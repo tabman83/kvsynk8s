@@ -34,7 +34,7 @@ import (
 )
 
 // namespace where the project is deployed in
-const namespace = "kvsynk8s-system"
+const namespace = "kvsynk8s"
 
 // serviceAccountName created for the project
 const serviceAccountName = "kvsynk8s-controller-manager"
