@@ -119,13 +119,13 @@ Single Go module at repository root, standard kubebuilder layout per plan.md: `c
 
 ### Tests for User Story 4 (write first, must fail before implementation)
 
-- [ ] T025 [P] [US4] Redaction test suite in internal/sync/redaction_test.go: plant `SENTINEL-...` values via the fake reader, capture controller/engine log output and all status/event fields across success, failure, conflict, and poison paths; assert zero occurrences (SC-004)
-- [ ] T026 [P] [US4] Failure isolation envtest in internal/controller/secretsync_controller_test.go (extend): one Failing SecretSync (reader error) while a second syncs normally — second reaches InSync on schedule (FR-008, SC-006)
+- [X] T025 [P] [US4] Redaction test suite in internal/sync/redaction_test.go: plant `SENTINEL-...` values via the fake reader, capture controller/engine log output and all status/event fields across success, failure, conflict, and poison paths; assert zero occurrences (SC-004)
+- [X] T026 [P] [US4] Failure isolation envtest in internal/controller/secretsync_controller_test.go (extend): one Failing SecretSync (reader error) while a second syncs normally — second reaches InSync on schedule (FR-008, SC-006)
 
 ### Implementation for User Story 4
 
-- [ ] T027 [US4] Emit Kubernetes Events on the SecretSync via an EventRecorder in internal/controller/secretsync_controller.go (Synced, SyncFailed with reason; names/versions only) and ensure status.message templates in internal/sync/engine.go reference vault/name/version, never values (FR-009, FR-010)
-- [ ] T028 [US4] Add structured logging conventions in internal/sync/writer.go and internal/events/listener.go: log keys limited to vault, secret, version, namespace, name, eventID, dequeueCount; add a lint-style unit check in internal/sync/redaction_test.go that the writer package never logs the value parameter
+- [X] T027 [US4] Emit Kubernetes Events on the SecretSync via an EventRecorder in internal/controller/secretsync_controller.go (Synced, SyncFailed with reason; names/versions only) and ensure status.message templates in internal/sync/engine.go reference vault/name/version, never values (FR-009, FR-010)
+- [X] T028 [US4] Add structured logging conventions in internal/sync/writer.go and internal/events/listener.go: log keys limited to vault, secret, version, namespace, name, eventID, dequeueCount; add a lint-style unit check in internal/sync/redaction_test.go that the writer package never logs the value parameter
 
 **Checkpoint**: All four stories independently functional; SC-004/SC-006 verified
 

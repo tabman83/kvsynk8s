@@ -13,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	kvsynk8sv1alpha1 "github.com/tabman83/kvsynk8s/api/v1alpha1"
 )
@@ -59,6 +60,15 @@ var ErrTargetConflict = errors.New("kvsynk8s: target secret exists and is not ma
 // CreateOrUpdate; nothing here ever logs, wraps in an error string, or
 // otherwise surfaces the value parameter — it is placed exclusively into the
 // returned/persisted Secret's Data field.
+//
+// Structured logging convention (T028, constitution I / FR-010): every log
+// call in this file uses only identifier keys — "namespace", "name",
+// "vault", "secret", "version" — read off owner/namespace/name/version.
+// internal/sync/redaction_test.go's static check
+// (TestWriterSource_NeverLogsValueParameter) parses this file's AST and
+// inspects every .Info(/.Error( call's arguments for a reference to the
+// `value` identifier, so it catches a future violation regardless of how the
+// call is formatted (single line or wrapped across several).
 type SecretWriter struct {
 	// Client is used to read the current state of the target Secret and to
 	// create or update it. Required.
@@ -109,6 +119,7 @@ func (w *SecretWriter) CreateOrUpdate(
 	if err := w.Client.Update(ctx, existing); err != nil {
 		return fmt.Errorf("kvsynk8s: update secret %s/%s: %w", namespace, name, err)
 	}
+	logf.FromContext(ctx).V(1).Info("updated managed secret", "namespace", namespace, "name", name, "vault", owner.Spec.Vault.Name, "secret", owner.Spec.Vault.Secret, "version", version)
 	return nil
 }
 
@@ -142,6 +153,7 @@ func (w *SecretWriter) create(
 		}
 		return fmt.Errorf("kvsynk8s: create secret %s/%s: %w", namespace, name, err)
 	}
+	logf.FromContext(ctx).V(1).Info("created managed secret", "namespace", namespace, "name", name, "vault", owner.Spec.Vault.Name, "secret", owner.Spec.Vault.Secret, "version", version)
 	return nil
 }
 
