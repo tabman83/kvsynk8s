@@ -26,6 +26,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -78,6 +79,16 @@ type SecretSyncReconciler struct {
 	// changed vault value with no event injected) don't need to wait an
 	// hour; production leaves it at the flag's own default.
 	ReconcileInterval time.Duration
+
+	// Recorder emits Kubernetes Events on the SecretSync (T027, FR-009):
+	// "Synced" (Normal) on every reconcile that ends InSync, "SyncFailed"
+	// (Warning) on every reconcile that ends Failing. SetupWithManager wires
+	// it from mgr.GetEventRecorderFor when left nil, which is also what lets
+	// every pre-T027 test in this package -- built by hand via
+	// reconcilerFor/&SecretSyncReconciler{...} without ever calling
+	// SetupWithManager -- keep working unchanged: recordEvent silently no-ops
+	// on a nil Recorder rather than requiring every caller to supply one.
+	Recorder record.EventRecorder
 }
 
 // reconcileInterval returns ReconcileInterval when set, or
@@ -90,6 +101,38 @@ func (r *SecretSyncReconciler) reconcileInterval() time.Duration {
 		return r.ReconcileInterval
 	}
 	return defaultReconcileInterval
+}
+
+// recordEvent emits a Kubernetes Event on ss (T027, FR-009) if a Recorder is
+// configured; it is a silent no-op otherwise, so nothing here ever requires
+// every reconciler in every test to wire one up. reason is always one of the
+// two fixed identifiers "Synced"/"SyncFailed" (never anything derived from
+// upstream error text), and message is built exclusively from vault name,
+// secret name, target namespace/name, and version identifiers -- constitution
+// I / FR-010 forbid anything else, and every call site below sources message
+// from status.Message/status.Reason, which classifyReaderError and this
+// package's own status-building code already restrict the same way.
+func (r *SecretSyncReconciler) recordEvent(ss *kvsynk8sv1alpha1.SecretSync, eventType, reason, message string) {
+	if r.Recorder == nil {
+		return
+	}
+	r.Recorder.Event(ss, eventType, reason, message)
+}
+
+// recordSyncOutcome emits the terminal-state Event for one reconcile's
+// result, per T027: "Synced" on InSync, "SyncFailed" (carrying status.Reason
+// in its message) on Failing. Pending is not terminal (it is only ever set
+// once, transiently, before the very first conflict check/vault read) and
+// gets no event of its own.
+func (r *SecretSyncReconciler) recordSyncOutcome(ss *kvsynk8sv1alpha1.SecretSync, status kvsynk8sv1alpha1.SecretSyncStatus, targetName string) {
+	switch status.State {
+	case kvsynk8sv1alpha1.SecretSyncStateInSync:
+		r.recordEvent(ss, corev1.EventTypeNormal, "Synced", fmt.Sprintf(
+			"synced secret %q (version %q) from vault %q into %s/%s",
+			ss.Spec.Vault.Secret, status.SyncedVersion, ss.Spec.Vault.Name, ss.Namespace, targetName))
+	case kvsynk8sv1alpha1.SecretSyncStateFailing:
+		r.recordEvent(ss, corev1.EventTypeWarning, "SyncFailed", fmt.Sprintf("%s: %s", status.Reason, status.Message))
+	}
 }
 
 // +kubebuilder:rbac:groups=kvsynk8s.io,resources=secretsyncs,verbs=get;list;watch;create;update;patch;delete
@@ -165,6 +208,7 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		if err := r.Status().Update(ctx, &ss); err != nil {
 			return ctrl.Result{}, fmt.Errorf("kvsynk8s: update status for %s: %w", req.NamespacedName, err)
 		}
+		r.recordSyncOutcome(&ss, ss.Status, targetName)
 		return ctrl.Result{RequeueAfter: r.reconcileInterval()}, nil
 	}
 
@@ -251,6 +295,7 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if err := r.Status().Update(ctx, &ss); err != nil {
 		return ctrl.Result{}, fmt.Errorf("kvsynk8s: update status for %s: %w", req.NamespacedName, err)
 	}
+	r.recordSyncOutcome(&ss, status, targetName)
 
 	log.V(1).Info("reconciled SecretSync",
 		"vault", ss.Spec.Vault.Name, "secret", ss.Spec.Vault.Secret, "state", status.State)
@@ -416,6 +461,10 @@ func takesPrecedence(a, b *kvsynk8sv1alpha1.SecretSync) bool {
 // watches plus the periodic RequeueAfter (cmd/main.go only builds a listener
 // and a non-nil channel when --queue-url/QUEUE_URL is set).
 func (r *SecretSyncReconciler) SetupWithManager(mgr ctrl.Manager, events <-chan event.GenericEvent) error {
+	if r.Recorder == nil {
+		r.Recorder = mgr.GetEventRecorderFor("kvsynk8s")
+	}
+
 	bldr := ctrl.NewControllerManagedBy(mgr).
 		For(&kvsynk8sv1alpha1.SecretSync{}).
 		Owns(&corev1.Secret{}).

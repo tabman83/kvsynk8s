@@ -31,6 +31,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/config"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -38,6 +39,7 @@ import (
 
 	kvsynk8sv1alpha1 "github.com/tabman83/kvsynk8s/api/v1alpha1"
 	"github.com/tabman83/kvsynk8s/internal/azure"
+	syncpkg "github.com/tabman83/kvsynk8s/internal/sync"
 )
 
 // Expected contract of the managed Secret (data-model.md "Managed Kubernetes
@@ -557,6 +559,176 @@ var _ = Describe("SecretSync Controller", func() {
 				}
 				return updated.Status.State, nil
 			}, 10*time.Second, 50*time.Millisecond).Should(Equal(kvsynk8sv1alpha1.SecretSyncStateInSync))
+		})
+	})
+
+	// T026 (US4, FR-008/SC-006): a SecretSync that fails forever must never
+	// block, slow down, or otherwise affect a completely unrelated SecretSync
+	// that is healthy. This runs a real manager (not a manually-invoked
+	// Reconcile) precisely so the two declarations are processed through the
+	// same shared workqueue a production operator would use -- proving
+	// isolation at the controller level, not just within one engine.Sync call.
+	Context("US4: a permanently failing SecretSync never blocks a healthy one", func() {
+		It("lets the healthy SecretSync reach InSync on its own schedule while the other stays Failing forever", func() {
+			ctx := context.Background()
+
+			okVaultSecret := "ok-secret-" + shortUID()
+			failVaultSecret := "fail-secret-" + shortUID()
+
+			mgrReader := newFakeSecretReader()
+			// Deliberately never call mgrReader.set for failVaultSecret: every
+			// GetLatest call for it returns ErrSecretNotFound, so that
+			// SecretSync can never leave the Failing state no matter how many
+			// times it is reconciled.
+			mgrReader.set(fakeVaultName, okVaultSecret, "SENTINEL-fake-value-isolation-ok-not-real", "v1")
+
+			nameOK := "ss-isolation-ok-" + shortUID()
+			nameFail := "ss-isolation-fail-" + shortUID()
+			targetOK := "target-isolation-ok-" + shortUID()
+			targetFail := "target-isolation-fail-" + shortUID()
+
+			ssFail := newTestSecretSync(namespace, nameFail, fakeVaultName, failVaultSecret, targetFail, fakeDataKey)
+			Expect(k8sClient.Create(ctx, ssFail)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), ssFail)
+			})
+
+			ssOK := newTestSecretSync(namespace, nameOK, fakeVaultName, okVaultSecret, targetOK, fakeDataKey)
+			Expect(k8sClient.Create(ctx, ssOK)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), ssOK)
+			})
+
+			// A short interval so both declarations get reconciled several
+			// times over the course of this test -- if the failing one were
+			// somehow starving the healthy one (a shared-workqueue bug, or a
+			// blocking call), that would show up as the healthy one never
+			// reaching InSync within the timeout below.
+			const shortInterval = 200 * time.Millisecond
+			cancel := startManagerFor(mgrReader, shortInterval)
+			DeferCleanup(cancel)
+
+			Eventually(func() (kvsynk8sv1alpha1.SecretSyncState, error) {
+				var updated kvsynk8sv1alpha1.SecretSync
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: nameOK, Namespace: namespace}, &updated); err != nil {
+					return "", err
+				}
+				return updated.Status.State, nil
+			}, 5*time.Second, 50*time.Millisecond).Should(Equal(kvsynk8sv1alpha1.SecretSyncStateInSync),
+				"the healthy SecretSync must reach InSync regardless of the other one failing")
+
+			// The failing one must genuinely still be failing -- not just not
+			// yet reconciled -- and stay that way across further reconciles.
+			Consistently(func() (kvsynk8sv1alpha1.SecretSyncState, error) {
+				var updated kvsynk8sv1alpha1.SecretSync
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: nameFail, Namespace: namespace}, &updated); err != nil {
+					return "", err
+				}
+				return updated.Status.State, nil
+			}, time.Second, 100*time.Millisecond).Should(Equal(kvsynk8sv1alpha1.SecretSyncStateFailing))
+
+			var failing kvsynk8sv1alpha1.SecretSync
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nameFail, Namespace: namespace}, &failing)).To(Succeed())
+			Expect(failing.Status.Reason).To(Equal(syncpkg.ReasonSecretNotFound))
+
+			// The healthy Secret must actually carry its value -- proving the
+			// two declarations were not just both stuck in some shared broken
+			// state.
+			var okSecret corev1.Secret
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: targetOK, Namespace: namespace}, &okSecret)).To(Succeed())
+			Expect(string(okSecret.Data[fakeDataKey])).To(Equal("SENTINEL-fake-value-isolation-ok-not-real"))
+
+			// And the failing declaration must never have gotten a Secret at
+			// all (nothing to fabricate on SecretNotFound with no prior sync).
+			err := k8sClient.Get(ctx, types.NamespacedName{Name: targetFail, Namespace: namespace}, &corev1.Secret{})
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		})
+	})
+
+	// T027 (US4, FR-009/FR-010): a "Synced" Normal event on success and a
+	// "SyncFailed" Warning event on failure, referencing only vault/secret/
+	// version identifiers -- never a secret value.
+	Context("US4: EventRecorder", func() {
+		It("emits a Synced event on success naming vault/secret/version, with no value in it", func() {
+			ctx := context.Background()
+
+			name := "ss-event-ok-" + shortUID()
+			vaultSecret := "event-ok-secret-" + shortUID()
+			targetName := "target-event-ok-" + shortUID()
+			const sentinel = "SENTINEL-fake-value-event-ok-not-real"
+
+			reader.set(fakeVaultName, vaultSecret, sentinel, "v7")
+
+			ss := newTestSecretSync(namespace, name, fakeVaultName, vaultSecret, targetName, fakeDataKey)
+			Expect(k8sClient.Create(ctx, ss)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), ss)
+			})
+
+			recorder := record.NewFakeRecorder(10)
+			r := reconcilerFor(reader)
+			r.Recorder = recorder
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: namespace}}
+
+			_, err := r.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			var evt string
+			Eventually(recorder.Events).Should(Receive(&evt))
+			Expect(evt).To(ContainSubstring("Synced"))
+			Expect(evt).To(ContainSubstring(vaultSecret))
+			Expect(evt).To(ContainSubstring("v7"))
+			Expect(evt).NotTo(ContainSubstring(sentinel))
+		})
+
+		It("emits a SyncFailed event carrying status.Reason on failure, with no value in it", func() {
+			ctx := context.Background()
+
+			name := "ss-event-fail-" + shortUID()
+			vaultSecret := "event-fail-secret-" + shortUID() // never reader.set -> SecretNotFound
+			targetName := "target-event-fail-" + shortUID()
+
+			ss := newTestSecretSync(namespace, name, fakeVaultName, vaultSecret, targetName, fakeDataKey)
+			Expect(k8sClient.Create(ctx, ss)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), ss)
+			})
+
+			recorder := record.NewFakeRecorder(10)
+			r := reconcilerFor(reader)
+			r.Recorder = recorder
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: namespace}}
+
+			_, err := r.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			var evt string
+			Eventually(recorder.Events).Should(Receive(&evt))
+			Expect(evt).To(ContainSubstring("SyncFailed"))
+			Expect(evt).To(ContainSubstring(syncpkg.ReasonSecretNotFound))
+			Expect(evt).To(ContainSubstring(vaultSecret))
+		})
+
+		It("never wires a Recorder for a reconciler built without SetupWithManager (nil-safe)", func() {
+			ctx := context.Background()
+
+			name := "ss-event-norecorder-" + shortUID()
+			vaultSecret := "event-norecorder-secret-" + shortUID()
+			targetName := "target-event-norecorder-" + shortUID()
+
+			reader.set(fakeVaultName, vaultSecret, "SENTINEL-fake-value-norecorder-not-real", "v1")
+
+			ss := newTestSecretSync(namespace, name, fakeVaultName, vaultSecret, targetName, fakeDataKey)
+			Expect(k8sClient.Create(ctx, ss)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), ss)
+			})
+
+			r := reconcilerFor(reader) // Recorder left nil, exactly like every pre-T027 test in this file
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: namespace}}
+
+			_, err := r.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred(), "a nil Recorder must never cause Reconcile to fail or panic")
 		})
 	})
 })
