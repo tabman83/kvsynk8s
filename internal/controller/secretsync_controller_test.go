@@ -67,6 +67,10 @@ const (
 	// work identically; these are fake per constitution I).
 	fakeVaultName = "fake-vault"
 	fakeDataKey   = "value"
+
+	// fakeSecretName is the vault secret name reused by the US3 reconciliation
+	// specs below (RequeueAfter, drift repair, convergence, retry/backoff).
+	fakeSecretName = "fake-secret"
 )
 
 // fakeSecretReader is a hand-rolled azure.SecretReader for envtest, which has
@@ -253,7 +257,7 @@ var _ = Describe("SecretSync Controller", func() {
 
 			name := "ss-create-" + shortUID()
 			vaultName := fakeVaultName
-			vaultSecret := "fake-secret"
+			vaultSecret := fakeSecretName
 			targetName := "target-" + shortUID()
 			dataKey := fakeDataKey
 			const fakeValue = "SENTINEL-fake-value-create-test-not-real"
@@ -295,7 +299,7 @@ var _ = Describe("SecretSync Controller", func() {
 
 			name := "ss-delete-" + shortUID()
 			vaultName := fakeVaultName
-			vaultSecret := "fake-secret"
+			vaultSecret := fakeSecretName
 			targetName := "target-" + shortUID()
 			dataKey := fakeDataKey
 
@@ -409,7 +413,7 @@ var _ = Describe("SecretSync Controller", func() {
 
 			name := "ss-interval-" + shortUID()
 			vaultName := fakeVaultName
-			vaultSecret := "fake-secret"
+			vaultSecret := fakeSecretName
 			targetName := "target-" + shortUID()
 			dataKey := fakeDataKey
 
@@ -440,7 +444,7 @@ var _ = Describe("SecretSync Controller", func() {
 
 			name := "ss-recreate-" + shortUID()
 			vaultName := fakeVaultName
-			vaultSecret := "fake-secret"
+			vaultSecret := fakeSecretName
 			targetName := "target-" + shortUID()
 			dataKey := fakeDataKey
 			targetKey := types.NamespacedName{Name: targetName, Namespace: namespace}
@@ -477,7 +481,7 @@ var _ = Describe("SecretSync Controller", func() {
 
 			name := "ss-converge-" + shortUID()
 			vaultName := fakeVaultName
-			vaultSecret := "fake-secret"
+			vaultSecret := fakeSecretName
 			targetName := "target-" + shortUID()
 			dataKey := fakeDataKey
 			targetKey := types.NamespacedName{Name: targetName, Namespace: namespace}
@@ -521,7 +525,7 @@ var _ = Describe("SecretSync Controller", func() {
 
 			name := "ss-retry-" + shortUID()
 			vaultName := fakeVaultName
-			vaultSecret := "fake-secret"
+			vaultSecret := fakeSecretName
 			targetName := "target-" + shortUID()
 			dataKey := fakeDataKey
 
