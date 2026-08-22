@@ -332,3 +332,118 @@ func TestSync_ReaderNotFound_FailingSecretNotFound_NoValueAnywhere(t *testing.T)
 		}
 	}
 }
+
+// T022 (US3, FR-013): once a SecretSync has already synced a version
+// successfully, the vault reporting that same secret as deleted or disabled
+// on a later reconcile must NOT be treated like TestSync_ReaderNotFound above
+// (which covers "never synced" — nothing exists to preserve). Here `existing`
+// already carries a synced version annotation, so Sync must go Failing with
+// SourceDeleted/SourceDisabled while leaving the previously-written Secret
+// completely untouched: same pointer, same Data, same annotations. This is
+// "keep last known good" — the whole point of FR-013 is that a vault-side
+// deletion/disable must never itself blank out or delete the Secret that
+// workloads are already reading from.
+
+// existingSyncedSecret builds a managed Secret that looks like the result of
+// a prior successful Sync for owner at the given version/value, for use as
+// the `existing` argument in the SourceDeleted/SourceDisabled tests below.
+func existingSyncedSecret(owner *kvsynk8sv1alpha1.SecretSync, version, value string) *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      owner.Name,
+			Namespace: owner.Namespace,
+			Labels: map[string]string{
+				LabelManagedBy: LabelManagedByValue,
+			},
+			Annotations: map[string]string{
+				AnnotationVault:   owner.Spec.Vault.Name,
+				AnnotationSecret:  owner.Spec.Vault.Secret,
+				AnnotationVersion: version,
+			},
+		},
+		Type: corev1.SecretTypeOpaque,
+		Data: map[string][]byte{
+			owner.Spec.Vault.Secret: []byte(value),
+		},
+	}
+}
+
+func TestSync_ReaderReportsDeleted_FailingSourceDeleted_ExistingSecretUntouched(t *testing.T) {
+	owner := newOwner("my-sync", "default", "my-vault", "my-app-password")
+	const lastKnownGood = "SENTINEL-last-known-good-value-not-real"
+	existing := existingSyncedSecret(owner, "v2", lastKnownGood)
+
+	deletedErr := fmt.Errorf("vault %q secret %q: %w", owner.Spec.Vault.Name, owner.Spec.Vault.Secret, azure.ErrSecretNotFound)
+	reader := &fakeSecretReader{err: deletedErr}
+	e := &Engine{Reader: reader}
+
+	status, secret, err := e.Sync(context.Background(), owner, existing)
+	if err != nil {
+		t.Fatalf("Sync() error = %v, want nil (expected failures are reported via status)", err)
+	}
+	if status.State != kvsynk8sv1alpha1.SecretSyncStateFailing {
+		t.Errorf("status.State = %q, want %q", status.State, kvsynk8sv1alpha1.SecretSyncStateFailing)
+	}
+	if status.Reason != ReasonSourceDeleted {
+		t.Errorf("status.Reason = %q, want %q", status.Reason, ReasonSourceDeleted)
+	}
+
+	if secret != existing {
+		t.Fatalf("Sync() must return the SAME existing Secret pointer on SourceDeleted (keep-last-known-good, FR-013)")
+	}
+	if string(secret.Data[owner.Spec.Vault.Secret]) != lastKnownGood {
+		t.Fatalf("existing Secret data was mutated on SourceDeleted: got %q, want unchanged %q",
+			secret.Data[owner.Spec.Vault.Secret], lastKnownGood)
+	}
+	if secret.Annotations[AnnotationVersion] != "v2" {
+		t.Fatalf("existing Secret's version annotation was mutated on SourceDeleted: got %q, want unchanged %q",
+			secret.Annotations[AnnotationVersion], "v2")
+	}
+
+	haystacks := []string{status.Message, status.Reason, fmt.Sprintf("%+v", status)}
+	for _, h := range haystacks {
+		if strings.Contains(h, lastKnownGood) {
+			t.Fatalf("secret value leaked into status output: %q", h)
+		}
+	}
+}
+
+func TestSync_ReaderReportsDisabled_FailingSourceDisabled_ExistingSecretUntouched(t *testing.T) {
+	owner := newOwner("my-sync", "default", "my-vault", "my-app-password")
+	const lastKnownGood = "SENTINEL-last-known-good-value-disabled-not-real"
+	existing := existingSyncedSecret(owner, "v5", lastKnownGood)
+
+	disabledErr := fmt.Errorf("vault %q secret %q: %w", owner.Spec.Vault.Name, owner.Spec.Vault.Secret, azure.ErrSecretDisabled)
+	reader := &fakeSecretReader{err: disabledErr}
+	e := &Engine{Reader: reader}
+
+	status, secret, err := e.Sync(context.Background(), owner, existing)
+	if err != nil {
+		t.Fatalf("Sync() error = %v, want nil (expected failures are reported via status)", err)
+	}
+	if status.State != kvsynk8sv1alpha1.SecretSyncStateFailing {
+		t.Errorf("status.State = %q, want %q", status.State, kvsynk8sv1alpha1.SecretSyncStateFailing)
+	}
+	if status.Reason != ReasonSourceDisabled {
+		t.Errorf("status.Reason = %q, want %q", status.Reason, ReasonSourceDisabled)
+	}
+
+	if secret != existing {
+		t.Fatalf("Sync() must return the SAME existing Secret pointer on SourceDisabled (keep-last-known-good, FR-013)")
+	}
+	if string(secret.Data[owner.Spec.Vault.Secret]) != lastKnownGood {
+		t.Fatalf("existing Secret data was mutated on SourceDisabled: got %q, want unchanged %q",
+			secret.Data[owner.Spec.Vault.Secret], lastKnownGood)
+	}
+	if secret.Annotations[AnnotationVersion] != "v5" {
+		t.Fatalf("existing Secret's version annotation was mutated on SourceDisabled: got %q, want unchanged %q",
+			secret.Annotations[AnnotationVersion], "v5")
+	}
+
+	haystacks := []string{status.Message, status.Reason, fmt.Sprintf("%+v", status)}
+	for _, h := range haystacks {
+		if strings.Contains(h, lastKnownGood) {
+			t.Fatalf("secret value leaked into status output: %q", h)
+		}
+	}
+}
