@@ -31,7 +31,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/config"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -665,7 +665,7 @@ var _ = Describe("SecretSync Controller", func() {
 				_ = k8sClient.Delete(context.Background(), ss)
 			})
 
-			recorder := record.NewFakeRecorder(10)
+			recorder := events.NewFakeRecorder(10)
 			r := reconcilerFor(reader)
 			r.Recorder = recorder
 			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: namespace}}
@@ -694,7 +694,7 @@ var _ = Describe("SecretSync Controller", func() {
 				_ = k8sClient.Delete(context.Background(), ss)
 			})
 
-			recorder := record.NewFakeRecorder(10)
+			recorder := events.NewFakeRecorder(10)
 			r := reconcilerFor(reader)
 			r.Recorder = recorder
 			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: namespace}}
