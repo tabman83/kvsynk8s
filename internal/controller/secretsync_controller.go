@@ -53,12 +53,10 @@ import (
 // package.
 const finalizerName = "kvsynk8s.io/secretsync-finalizer"
 
-// defaultReconcileInterval is the periodic full-reconciliation cadence: the
-// safety net for missed events, vault-side deletions, and in-cluster drift
-// (plan.md, data-model.md). It mirrors cmd/main.go's own default; wiring this
-// through as configuration (RECONCILE_INTERVAL/--reconcile-interval) is
-// T023 (US3) — for T013 every successful reconcile simply requeues after
-// this fixed interval.
+// defaultReconcileInterval is the periodic full-reconciliation cadence used
+// when ReconcileInterval is left unset: the safety net for missed events,
+// vault-side deletions, and in-cluster drift (plan.md, data-model.md). It
+// mirrors cmd/main.go's own default.
 const defaultReconcileInterval = time.Hour
 
 // SecretSyncReconciler reconciles a SecretSync object
@@ -72,6 +70,26 @@ type SecretSyncReconciler struct {
 	// separately in T020 — this reconciler only needs a way to read the
 	// vault, not a way to be notified about it.
 	Reader azure.SecretReader
+
+	// ReconcileInterval overrides defaultReconcileInterval when non-zero.
+	// Wired in cmd/main.go from --reconcile-interval/RECONCILE_INTERVAL
+	// (T023, US3). Tests set this to a short duration so periodic-
+	// reconciliation-driven assertions (drift repair, convergence on a
+	// changed vault value with no event injected) don't need to wait an
+	// hour; production leaves it at the flag's own default.
+	ReconcileInterval time.Duration
+}
+
+// reconcileInterval returns ReconcileInterval when set, or
+// defaultReconcileInterval otherwise. Every RequeueAfter this reconciler
+// returns on a healthy (non-backoff) path goes through this method rather
+// than referencing either constant/field directly, so there is exactly one
+// place that resolves "how often do we fully reconcile".
+func (r *SecretSyncReconciler) reconcileInterval() time.Duration {
+	if r.ReconcileInterval > 0 {
+		return r.ReconcileInterval
+	}
+	return defaultReconcileInterval
 }
 
 // +kubebuilder:rbac:groups=kvsynk8s.io,resources=secretsyncs,verbs=get;list;watch;create;update;patch;delete
@@ -95,8 +113,8 @@ type SecretSyncReconciler struct {
 // (constitution II: retries, not a crash or a hot loop). Every other
 // *expected* failure mode (vault secret missing/disabled/access-denied,
 // target conflict) is instead reported via status with err == nil, and this
-// reconcile still requeues after defaultReconcileInterval so a
-// since-resolved cause is retried without needing an external trigger.
+// reconcile still requeues after reconcileInterval() so a since-resolved
+// cause is retried without needing an external trigger.
 func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
@@ -147,7 +165,7 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		if err := r.Status().Update(ctx, &ss); err != nil {
 			return ctrl.Result{}, fmt.Errorf("kvsynk8s: update status for %s: %w", req.NamespacedName, err)
 		}
-		return ctrl.Result{RequeueAfter: defaultReconcileInterval}, nil
+		return ctrl.Result{RequeueAfter: r.reconcileInterval()}, nil
 	}
 
 	var existing *corev1.Secret
@@ -245,7 +263,7 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, fmt.Errorf("kvsynk8s: transient error syncing %s, retrying with backoff", req.NamespacedName)
 	}
 
-	return ctrl.Result{RequeueAfter: defaultReconcileInterval}, nil
+	return ctrl.Result{RequeueAfter: r.reconcileInterval()}, nil
 }
 
 // reconcileDelete handles a SecretSync with a non-zero DeletionTimestamp: it
@@ -381,6 +399,15 @@ func takesPrecedence(a, b *kvsynk8sv1alpha1.SecretSync) bool {
 // means drift on a managed Secret (deleted or edited in-cluster) re-triggers
 // a reconcile of its owning SecretSync automatically, without waiting for
 // the periodic RequeueAfter (US3 drift repair).
+//
+// Startup convergence (US3, T023) needs no code here either: For(&SecretSync{})
+// backs the controller with a client-go informer, and that informer's initial
+// List when the manager starts delivers every already-existing SecretSync as
+// a Create event, which the default predicates let through to the workqueue —
+// so every declaration gets reconciled once as soon as the cache syncs, with
+// no replayed queue events required. Exercised in secretsync_controller_test.go
+// (T021) by starting a real manager and asserting convergence without ever
+// calling Reconcile by hand.
 //
 // events is the channel the queue listener (internal/events, T019) sends
 // matched SecretSync objects on; a nil events channel is the US1 contract:

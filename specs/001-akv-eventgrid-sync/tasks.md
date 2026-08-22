@@ -99,13 +99,13 @@ Single Go module at repository root, standard kubebuilder layout per plan.md: `c
 
 ### Tests for User Story 3 (write first, must fail before implementation)
 
-- [ ] T021 [P] [US3] Reconciliation tests in internal/controller/secretsync_controller_test.go (extend): successful reconcile returns RequeueAfter == configured interval; deleting the managed Secret triggers re-creation via the Owns watch; fake reader flips value while no event arrives → next reconcile converges; retry/backoff — fake reader fails with a transient error N times then succeeds → reconcile is retried via the rate-limited queue and the CR reaches InSync without manual intervention (constitution IV retry/backoff test mandate; US2 acceptance scenario 4, FR-008)
-- [ ] T022 [P] [US3] Source-deleted tests in internal/sync/engine_test.go (extend): reader reports deleted/disabled → status Failing with SourceDeleted/SourceDisabled AND the existing Secret is left untouched (FR-013)
+- [X] T021 [P] [US3] Reconciliation tests in internal/controller/secretsync_controller_test.go (extend): successful reconcile returns RequeueAfter == configured interval; deleting the managed Secret triggers re-creation via the Owns watch; fake reader flips value while no event arrives → next reconcile converges; retry/backoff — fake reader fails with a transient error N times then succeeds → reconcile is retried via the rate-limited queue and the CR reaches InSync without manual intervention (constitution IV retry/backoff test mandate; US2 acceptance scenario 4, FR-008)
+- [X] T022 [P] [US3] Source-deleted tests in internal/sync/engine_test.go (extend): reader reports deleted/disabled → status Failing with SourceDeleted/SourceDisabled AND the existing Secret is left untouched (FR-013)
 
 ### Implementation for User Story 3
 
-- [ ] T023 [US3] Add periodic reconciliation in internal/controller/secretsync_controller.go: RequeueAfter with the configured interval (default 1 h) on every successful reconcile; startup convergence needs no extra code (informer sync enqueues all CRs) — assert it in the envtest from T021
-- [ ] T024 [US3] Implement keep-last-known-good in internal/sync/engine.go: on SourceDeleted/SourceDisabled set Failing status but skip writer deletion/overwrite (FR-013, spec edge case)
+- [X] T023 [US3] Add periodic reconciliation in internal/controller/secretsync_controller.go: RequeueAfter with the configured interval (default 1 h) on every successful reconcile; startup convergence needs no extra code (informer sync enqueues all CRs) — assert it in the envtest from T021
+- [X] T024 [US3] Implement keep-last-known-good in internal/sync/engine.go: on SourceDeleted/SourceDisabled set Failing status but skip writer deletion/overwrite (FR-013, spec edge case)
 
 **Checkpoint**: quickstart V3/V4 pass; convergence guaranteed with the event path fully broken (SC-003)
 
