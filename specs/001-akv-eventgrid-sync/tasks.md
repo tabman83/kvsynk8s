@@ -23,10 +23,10 @@ Single Go module at repository root, standard kubebuilder layout per plan.md: `c
 
 **Purpose**: Scaffold the kubebuilder project and pin dependencies
 
-- [ ] T001 Scaffold the operator with kubebuilder: `kubebuilder init --domain io --repo github.com/tabman83/kvsynk8s` producing cmd/main.go, Makefile, Dockerfile, config/ tree, go.mod (Go 1.25+, controller-runtime pinned). Domain is `io` so that group `kvsynk8s` yields API group `kvsynk8s.io` (kubebuilder composes `<group>.<domain>`)
-- [ ] T002 Scaffold the API with `kubebuilder create api --group kvsynk8s --version v1alpha1 --kind SecretSync` (namespaced, with controller), producing api/v1alpha1/secretsync_types.go and internal/controller/secretsync_controller.go stubs; verify the resulting API group is exactly `kvsynk8s.io` per contracts/secretsync-crd.yaml
-- [ ] T003 [P] Add pinned Azure SDK for Go dependencies to go.mod: azidentity (≥1.14), azsecrets, azqueue v2, azsystemevents
-- [ ] T004 [P] Configure golangci-lint (.golangci.yml) and extend .gitignore to cover kubeconfig/.env/local settings files (constitution: Security Requirements)
+- [X] T001 Scaffold the operator with kubebuilder: `kubebuilder init --domain io --repo github.com/tabman83/kvsynk8s` producing cmd/main.go, Makefile, Dockerfile, config/ tree, go.mod (Go 1.25+, controller-runtime pinned). Domain is `io` so that group `kvsynk8s` yields API group `kvsynk8s.io` (kubebuilder composes `<group>.<domain>`)
+- [X] T002 Scaffold the API with `kubebuilder create api --group kvsynk8s --version v1alpha1 --kind SecretSync` (namespaced, with controller), producing api/v1alpha1/secretsync_types.go and internal/controller/secretsync_controller.go stubs; verify the resulting API group is exactly `kvsynk8s.io` per contracts/secretsync-crd.yaml
+- [X] T003 [P] Add pinned Azure SDK for Go dependencies to go.mod: azidentity (≥1.14), azsecrets, azqueue v2, azsystemevents
+- [X] T004 [P] Configure golangci-lint (.golangci.yml) and extend .gitignore to cover kubeconfig/.env/local settings files (constitution: Security Requirements)
 
 **Checkpoint**: `make build` and `make test` pass on the empty scaffold
 
@@ -38,10 +38,10 @@ Single Go module at repository root, standard kubebuilder layout per plan.md: `c
 
 **⚠️ CRITICAL**: No user story work can begin until this phase is complete
 
-- [ ] T005 Implement SecretSync spec/status types in api/v1alpha1/secretsync_types.go per data-model.md (spec.vault.name/secret with validation markers, spec.target.secretName/dataKey defaults, status.state/lastSyncTime/syncedVersion/reason/message/observedGeneration, printer columns, status subresource); run `make manifests generate` and verify the generated CRD in config/crd/ matches contracts/secretsync-crd.yaml
-- [ ] T006 Restrict config/rbac/role.yaml to least privilege (constitution V): secretsyncs + status + finalizers all verbs; secrets get/list/watch/create/update/delete; events create/patch — nothing else
-- [ ] T007 [P] Implement the SecretReader interface and azsecrets-backed implementation in internal/azure/keyvault.go: `GetLatest(ctx, vaultName, secretName) (value, version, err)` using DefaultAzureCredential, distinguishing not-found / access-denied / disabled / transient errors; value never appears in error strings or logs
-- [ ] T008 [P] Wire operator configuration in cmd/main.go: flags/env for queue URL, reconcile interval (default 1h), client ID; manager setup with health/ready probes; no leader election (single replica, plan.md)
+- [X] T005 Implement SecretSync spec/status types in api/v1alpha1/secretsync_types.go per data-model.md (spec.vault.name/secret with validation markers, spec.target.secretName/dataKey defaults, status.state/lastSyncTime/syncedVersion/reason/message/observedGeneration, printer columns, status subresource); run `make manifests generate` and verify the generated CRD in config/crd/ matches contracts/secretsync-crd.yaml
+- [X] T006 Restrict config/rbac/role.yaml to least privilege (constitution V): secretsyncs + status + finalizers all verbs; secrets get/list/watch/create/update/delete; events create/patch — nothing else
+- [X] T007 [P] Implement the SecretReader interface and azsecrets-backed implementation in internal/azure/keyvault.go: `GetLatest(ctx, vaultName, secretName) (value, version, err)` using DefaultAzureCredential, distinguishing not-found / access-denied / disabled / transient errors; value never appears in error strings or logs
+- [X] T008 [P] Wire operator configuration in cmd/main.go: flags/env for queue URL, reconcile interval (default 1h), client ID; manager setup with health/ready probes; no leader election (single replica, plan.md)
 
 **Checkpoint**: CRD installs (`make install`), operator starts against a cluster and does nothing — user story implementation can now begin
 
@@ -55,15 +55,15 @@ Single Go module at repository root, standard kubebuilder layout per plan.md: `c
 
 ### Tests for User Story 1 (write first, must fail before implementation)
 
-- [ ] T009 [P] [US1] Sync engine unit tests in internal/sync/engine_test.go with a fake SecretReader: creates Secret with labels/annotations/ownerReference per data-model.md; skips write when annotated version matches (idempotency); refuses pre-existing unmanaged Secret → TargetConflict (FR-012); reader not-found → Failing/SecretNotFound with no value anywhere in status
-- [ ] T010 [P] [US1] Controller envtest in internal/controller/secretsync_controller_test.go: reconcile creates the Secret and sets state InSync/observedGeneration; CR deletion runs the finalizer and deletes the managed Secret; two SecretSyncs targeting the same Secret → later one Failing/TargetConflict
+- [X] T009 [P] [US1] Sync engine unit tests in internal/sync/engine_test.go with a fake SecretReader: creates Secret with labels/annotations/ownerReference per data-model.md; skips write when annotated version matches (idempotency); refuses pre-existing unmanaged Secret → TargetConflict (FR-012); reader not-found → Failing/SecretNotFound with no value anywhere in status
+- [X] T010 [P] [US1] Controller envtest in internal/controller/secretsync_controller_test.go: reconcile creates the Secret and sets state InSync/observedGeneration; CR deletion runs the finalizer and deletes the managed Secret; two SecretSyncs targeting the same Secret → later one Failing/TargetConflict
 
 ### Implementation for User Story 1
 
-- [ ] T011 [P] [US1] Implement the secret writer in internal/sync/writer.go — the ONLY code path handling values (constitution I): create/update the Opaque Secret with managed-by label, vault/secret/version annotations, ownerReference; refuse writes to unmanaged existing Secrets
-- [ ] T012 [US1] Implement the sync engine in internal/sync/engine.go: resolve target name/dataKey defaults, fetch latest via SecretReader, call writer, compute status (InSync/Pending/Failing + reason/message per data-model.md state transitions); idempotent, latest-wins (FR-005)
-- [ ] T013 [US1] Implement reconcile + finalizer in internal/controller/secretsync_controller.go: builder watches SecretSync and Owns(corev1.Secret); reconcile calls the engine, updates status subresource, requeues with backoff on failure (FR-008); finalizer deletes the managed Secret on CR deletion (FR-002)
-- [ ] T014 [US1] Add workload-identity deployment config in config/manager/manager.yaml: `azure.workload.identity/use` pod label, ServiceAccount annotation placeholder for client ID, resource requests/limits, non-root securityContext; set namespace to `kvsynk8s` and deployment name to `kvsynk8s-operator` in config/default kustomization (replacing kubebuilder's `-system`/`controller-manager` defaults) to match quickstart.md
+- [X] T011 [P] [US1] Implement the secret writer in internal/sync/writer.go — the ONLY code path handling values (constitution I): create/update the Opaque Secret with managed-by label, vault/secret/version annotations, ownerReference; refuse writes to unmanaged existing Secrets
+- [X] T012 [US1] Implement the sync engine in internal/sync/engine.go: resolve target name/dataKey defaults, fetch latest via SecretReader, call writer, compute status (InSync/Pending/Failing + reason/message per data-model.md state transitions); idempotent, latest-wins (FR-005)
+- [X] T013 [US1] Implement reconcile + finalizer in internal/controller/secretsync_controller.go: builder watches SecretSync and Owns(corev1.Secret); reconcile calls the engine, updates status subresource, requeues with backoff on failure (FR-008); finalizer deletes the managed Secret on CR deletion (FR-002)
+- [X] T014 [US1] Add workload-identity deployment config in config/manager/manager.yaml: `azure.workload.identity/use` pod label, ServiceAccount annotation placeholder for client ID, resource requests/limits, non-root securityContext; set namespace to `kvsynk8s` and deployment name to `kvsynk8s-operator` in config/default kustomization (replacing kubebuilder's `-system`/`controller-manager` defaults) to match quickstart.md
 
 **Checkpoint**: MVP — quickstart V1/V5/V7 pass on a real cluster; value propagation works without any queue
 
