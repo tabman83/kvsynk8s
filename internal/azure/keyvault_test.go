@@ -4,8 +4,10 @@
 package azure
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -70,6 +72,61 @@ func TestClassifyGetSecretError_MessageReferencesOnlyIdentifiers(t *testing.T) {
 	if !strings.Contains(msg, "my-vault") || !strings.Contains(msg, "my-secret") {
 		t.Fatalf("expected error message %q to reference vault and secret name", msg)
 	}
+}
+
+// TestClassifyGetSecretError_DisabledSecretRegardlessOfStatusCode locks in
+// the T030 finding: Key Vault refuses GetSecret on a disabled secret with an
+// error response instead of a 200 body carrying attributes.enabled=false,
+// so secretIsDisabled (below) never actually fires for the "get the latest
+// version" call GetLatest makes. Real Key Vault answers 403; the Lowkey
+// Vault emulator (internal/azure/keyvault_integration_test.go) answers 404.
+// classifyGetSecretError must catch both by the response wording, not the
+// status code.
+func TestClassifyGetSecretError_DisabledSecretRegardlessOfStatusCode(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		body       string
+	}{
+		{
+			name:       "real key vault style 403",
+			statusCode: http.StatusForbidden,
+			body:       `{"error":{"code":"Forbidden","message":"Operation get is not allowed on a disabled secret."}}`,
+		},
+		{
+			name:       "lowkey vault emulator style 404",
+			statusCode: http.StatusNotFound,
+			body:       `{"error":{"code":"NotFoundException","message":"Operation get is not allowed on a disabled entity."}}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			respErr := responseErrorWithBody(tt.statusCode, tt.body)
+
+			got := classifyGetSecretError("my-vault", "my-secret", respErr)
+
+			if !errors.Is(got, ErrSecretDisabled) {
+				t.Fatalf("classifyGetSecretError() = %v, want wrapped %v", got, ErrSecretDisabled)
+			}
+			if strings.Contains(got.Error(), tt.body) {
+				t.Fatalf("classified error leaked the raw response body: %q", got.Error())
+			}
+		})
+	}
+}
+
+// responseErrorWithBody builds an *azcore.ResponseError whose Error() method
+// renders the given status code and body, the same way one constructed by
+// the real SDK pipeline from an HTTP response would.
+func responseErrorWithBody(statusCode int, body string) *azcore.ResponseError {
+	resp := &http.Response{
+		StatusCode: statusCode,
+		Status:     http.StatusText(statusCode),
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(bytes.NewBufferString(body)),
+	}
+	return &azcore.ResponseError{StatusCode: statusCode, RawResponse: resp}
 }
 
 func TestSecretIsDisabled(t *testing.T) {

@@ -11,6 +11,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
@@ -97,6 +99,18 @@ func vaultURL(vaultName string) string {
 	return fmt.Sprintf("https://%s.vault.azure.net/", vaultName)
 }
 
+// testEndpointOverrideEnv, when set, replaces vaultURL's public-cloud
+// address with this fixed endpoint for every vault name, and disables
+// azsecrets' challenge-resource-domain check (which otherwise assumes a
+// *.vault.azure.net endpoint and rejects anything else). It exists solely so
+// test/e2e can point a real, unmodified operator binary at a local
+// Key-Vault-compatible emulator that cannot serve *.vault.azure.net
+// hostnames (T032; research.md R10) -- a real deployment never sets this
+// env var, so clientFor's behavior for every actual production vault is
+// byte-for-byte what it was before this existed: same URL
+// (vaultURL(vaultName)), same nil options.
+const testEndpointOverrideEnv = "KVSYNK8S_KEYVAULT_TEST_ENDPOINT"
+
 // clientFor returns the cached secretsClient for vaultName, creating and
 // caching one if this is the first time this vault is used.
 func (r *keyVaultReader) clientFor(vaultName string) (secretsClient, error) {
@@ -107,7 +121,14 @@ func (r *keyVaultReader) clientFor(vaultName string) (secretsClient, error) {
 		return c, nil
 	}
 
-	c, err := azsecrets.NewClient(vaultURL(vaultName), r.credential, nil)
+	endpoint := vaultURL(vaultName)
+	var opts *azsecrets.ClientOptions
+	if override := os.Getenv(testEndpointOverrideEnv); override != "" {
+		endpoint = override
+		opts = &azsecrets.ClientOptions{DisableChallengeResourceVerification: true}
+	}
+
+	c, err := azsecrets.NewClient(endpoint, r.credential, opts)
 	if err != nil {
 		// Client construction failure (bad endpoint/credential wiring) is not
 		// one of the classified vault-response outcomes, but GetLatest's
@@ -166,6 +187,20 @@ func secretIsDisabled(attrs *azsecrets.SecretAttributes) bool {
 func classifyGetSecretError(vaultName, secretName string, err error) error {
 	var respErr *azcore.ResponseError
 	if errors.As(err, &respErr) {
+		// Key Vault refuses GetSecret outright on a disabled secret instead
+		// of returning a normal 200 body with attributes.enabled=false (that
+		// shape only ever comes back from an already-successful GetLatest,
+		// via secretIsDisabled below, for callers that reach it some other
+		// way). The refusal is observed as a 403 on real Key Vault and as a
+		// 404 against the Lowkey Vault emulator (T030) -- neither status
+		// code alone is a reliable signal, so this checks the server's own
+		// wording instead of guessing from the status code. Nothing here
+		// echoes that wording into the error this function returns
+		// (constitution I): it is only ever used to pick which fixed
+		// sentinel applies.
+		if isDisabledSecretResponse(respErr) {
+			return fmt.Errorf("vault %q secret %q: %w", vaultName, secretName, ErrSecretDisabled)
+		}
 		switch {
 		case respErr.StatusCode == http.StatusNotFound:
 			return fmt.Errorf("vault %q secret %q: %w", vaultName, secretName, ErrSecretNotFound)
@@ -183,4 +218,13 @@ func classifyGetSecretError(vaultName, secretName string, err error) error {
 
 	// No HTTP response at all: network failure, timeout, DNS, TLS, etc.
 	return fmt.Errorf("vault %q secret %q: %w", vaultName, secretName, ErrTransient)
+}
+
+// isDisabledSecretResponse reports whether respErr represents Key Vault
+// refusing a get because the secret (or the specific version requested) is
+// disabled. respErr.Error() renders the cached response body -- read only
+// to classify the failure, never forwarded into this package's own error
+// text.
+func isDisabledSecretResponse(respErr *azcore.ResponseError) bool {
+	return strings.Contains(strings.ToLower(respErr.Error()), "disabled")
 }
