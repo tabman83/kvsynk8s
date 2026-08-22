@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- kvsynk8s_v1alpha1_secretsync.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples
