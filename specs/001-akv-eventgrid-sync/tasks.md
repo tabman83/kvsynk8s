@@ -77,15 +77,15 @@ Single Go module at repository root, standard kubebuilder layout per plan.md: `c
 
 ### Tests for User Story 2 (write first, must fail before implementation)
 
-- [ ] T015 [P] [US2] Parser unit tests in internal/events/parser_test.go using the example payload from contracts/queue-message.md: valid SecretNewVersionCreated → (vault, secretName); SecretNearExpiry/SecretExpired/unknown types → discard; ObjectType != secret → discard; malformed body → discard error without echoing body content
-- [ ] T016 [P] [US2] Listener unit tests in internal/events/listener_test.go with a fake QueueSource: matched events emit reconcile requests for all matching SecretSyncs (case-insensitive vault match); unmatched events deleted silently (FR-006); DequeueCount > 5 → poison delete; batch of 32 processed without loss; burst case — 100+ events spread across multiple fake receive batches all produce reconcile requests with none lost (SC-005)
+- [X] T015 [P] [US2] Parser unit tests in internal/events/parser_test.go using the example payload from contracts/queue-message.md: valid SecretNewVersionCreated → (vault, secretName); SecretNearExpiry/SecretExpired/unknown types → discard; ObjectType != secret → discard; malformed body → discard error without echoing body content
+- [X] T016 [P] [US2] Listener unit tests in internal/events/listener_test.go with a fake QueueSource: matched events emit reconcile requests for all matching SecretSyncs (case-insensitive vault match); unmatched events deleted silently (FR-006); DequeueCount > 5 → poison delete; batch of 32 processed without loss; burst case — 100+ events spread across multiple fake receive batches all produce reconcile requests with none lost (SC-005)
 
 ### Implementation for User Story 2
 
-- [ ] T017 [P] [US2] Implement the QueueSource interface and azqueue-backed implementation in internal/azure/queue.go: batch receive (32), delete, DequeueCount exposure, DefaultAzureCredential
-- [ ] T018 [US2] Implement event parsing in internal/events/parser.go per contracts/queue-message.md rules 1–2 (Base64 decode, azsystemevents deserialization, type/objectType filtering)
-- [ ] T019 [US2] Implement the queue listener in internal/events/listener.go: adaptive poll loop (1–2 s busy → 30 s idle, research R6), map events to SecretSync objects via the manager's cached client, inject reconcile requests through a source.Channel, delete messages per contracts rules 5–6
-- [ ] T020 [US2] Wire the listener into the manager in cmd/main.go and internal/controller/secretsync_controller.go: WatchesRawSource(source.Channel) on the controller builder, listener started as a manager Runnable
+- [X] T017 [P] [US2] Implement the QueueSource interface and azqueue-backed implementation in internal/azure/queue.go: batch receive (32), delete, DequeueCount exposure, DefaultAzureCredential
+- [X] T018 [US2] Implement event parsing in internal/events/parser.go per contracts/queue-message.md rules 1–2 (Base64 decode, azsystemevents deserialization, type/objectType filtering)
+- [X] T019 [US2] Implement the queue listener in internal/events/listener.go: adaptive poll loop (1–2 s busy → 30 s idle, research R6), map events to SecretSync objects via the manager's cached client, inject reconcile requests through a source.Channel, delete messages per contracts rules 5–6
+- [X] T020 [US2] Wire the listener into the manager in cmd/main.go and internal/controller/secretsync_controller.go: WatchesRawSource(source.Channel) on the controller builder, listener started as a manager Runnable
 
 **Checkpoint**: quickstart V2 passes — rotation lands in <60 s; US1 still fully functional with the queue unconfigured
 

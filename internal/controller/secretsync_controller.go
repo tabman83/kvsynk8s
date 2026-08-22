@@ -29,7 +29,10 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	kvsynk8sv1alpha1 "github.com/tabman83/kvsynk8s/api/v1alpha1"
 	"github.com/tabman83/kvsynk8s/internal/azure"
@@ -378,10 +381,27 @@ func takesPrecedence(a, b *kvsynk8sv1alpha1.SecretSync) bool {
 // means drift on a managed Secret (deleted or edited in-cluster) re-triggers
 // a reconcile of its owning SecretSync automatically, without waiting for
 // the periodic RequeueAfter (US3 drift repair).
-func (r *SecretSyncReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+//
+// events is the channel the queue listener (internal/events, T019) sends
+// matched SecretSync objects on; a nil events channel is the US1 contract:
+// the queue is completely unconfigured, so no WatchesRawSource is added at
+// all and reconciliation runs exclusively through the normal For/Owns
+// watches plus the periodic RequeueAfter (cmd/main.go only builds a listener
+// and a non-nil channel when --queue-url/QUEUE_URL is set).
+func (r *SecretSyncReconciler) SetupWithManager(mgr ctrl.Manager, events <-chan event.GenericEvent) error {
+	bldr := ctrl.NewControllerManagedBy(mgr).
 		For(&kvsynk8sv1alpha1.SecretSync{}).
 		Owns(&corev1.Secret{}).
-		Named("secretsync").
-		Complete(r)
+		Named("secretsync")
+
+	if events != nil {
+		// Near-realtime path (US2): the listener has already matched the
+		// notification to these specific SecretSync objects (case-insensitive
+		// vault match, data-model.md), so EnqueueRequestForObject just reads
+		// their namespace/name back off into a reconcile.Request -- the same
+		// Reconcile this controller already runs for every other trigger.
+		bldr = bldr.WatchesRawSource(source.Channel(events, &handler.EnqueueRequestForObject{}))
+	}
+
+	return bldr.Complete(r)
 }
