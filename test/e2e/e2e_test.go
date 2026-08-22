@@ -269,17 +269,15 @@ var _ = Describe("Manager", Ordered, func() {
 		})
 
 		// +kubebuilder:scaffold:e2e-webhooks-checks
-
-		// TODO: Customize the e2e test suite with scenarios specific to your project.
-		// Consider applying sample/CR(s) and check their status and/or verifying
-		// the reconciliation by using the metrics, i.e.:
-		// metricsOutput, err := getMetricsOutput()
-		// Expect(err).NotTo(HaveOccurred(), "Failed to retrieve logs from curl pod")
-		// Expect(metricsOutput).To(ContainSubstring(
-		//    fmt.Sprintf(`controller_runtime_reconcile_total{controller="%s",result="success"} 1`,
-		//    strings.ToLower(<Kind>),
-		// ))
 	})
+
+	// T032: the full SecretSync sync loop against real Azurite/Lowkey Vault
+	// containers on the kind cluster's own Docker network. Declared as its
+	// own nested, Ordered Context (secretsync_test.go) so it runs after the
+	// "Manager" Context above and reuses the namespace/CRDs/operator
+	// deployment that Context's BeforeAll already created, rather than
+	// standing up a second copy of everything.
+	registerSecretSyncEmulatorTests()
 })
 
 // serviceAccountToken returns a token for the specified service account in the given namespace.
