@@ -21,6 +21,7 @@ Do not invent those sections before the code exists.
 - Never commit directly to `master`. Create a branch, commit there, push, open a PR.
 - The human operator (Nino) reviews every PR and decides when it gets merged. Do not merge a PR yourself, and do not assume approval — wait for an explicit "merge it".
 - One PR per logical change. Keep the diff focused on what was asked.
+- When merging: use squash merge (`gh pr merge --squash --delete-branch`), and always delete the branch (local and remote) after merging.
 
 ## PR descriptions
 
