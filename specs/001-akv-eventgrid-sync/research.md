@@ -1,0 +1,67 @@
+# Phase 0 Research: Event-Driven Azure Key Vault to Kubernetes Secret Sync
+
+All Technical Context unknowns resolved. Sources: Microsoft Learn (Key Vault Event Grid integration, AKS Workload ID, Azure SDK for Go library index — azidentity/azqueue/azsystemevents), akv2k8s.io docs (prior art), controller-runtime docs, queried 2026-08-21 via Context7 / Microsoft Docs MCP.
+
+## R1. Language and runtime
+
+- **Decision**: Go (current stable, 1.25+). Chosen on task fit, not maintainer preference (revisited 2026-08-21 at the maintainer's request — an earlier draft picked C#/.NET for toolchain familiarity).
+- **Rationale**: Kubernetes operators are Go's home turf. Every directly comparable project — akv2k8s itself, external-secrets-operator, azure-service-operator, azure-workload-identity — is Go on controller-runtime, so battle-tested patterns can be borrowed rather than reinvented, and outside contributors from that community can actually contribute. The Azure SDK for Go covers every integration first-party (R4, R5). Operationally Go wins for a cluster-resident daemon: small static binary in a distroless image (tens of MB, no runtime to patch), low memory per pod, fast start.
+- **Alternatives considered**: C#/.NET 10 + KubeOps (rejected: KubeOps is a small community project compared to controller-runtime's SIG-maintained informer/workqueue machinery; larger images and memory footprint; no comparable ecosystem of operators to learn from); Rust + kube-rs (solid but a much smaller operator ecosystem, no first-party advantage for this task).
+
+## R2. Operator framework
+
+- **Decision**: controller-runtime with kubebuilder scaffolding (the reference stack maintained by Kubernetes SIG API Machinery).
+- **Rationale**: gives CRD generation from Go types (`controller-gen`), cached informer-based watches, per-item workqueue with rate-limited requeue/backoff, finalizer helpers, status subresource handling, and owned-resource watches (the managed Secret is watched automatically → drift repair is event-driven, not poll-driven). `source.Channel` provides exactly the hook needed to inject external (queue) events into the reconcile queue. envtest gives reconciler tests against a real API server.
+- **Alternatives considered**: Operator SDK (a wrapper over the same controller-runtime; extra layer, no benefit here — simplicity first); raw client-go watch loop (rejected: re-implements requeue/backoff/informer plumbing, more code to test).
+
+## R3. Notification transport (queue choice)
+
+- **Decision**: Azure Storage Queue as the Event Grid event handler destination.
+- **Rationale**: Event Grid supports Storage Queues as a native handler; Storage Queues are the cheapest and operationally simplest queue in Azure, support `DefaultAzureCredential` auth (`Storage Queue Data Message Processor` role), at-least-once delivery with visibility timeout and `DequeueCount` for poison handling. The spec's clarification #1 mandates pull-based delivery; this is its simplest realization.
+- **Alternatives considered**: Service Bus queue (rejected: more features than needed — sessions, ordering — at higher cost and setup complexity); Event Hubs (rejected: streaming semantics and checkpointing are overkill for low-volume notifications).
+
+## R4. Queue message format and parsing
+
+- **Decision**: Parse queue messages as Event Grid schema events using the Azure SDK for Go `azsystemevents` module (v1.0.0+); act only on `eventType == "Microsoft.KeyVault.SecretNewVersionCreated"` deserialized to `KeyVaultSecretNewVersionCreatedEventData`.
+- **Rationale**: when Event Grid delivers to a Storage Queue, the message body is the EventGridEvent JSON (Base64-encoded in the queue message). The system-events module gives typed access to `VaultName`, `ObjectName`, `ObjectType`, `Version`, `ID` — everything needed to map to declarations, and no secret value ever transits the queue. Per Microsoft's consumption guidance: verify the event comes from an expected vault (check topic/vaultName), check eventType explicitly, ignore unknown fields/types.
+- **Alternatives considered**: CloudEvents schema (viable, but Event Grid system topics default to Event Grid schema and the SDK types target it; no benefit for a single consumer); hand-rolled JSON parsing (rejected: fragile, SDK exists).
+- **v1 behavior**: `SecretNearExpiry` / `SecretExpired` events are recognized and discarded without action (clarification #4).
+
+## R5. Azure authentication
+
+- **Decision**: `azidentity.DefaultAzureCredential` (azidentity ≥ 1.3 for workload identity; current 1.14.x), which resolves to `WorkloadIdentityCredential` in-cluster via Microsoft Entra Workload ID federation. Same credential for Key Vault (`azsecrets`) and Storage Queue (`azqueue`).
+- **Rationale**: platform-issued, short-lived tokens (constitution: Security Requirements); the workload-identity webhook injects the env/projected token automatically once the ServiceAccount is annotated. `DefaultAzureCredential` also lets developers run locally against az CLI credentials without code changes.
+- **Azure roles (least privilege)**: `Key Vault Secrets User` scoped to the vault; `Storage Queue Data Message Processor` scoped to the queue.
+- **Alternatives considered**: client secret / certificate in a K8s Secret (rejected: violates constitution — long-lived static credential); AKS identity bindings (preview) (rejected for v1: preview-only, beta SDK requirement).
+
+## R6. "Near realtime" and queue polling cadence
+
+- **Decision**: short-poll the Storage Queue with an adaptive delay — 1–2 s while messages are flowing, backing off to a max of ~30 s when idle. Batch-receive (up to 32 messages) for burst handling.
+- **Rationale**: Storage Queues have no push; short-polling the queue is a few cheap storage GETs per minute and touches Key Vault zero times when nothing changed. This preserves the project's premise — no polling *of Key Vault* — while comfortably meeting the <60 s propagation target (Event Grid delivery is typically sub-second to seconds; queue poll adds ≤30 s worst case, ~1–2 s typical).
+- **Alternatives considered**: fixed 1 s poll (rejected: needless constant traffic); long visibility-timeout tricks (unnecessary complexity).
+
+## R7. Ownership and drift control of managed Secrets
+
+- **Decision**: the managed Secret carries an `ownerReference` to its `SecretSync` (same namespace → garbage collection on CR delete as backstop to the finalizer) plus a `app.kubernetes.io/managed-by: kvsynk8s` label. The controller refuses to create/overwrite a Secret that exists without that ownership marker (FR-012) and reconciles drift on its own Secrets.
+- **Rationale**: ownerReferences are the Kubernetes-native lifecycle mechanism; the label makes "managed by us" checkable before any write.
+- **Alternatives considered**: annotations with a content hash only (kept as an addition — a hash annotation of the synced version avoids no-op writes — but not as the ownership signal).
+
+## R8. Reconciliation strategy
+
+- **Decision**: two triggers into one idempotent sync-engine path: (a) queue events mapped to matching declarations and injected into the reconcile queue via `source.Channel`, (b) controller-runtime timed requeue (`RequeueAfter`) of every `SecretSync` at the configured interval (default 1 h, clarification #3). The engine always reads the *latest* secret from Key Vault and writes only on change ("latest wins", FR-005).
+- **Rationale**: single code path means event handling and reconciliation cannot diverge; latest-wins makes duplicates and out-of-order events harmless.
+- **Alternatives considered**: version-targeted fetches from event payloads (rejected: enables rollback on stale events, violates FR-005).
+
+## R9. Retry, backoff, failure isolation
+
+- **Decision**: rely on Azure SDK built-in retry (with jittered exponential backoff) for transient HTTP/throttling, plus controller-runtime's rate-limited workqueue for per-declaration requeue-with-backoff on failure. Poison queue messages: after `DequeueCount` > 5, delete and log metadata (never content interpreted as value) — reconciliation covers whatever the message would have triggered.
+- **Rationale**: per-declaration requeue isolates failures (FR-008); SDK retry handles 429s from bursts (SC-005 edge case).
+
+## R10. Testing approach
+
+- **Decision**: three layers, all automated and Azure-free.
+  1. **Unit + envtest**: standard `go test`. Small interfaces (`SecretReader` for Key Vault, `QueueSource` for the queue) with hand-written fakes make the sync engine, parser, backoff, and ownership logic unit-testable. Reconciler and finalizer behavior tested with controller-runtime's envtest (real API server + etcd binaries, no cluster). Redaction tests plant sentinel values (`SENTINEL-...`) in fake secrets and assert captured log/status output never contains them (SC-004).
+  2. **Integration** (build tag `integration`, requires Docker): testcontainers-go runs **Azurite** (Microsoft's official Storage emulator — validates the azqueue-backed QueueSource against the real wire protocol) and **Lowkey Vault** (community Key Vault emulator — validates the azsecrets-backed SecretReader). Fallback if Lowkey Vault's auth-challenge emulation fights the Go SDK: a minimal local HTTPS stub for the two Key Vault REST calls used, recorded here when taken.
+  3. **E2E**: **kind** cluster (kubebuilder's native e2e target — chosen over k3s/k3d for scaffolding fit and ecosystem prevalence; either would work) running the built operator image against the emulators, asserting the full loop including the <60 s event-to-Secret path and drift repair. Event Grid itself is simulated by writing schema-correct messages to the queue — Event Grid's own delivery plus workload identity remain the only things verified manually against real Azure (quickstart validation).
+  All three layers run in CI (GitHub Actions) on every PR, per constitution IV.
+- **Alternatives considered**: mocking frameworks (unnecessary — Go interfaces + fakes are idiomatic and simpler); e2e against real Azure in CI (rejected: needs cloud credentials and a live vault in CI, flaky and slow; the emulator gap is covered by the manual quickstart run); k3s/k3d instead of kind (viable, but kubebuilder scaffolds kind-based e2e out of the box).
