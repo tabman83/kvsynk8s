@@ -8,13 +8,106 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current state
 
-The repository contains only `README.md` — no source code, build system, or tests yet. There are no build/lint/test commands to document.
+A working kubebuilder operator. All of Phases 1-8 in
+`specs/001-akv-eventgrid-sync/tasks.md` are implemented except:
 
-When the first real code lands, update this file with:
-- the actual build, lint, and test commands (including how to run a single test)
-- the architecture: what watches Key Vault, how changes are propagated, how the K8s secrets are written (operator/controller? CRDs? sidecar?), and how auth to Azure and to the cluster is done
+- T032 (partial) — the E2E suite in `test/e2e/secretsync_test.go` that
+  exercises the actual sync loop (create, SC-001 queue propagation, drift
+  repair, deletion, TargetConflict, log redaction) is written and was proven
+  correct by hand against Azurite/Lowkey Vault, but its `Context` is gated
+  behind `KVSYNK8S_E2E_EMULATORS=1` (unset by default, and not set in CI)
+  because of an unresolved DNS-reachability flake — see research.md R10.
+- T038 (the real-AKS validation run, which needs a live subscription and is
+  done by hand, not by an agent).
 
-Do not invent those sections before the code exists.
+## Architecture
+
+Standard kubebuilder layout, one Go module, one controller.
+
+- **`cmd/main.go`** — manager setup: flags/env (queue URL, reconcile
+  interval, Azure client ID), wires the Key Vault reader, optionally the
+  queue listener (only if a queue URL is configured), and the reconciler.
+- **`api/v1alpha1/secretsync_types.go`** — the `SecretSync` CRD (spec: vault
+  name/secret, optional target secret name/data key; status: state/reason/
+  message/syncedVersion/lastSyncTime/observedGeneration).
+- **`internal/controller/secretsync_controller.go`** — the controller-runtime
+  reconcile loop: finalizer-driven cleanup on deletion, target-conflict
+  detection (first writer wins), periodic `RequeueAfter` (default 1h) as the
+  drift/missed-event safety net, `Owns(&corev1.Secret{})` so in-cluster
+  edits/deletes of the managed Secret re-trigger a reconcile, and an optional
+  `WatchesRawSource(source.Channel(...))` fed by the queue listener.
+- **`internal/sync/engine.go`** — the sync engine: resolves target
+  name/dataKey defaults, calls the `SecretReader`, decides the resulting
+  status (`Pending`/`InSync`/`Failing` + reason). No Kubernetes API I/O of its
+  own; the reconciler applies whatever it returns.
+- **`internal/sync/writer.go`** — the *only* code path in the whole codebase
+  that ever places a secret value into a Kubernetes object
+  (`SecretWriter.CreateOrUpdate`). Every other package that needs a value
+  synced goes through this file. Nothing here logs the value; a static AST
+  check in `internal/sync/redaction_test.go` enforces that.
+- **`internal/azure/keyvault.go`** and **`internal/azure/queue.go`** — thin
+  wrappers around `azsecrets` and `azqueue`, each behind a small interface
+  (`SecretReader`, `QueueSource`) so the rest of the codebase never imports
+  the Azure SDK directly.
+- **`internal/events/`** — the Event Grid → Storage Queue path: `parser.go`
+  decodes a queue message into a `(vault, secret, version)` tuple or a clean
+  discard (wrong event type, wrong object type, malformed body);
+  `listener.go` is a `manager.Runnable` that polls the queue with an adaptive
+  delay (2s busy / 30s idle), matches events against `SecretSync` objects via
+  the manager's cached client, and injects matches into the controller
+  through a `source.Channel`.
+
+**Auth.** Azure: `azidentity.DefaultAzureCredential`, i.e. Microsoft Entra
+Workload ID in-cluster (falls back through the standard credential chain
+locally) — no static credentials anywhere. Kubernetes: the in-cluster
+ServiceAccount / kubeconfig controller-runtime already handles.
+
+**Change propagation, in order of how a value actually reaches the cluster:**
+a secret is rotated in Key Vault → Key Vault emits a
+`Microsoft.KeyVault.SecretNewVersionCreated` event → Event Grid delivers it
+(Base64-encoded) to an Azure Storage Queue → the listener pulls it, matches it
+against `SecretSync` objects, and enqueues a reconcile request → the
+reconciler re-reads the **latest** value from Key Vault (never trusting the
+event's own version — latest always wins) and writes it through
+`SecretWriter`. If the queue is unconfigured, misconfigured, or the event is
+simply lost, the periodic reconcile (default every hour, `RequeueAfter` on the
+controller) reaches the same end state on its own; the queue path only buys
+speed, never correctness.
+
+## Build, lint, test
+
+```bash
+make build              # go build -o bin/manager cmd/main.go (also regenerates manifests/deepcopy)
+make test               # unit tests + envtest (real API server), all packages except test/e2e
+make lint                # golangci-lint run
+make test-integration    # azqueue against Azurite + azsecrets against Lowkey Vault, via testcontainers-go. Needs Docker.
+make test-e2e            # scaffold checks against a kind cluster (spins the cluster up and tears it down);
+                         # the SecretSync sync-loop Context is skipped unless KVSYNK8S_E2E_EMULATORS=1 (see T032 above)
+```
+
+Run a single test:
+
+```bash
+# one package, unit/envtest layer (needs KUBEBUILDER_ASSETS for envtest-backed packages,
+# which `make test` sets up automatically via setup-envtest; for a package that has no
+# envtest dependency — e.g. internal/sync, internal/events — plain `go test` is enough)
+go test ./internal/sync/... -run TestSync_ReaderNotFound_FailingSecretNotFound_NoValueAnywhere -v
+
+# integration layer (build tag `integration`, needs Docker)
+go test -tags integration ./internal/azure/... -run TestStorageQueueSource_BatchReceiveAndDelete -v
+```
+
+CI runs `make test`, `make lint`, and `make test-integration` on every PR
+(`.github/workflows/test.yml`, `lint.yml`, `test-integration.yml`); `test-e2e`
+runs there too (`test-e2e.yml`) and additionally on `v*` tag pushes as part
+of `release.yml`, which then builds and pushes the multi-arch image to GHCR
+and attaches a rendered install manifest to a GitHub Release.
+
+Once a branch is pushed and its PR is open, watch its checks
+(`gh pr checks <PR#> --watch`) and fix forward on any failure — see the "PR
+CI babysitting" note in `specs/001-akv-eventgrid-sync/tasks.md` for the exact
+loop. A task/PR is not done until its checks are green; never merge it
+yourself, and never weaken a test or lint rule to get there.
 
 ## Workflow: everything goes through a PR
 
