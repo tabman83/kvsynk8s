@@ -189,8 +189,11 @@ func classifyReaderError(err error, owner *kvsynk8sv1alpha1.SecretSync, managed 
 		}
 		return ReasonSecretNotFound, fmt.Sprintf("secret %q not found in vault %q", secretName, vault)
 	case errors.Is(err, azure.ErrSecretDisabled):
-		return ReasonSourceDisabled, fmt.Sprintf(
-			"secret %q in vault %q is disabled; keeping last synced value", secretName, vault)
+		if managed {
+			return ReasonSourceDisabled, fmt.Sprintf(
+				"secret %q in vault %q is disabled; keeping last synced value", secretName, vault)
+		}
+		return ReasonSourceDisabled, fmt.Sprintf("secret %q in vault %q is disabled", secretName, vault)
 	case errors.Is(err, azure.ErrAccessDenied):
 		return ReasonAccessDenied, fmt.Sprintf("access denied reading secret %q from vault %q", secretName, vault)
 	case errors.Is(err, azure.ErrTransient):

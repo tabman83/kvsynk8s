@@ -292,9 +292,10 @@ func main() {
 	}
 
 	if err := (&controller.SecretSyncReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		Reader: secretReader,
+		Client:            mgr.GetClient(),
+		Scheme:            mgr.GetScheme(),
+		Reader:            secretReader,
+		ReconcileInterval: reconcileInterval,
 	}).SetupWithManager(mgr, eventsCh); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "secretsync")
 		os.Exit(1)

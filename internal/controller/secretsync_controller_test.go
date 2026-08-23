@@ -19,6 +19,8 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sync"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -28,6 +30,10 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes/scheme"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/config"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	kvsynk8sv1alpha1 "github.com/tabman83/kvsynk8s/api/v1alpha1"
@@ -61,13 +67,23 @@ const (
 	// work identically; these are fake per constitution I).
 	fakeVaultName = "fake-vault"
 	fakeDataKey   = "value"
+
+	// fakeSecretName is the vault secret name reused by the US3 reconciliation
+	// specs below (RequeueAfter, drift repair, convergence, retry/backoff).
+	fakeSecretName = "fake-secret"
 )
 
 // fakeSecretReader is a hand-rolled azure.SecretReader for envtest, which has
 // no network access to Azure (T010 instructions). Every value it can return
 // is an obviously-fake sentinel, per constitution I ("Test fixtures MUST use
 // fake values that are clearly fake").
+//
+// mu guards values: the US3 tests (T021) run a real manager whose controller
+// goroutine calls GetLatest concurrently with the test goroutine calling set
+// (e.g. to change the reader's answer mid-test, simulating a vault-side
+// change with no event injected) — without a lock that's a data race.
 type fakeSecretReader struct {
+	mu     sync.Mutex
 	values map[string]fakeSecretEntry
 }
 
@@ -87,11 +103,15 @@ func newFakeSecretReader() *fakeSecretReader {
 //
 //nolint:unparam // see comment above
 func (f *fakeSecretReader) set(vaultName, secretName, value, version string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.values[vaultName+"/"+secretName] = fakeSecretEntry{value: value, version: version}
 }
 
 // GetLatest implements azure.SecretReader.
 func (f *fakeSecretReader) GetLatest(_ context.Context, vaultName, secretName string) (string, string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	entry, ok := f.values[vaultName+"/"+secretName]
 	if !ok {
 		return "", "", fmt.Errorf("vault %q secret %q: %w", vaultName, secretName, azure.ErrSecretNotFound)
@@ -103,6 +123,80 @@ func (f *fakeSecretReader) GetLatest(_ context.Context, vaultName, secretName st
 }
 
 var _ azure.SecretReader = (*fakeSecretReader)(nil)
+
+// flakyThenOKReader fails GetLatest with a transient error the first
+// failCount calls, then succeeds every time after. Used by the retry/backoff
+// test (T021, constitution IV): this failure-then-recovery pattern is
+// observed only through controller-runtime's rate-limited workqueue
+// automatically re-invoking Reconcile after an error return, which requires
+// a real running controller (see startManagerFor) — a manually-invoked
+// Reconcile call, as used elsewhere in this file, cannot exercise it.
+type flakyThenOKReader struct {
+	mu             sync.Mutex
+	remainingFails int
+	value, version string
+}
+
+func (f *flakyThenOKReader) GetLatest(_ context.Context, _, _ string) (string, string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.remainingFails > 0 {
+		f.remainingFails--
+		return "", "", fmt.Errorf("kvsynk8s: fake transient failure: %w", azure.ErrTransient)
+	}
+	return f.value, f.version, nil
+}
+
+var _ azure.SecretReader = (*flakyThenOKReader)(nil)
+
+// startManagerFor spins up a full manager (cache + registered controller, no
+// metrics/health/webhook endpoints) around a fresh SecretSyncReconciler using
+// reader and interval, and starts it in the background. Returning cancel lets
+// the caller (typically via DeferCleanup) stop it once the spec finishes.
+//
+// This exists because several US3 behaviors only manifest on the real
+// controller-runtime request path — the Owns() watch re-triggering a
+// reconcile on drift, the periodic RequeueAfter firing on its own schedule,
+// and the rate-limited workqueue retrying a failed reconcile — none of which
+// a direct r.Reconcile(ctx, req) call (the pattern the rest of this file
+// uses for US1's synchronous, single-shot assertions) can exercise.
+func startManagerFor(reader azure.SecretReader, interval time.Duration) context.CancelFunc {
+	// Each It() in this Context starts its own manager, and controller-runtime
+	// validates controller-name uniqueness against a process-global metrics
+	// registry — so a second "secretsync" controller in a later spec would
+	// otherwise be rejected as a duplicate even though the prior manager has
+	// already been stopped. SkipNameValidation opts out of that check; these
+	// tests don't scrape metrics, so unique names/metrics per controller
+	// don't matter here.
+	skipNameValidation := true
+	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
+		Scheme:                 scheme.Scheme,
+		Metrics:                metricsserver.Options{BindAddress: "0"},
+		HealthProbeBindAddress: "0",
+		LeaderElection:         false,
+		Controller: config.Controller{
+			SkipNameValidation: &skipNameValidation,
+		},
+	})
+	Expect(err).NotTo(HaveOccurred())
+
+	r := &SecretSyncReconciler{
+		Client:            mgr.GetClient(),
+		Scheme:            mgr.GetScheme(),
+		Reader:            reader,
+		ReconcileInterval: interval,
+	}
+	Expect(r.SetupWithManager(mgr, nil)).To(Succeed())
+
+	mgrCtx, cancel := context.WithCancel(ctx)
+	go func() {
+		defer GinkgoRecover()
+		_ = mgr.Start(mgrCtx)
+	}()
+	Expect(mgr.GetCache().WaitForCacheSync(mgrCtx)).To(BeTrue())
+
+	return cancel
+}
 
 // newTestSecretSync builds a minimal, valid SecretSync for envtest. Vault and
 // secret names are fake identifiers only; no value ever appears in a spec
@@ -163,7 +257,7 @@ var _ = Describe("SecretSync Controller", func() {
 
 			name := "ss-create-" + shortUID()
 			vaultName := fakeVaultName
-			vaultSecret := "fake-secret"
+			vaultSecret := fakeSecretName
 			targetName := "target-" + shortUID()
 			dataKey := fakeDataKey
 			const fakeValue = "SENTINEL-fake-value-create-test-not-real"
@@ -205,7 +299,7 @@ var _ = Describe("SecretSync Controller", func() {
 
 			name := "ss-delete-" + shortUID()
 			vaultName := fakeVaultName
-			vaultSecret := "fake-secret"
+			vaultSecret := fakeSecretName
 			targetName := "target-" + shortUID()
 			dataKey := fakeDataKey
 
@@ -306,6 +400,163 @@ var _ = Describe("SecretSync Controller", func() {
 			var secret corev1.Secret
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: targetName, Namespace: namespace}, &secret)).To(Succeed())
 			Expect(string(secret.Data[dataKey])).To(Equal(valueA))
+		})
+	})
+
+	// T021 (US3): recovery/drift-repair behaviors that only exist on the real
+	// controller-runtime request path, not on a manually-invoked Reconcile
+	// call. See startManagerFor's doc comment for why each of these needs a
+	// running manager.
+	Context("US3: periodic reconciliation, drift repair, and retry with backoff", func() {
+		It("returns RequeueAfter equal to the configured reconcile interval on a successful reconcile", func() {
+			ctx := context.Background()
+
+			name := "ss-interval-" + shortUID()
+			vaultName := fakeVaultName
+			vaultSecret := fakeSecretName
+			targetName := "target-" + shortUID()
+			dataKey := fakeDataKey
+
+			reader.set(vaultName, vaultSecret, "SENTINEL-fake-value-interval-test-not-real", "v1")
+
+			ss := newTestSecretSync(namespace, name, vaultName, vaultSecret, targetName, dataKey)
+			Expect(k8sClient.Create(ctx, ss)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), ss)
+			})
+
+			const configuredInterval = 250 * time.Millisecond
+			r := &SecretSyncReconciler{
+				Client:            k8sClient,
+				Scheme:            k8sClient.Scheme(),
+				Reader:            reader,
+				ReconcileInterval: configuredInterval,
+			}
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: namespace}}
+
+			result, err := r.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(configuredInterval))
+		})
+
+		It("re-creates the managed Secret when it is deleted in-cluster, via the Owns() watch", func() {
+			ctx := context.Background()
+
+			name := "ss-recreate-" + shortUID()
+			vaultName := fakeVaultName
+			vaultSecret := fakeSecretName
+			targetName := "target-" + shortUID()
+			dataKey := fakeDataKey
+			targetKey := types.NamespacedName{Name: targetName, Namespace: namespace}
+			const fakeValue = "SENTINEL-fake-value-recreate-test-not-real"
+
+			mgrReader := newFakeSecretReader()
+			mgrReader.set(vaultName, vaultSecret, fakeValue, "v1")
+
+			ss := newTestSecretSync(namespace, name, vaultName, vaultSecret, targetName, dataKey)
+			Expect(k8sClient.Create(ctx, ss)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), ss)
+			})
+
+			// A long interval: only the Owns() watch, not periodic
+			// reconciliation, should be responsible for the re-creation below.
+			cancel := startManagerFor(mgrReader, time.Hour)
+			DeferCleanup(cancel)
+
+			var secret corev1.Secret
+			Eventually(func() error {
+				return k8sClient.Get(ctx, targetKey, &secret)
+			}).Should(Succeed(), "Secret should be created once the manager's informer picks up the SecretSync (startup convergence)")
+
+			Expect(k8sClient.Delete(ctx, &secret)).To(Succeed())
+
+			Eventually(func() error {
+				return k8sClient.Get(ctx, targetKey, &corev1.Secret{})
+			}).Should(Succeed(), "managed Secret should be re-created via the Owns() watch without any manual reconcile")
+		})
+
+		It("converges to a changed vault value on the next scheduled reconcile with no event injected", func() {
+			ctx := context.Background()
+
+			name := "ss-converge-" + shortUID()
+			vaultName := fakeVaultName
+			vaultSecret := fakeSecretName
+			targetName := "target-" + shortUID()
+			dataKey := fakeDataKey
+			targetKey := types.NamespacedName{Name: targetName, Namespace: namespace}
+
+			mgrReader := newFakeSecretReader()
+			mgrReader.set(vaultName, vaultSecret, "SENTINEL-fake-value-v1-not-real", "v1")
+
+			ss := newTestSecretSync(namespace, name, vaultName, vaultSecret, targetName, dataKey)
+			Expect(k8sClient.Create(ctx, ss)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), ss)
+			})
+
+			const shortInterval = 200 * time.Millisecond
+			cancel := startManagerFor(mgrReader, shortInterval)
+			DeferCleanup(cancel)
+
+			Eventually(func() (string, error) {
+				var secret corev1.Secret
+				if err := k8sClient.Get(ctx, targetKey, &secret); err != nil {
+					return "", err
+				}
+				return string(secret.Data[dataKey]), nil
+			}).Should(Equal("SENTINEL-fake-value-v1-not-real"))
+
+			// The vault "changes" with no queue event injected: only the
+			// periodic RequeueAfter can pick this up.
+			mgrReader.set(vaultName, vaultSecret, "SENTINEL-fake-value-v2-not-real", "v2")
+
+			Eventually(func() (string, error) {
+				var secret corev1.Secret
+				if err := k8sClient.Get(ctx, targetKey, &secret); err != nil {
+					return "", err
+				}
+				return string(secret.Data[dataKey]), nil
+			}, 5*time.Second, 50*time.Millisecond).Should(Equal("SENTINEL-fake-value-v2-not-real"))
+		})
+
+		It("retries a transient reader failure via the rate-limited workqueue until InSync (constitution IV)", func() {
+			ctx := context.Background()
+
+			name := "ss-retry-" + shortUID()
+			vaultName := fakeVaultName
+			vaultSecret := fakeSecretName
+			targetName := "target-" + shortUID()
+			dataKey := fakeDataKey
+
+			ss := newTestSecretSync(namespace, name, vaultName, vaultSecret, targetName, dataKey)
+			Expect(k8sClient.Create(ctx, ss)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), ss)
+			})
+
+			// Fails the first 3 attempts with a transient error, then
+			// succeeds: exercises retry via controller-runtime's default
+			// rate-limited workqueue, without any manual re-reconcile.
+			flaky := &flakyThenOKReader{
+				remainingFails: 3,
+				value:          "SENTINEL-fake-value-recovered-not-real",
+				version:        "v9",
+			}
+
+			// A long interval: convergence here must come from error-driven
+			// backoff retries, not the periodic reconcile.
+			cancel := startManagerFor(flaky, time.Hour)
+			DeferCleanup(cancel)
+
+			req := types.NamespacedName{Name: name, Namespace: namespace}
+			Eventually(func() (kvsynk8sv1alpha1.SecretSyncState, error) {
+				var updated kvsynk8sv1alpha1.SecretSync
+				if err := k8sClient.Get(ctx, req, &updated); err != nil {
+					return "", err
+				}
+				return updated.Status.State, nil
+			}, 10*time.Second, 50*time.Millisecond).Should(Equal(kvsynk8sv1alpha1.SecretSyncStateInSync))
 		})
 	})
 })
