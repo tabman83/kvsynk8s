@@ -55,6 +55,13 @@ jobs:
             -f charts/kvsynk8s/ci/nondefault-values.yaml > /tmp/render/nondefault.yaml
           hack/check-render.sh /tmp/render/default.yaml /tmp/render/nondefault.yaml
 
+      # helm lint and the equivalence check only ever look at the default
+      # render, so a template could quietly stop honouring a value and nothing
+      # would fail. This renders the toggles on and off and asserts each value
+      # lands where contracts/values.md says.
+      - name: Values land where the contract says
+        run: hack/check-values.sh
+
       - name: No secret material in the chart source
         run: |
           if grep -rniE '<[[:space:]]*SET[-_ ]?ME[[:space:]]*>' charts/; then

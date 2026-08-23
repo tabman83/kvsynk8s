@@ -107,9 +107,10 @@ helm-sync: manifests ## Copy the generated CRD and RBAC rules into the Helm char
 	hack/helm-sync.sh
 
 .PHONY: helm-verify
-helm-verify: kustomize helm-sync ## Lint the chart, render it, and check it still matches the kustomize output.
+helm-verify: kustomize helm-sync ## Lint the chart, check the values contract, and compare against the kustomize output.
 	helm lint charts/kvsynk8s
 	helm lint charts/kvsynk8s -f charts/kvsynk8s/ci/nondefault-values.yaml
+	hack/check-values.sh
 	KUSTOMIZE="$(KUSTOMIZE)" hack/compare-helm-kustomize.sh
 
 .PHONY: lint
