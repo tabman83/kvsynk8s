@@ -26,6 +26,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -78,6 +79,21 @@ type SecretSyncReconciler struct {
 	// changed vault value with no event injected) don't need to wait an
 	// hour; production leaves it at the flag's own default.
 	ReconcileInterval time.Duration
+
+	// Recorder emits Kubernetes Events on the SecretSync (T027, FR-009):
+	// "Synced" (Normal) on every reconcile that ends InSync, "SyncFailed"
+	// (Warning) on every reconcile that ends Failing. SetupWithManager wires
+	// it from mgr.GetEventRecorder when left nil, which is also what lets
+	// every pre-T027 test in this package -- built by hand via
+	// reconcilerFor/&SecretSyncReconciler{...} without ever calling
+	// SetupWithManager -- keep working unchanged: recordEvent silently no-ops
+	// on a nil Recorder rather than requiring every caller to supply one.
+	//
+	// events.EventRecorder (the events.k8s.io/v1 API) rather than the older
+	// client-go/tools/record.EventRecorder: mgr.GetEventRecorderFor is
+	// deprecated (SA1019) in favor of mgr.GetEventRecorder, which returns
+	// this type.
+	Recorder events.EventRecorder
 }
 
 // reconcileInterval returns ReconcileInterval when set, or
@@ -90,6 +106,41 @@ func (r *SecretSyncReconciler) reconcileInterval() time.Duration {
 		return r.ReconcileInterval
 	}
 	return defaultReconcileInterval
+}
+
+// recordEvent emits a Kubernetes Event on ss (T027, FR-009) if a Recorder is
+// configured; it is a silent no-op otherwise, so nothing here ever requires
+// every reconciler in every test to wire one up. reason is always one of the
+// two fixed identifiers "Synced"/"SyncFailed" (never anything derived from
+// upstream error text), and message is built exclusively from vault name,
+// secret name, target namespace/name, and version identifiers -- constitution
+// I / FR-010 forbid anything else, and every call site below sources message
+// from status.Message/status.Reason, which classifyReaderError and this
+// package's own status-building code already restrict the same way.
+func (r *SecretSyncReconciler) recordEvent(ss *kvsynk8sv1alpha1.SecretSync, eventType, reason, message string) {
+	if r.Recorder == nil {
+		return
+	}
+	// action is set equal to reason: both "Synced" and "SyncFailed" already
+	// describe what the controller did, and this operator has no separate
+	// action taxonomy worth introducing (constitution III: simplicity first).
+	r.Recorder.Eventf(ss, nil, eventType, reason, reason, message)
+}
+
+// recordSyncOutcome emits the terminal-state Event for one reconcile's
+// result, per T027: "Synced" on InSync, "SyncFailed" (carrying status.Reason
+// in its message) on Failing. Pending is not terminal (it is only ever set
+// once, transiently, before the very first conflict check/vault read) and
+// gets no event of its own.
+func (r *SecretSyncReconciler) recordSyncOutcome(ss *kvsynk8sv1alpha1.SecretSync, status kvsynk8sv1alpha1.SecretSyncStatus, targetName string) {
+	switch status.State {
+	case kvsynk8sv1alpha1.SecretSyncStateInSync:
+		r.recordEvent(ss, corev1.EventTypeNormal, "Synced", fmt.Sprintf(
+			"synced secret %q (version %q) from vault %q into %s/%s",
+			ss.Spec.Vault.Secret, status.SyncedVersion, ss.Spec.Vault.Name, ss.Namespace, targetName))
+	case kvsynk8sv1alpha1.SecretSyncStateFailing:
+		r.recordEvent(ss, corev1.EventTypeWarning, "SyncFailed", fmt.Sprintf("%s: %s", status.Reason, status.Message))
+	}
 }
 
 // +kubebuilder:rbac:groups=kvsynk8s.io,resources=secretsyncs,verbs=get;list;watch;create;update;patch;delete
@@ -165,6 +216,7 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		if err := r.Status().Update(ctx, &ss); err != nil {
 			return ctrl.Result{}, fmt.Errorf("kvsynk8s: update status for %s: %w", req.NamespacedName, err)
 		}
+		r.recordSyncOutcome(&ss, ss.Status, targetName)
 		return ctrl.Result{RequeueAfter: r.reconcileInterval()}, nil
 	}
 
@@ -251,6 +303,7 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if err := r.Status().Update(ctx, &ss); err != nil {
 		return ctrl.Result{}, fmt.Errorf("kvsynk8s: update status for %s: %w", req.NamespacedName, err)
 	}
+	r.recordSyncOutcome(&ss, status, targetName)
 
 	log.V(1).Info("reconciled SecretSync",
 		"vault", ss.Spec.Vault.Name, "secret", ss.Spec.Vault.Secret, "state", status.State)
@@ -409,25 +462,29 @@ func takesPrecedence(a, b *kvsynk8sv1alpha1.SecretSync) bool {
 // (T021) by starting a real manager and asserting convergence without ever
 // calling Reconcile by hand.
 //
-// events is the channel the queue listener (internal/events, T019) sends
-// matched SecretSync objects on; a nil events channel is the US1 contract:
+// syncEvents is the channel the queue listener (internal/events, T019)
+// sends matched SecretSync objects on; a nil channel is the US1 contract:
 // the queue is completely unconfigured, so no WatchesRawSource is added at
 // all and reconciliation runs exclusively through the normal For/Owns
 // watches plus the periodic RequeueAfter (cmd/main.go only builds a listener
 // and a non-nil channel when --queue-url/QUEUE_URL is set).
-func (r *SecretSyncReconciler) SetupWithManager(mgr ctrl.Manager, events <-chan event.GenericEvent) error {
+func (r *SecretSyncReconciler) SetupWithManager(mgr ctrl.Manager, syncEvents <-chan event.GenericEvent) error {
+	if r.Recorder == nil {
+		r.Recorder = mgr.GetEventRecorder("kvsynk8s")
+	}
+
 	bldr := ctrl.NewControllerManagedBy(mgr).
 		For(&kvsynk8sv1alpha1.SecretSync{}).
 		Owns(&corev1.Secret{}).
 		Named("secretsync")
 
-	if events != nil {
+	if syncEvents != nil {
 		// Near-realtime path (US2): the listener has already matched the
 		// notification to these specific SecretSync objects (case-insensitive
 		// vault match, data-model.md), so EnqueueRequestForObject just reads
 		// their namespace/name back off into a reconcile.Request -- the same
 		// Reconcile this controller already runs for every other trigger.
-		bldr = bldr.WatchesRawSource(source.Channel(events, &handler.EnqueueRequestForObject{}))
+		bldr = bldr.WatchesRawSource(source.Channel(syncEvents, &handler.EnqueueRequestForObject{}))
 	}
 
 	return bldr.Complete(r)
