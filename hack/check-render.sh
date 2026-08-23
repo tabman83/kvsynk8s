@@ -16,7 +16,10 @@
 #      internal/sync/writer.go, and this chart templates no Secret at all;
 #   3. no mapping has a duplicate key — YAML parsers silently keep the last one,
 #      so a template that emits the same label twice is a real bug that reading
-#      the parsed output cannot catch.
+#      the parsed output cannot catch;
+#   4. no two resources of the same kind share a name, and no name exceeds the
+#      63-character DNS limit. Name truncation under a long release name is the
+#      easy way to get two objects silently collapsed into one.
 #
 # Requires: python3 with PyYAML.
 
@@ -110,6 +113,22 @@ for path in sys.argv[1:]:
         # talk about secrets; scanning it produces only noise.
         if doc.get("kind") != "CustomResourceDefinition":
             scan_for_credentials(path, doc, doc.get("kind", "?"))
+
+    seen_names = {}
+    for doc in docs:
+        md = doc.get("metadata", {})
+        ident = (doc.get("kind"), md.get("namespace", ""), md.get("name"))
+        if ident in seen_names:
+            failures.append(
+                "%s: two %s resources both named %r%s — one silently overwrites the other"
+                % (path, ident[0], ident[2], " in namespace %s" % ident[1] if ident[1] else "")
+            )
+        seen_names[ident] = True
+        if ident[2] and len(ident[2]) > 63:
+            failures.append(
+                "%s: %s name %r is %d characters, over the 63-character DNS limit"
+                % (path, ident[0], ident[2], len(ident[2]))
+            )
 
     for hit in set(PLACEHOLDER.findall(text)):
         failures.append("%s: render contains the placeholder %r" % (path, hit))

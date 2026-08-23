@@ -13,9 +13,20 @@ See specs/002-helm-chart/research.md R10.
 {{/*
 Build "<prefix>-<suffix>" and keep it inside the 63-character DNS limit.
 Usage: {{ include "kvsynk8s.name" (dict "ctx" . "suffix" "operator") }}
+
+The truncation takes the characters off the PREFIX, never off the suffix.
+Truncating the whole string instead would be a real bug: the longest release
+name Helm allows (53 characters) plus "-secretsync-admin-role" is over the
+limit, and cutting from the right turns secretsync-admin-role,
+secretsync-editor-role and secretsync-viewer-role into the same name, so the
+three helper ClusterRoles collapse into one. hack/check-render.sh asserts no
+two resources of the same kind end up with the same name.
 */}}
 {{- define "kvsynk8s.name" -}}
-{{- printf "%s-%s" (include "kvsynk8s.prefix" .ctx) .suffix | trunc 63 | trimSuffix "-" -}}
+{{- $suffix := .suffix -}}
+{{- $room := int (sub 62 (len $suffix)) -}}
+{{- $prefix := include "kvsynk8s.prefix" .ctx | trunc $room | trimSuffix "-" -}}
+{{- printf "%s-%s" $prefix $suffix -}}
 {{- end -}}
 
 {{/*

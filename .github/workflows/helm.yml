@@ -53,7 +53,13 @@ jobs:
             > /tmp/render/default.yaml
           helm template kvsynk8s charts/kvsynk8s --namespace kvsynk8s \
             -f charts/kvsynk8s/ci/nondefault-values.yaml > /tmp/render/nondefault.yaml
-          hack/check-render.sh /tmp/render/default.yaml /tmp/render/nondefault.yaml
+          # The longest release name Helm accepts. Names are built by truncating
+          # the prefix, so every suffix must survive intact and no two resources
+          # may end up sharing a name.
+          helm template "$(printf 'r%.0s' $(seq 53))" charts/kvsynk8s \
+            --namespace kvsynk8s > /tmp/render/longname.yaml
+          hack/check-render.sh /tmp/render/default.yaml /tmp/render/nondefault.yaml \
+            /tmp/render/longname.yaml
 
       # helm lint and the equivalence check only ever look at the default
       # render, so a template could quietly stop honouring a value and nothing
