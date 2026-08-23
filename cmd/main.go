@@ -31,6 +31,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
@@ -40,8 +41,16 @@ import (
 	kvsynk8sv1alpha1 "github.com/tabman83/kvsynk8s/api/v1alpha1"
 	"github.com/tabman83/kvsynk8s/internal/azure"
 	"github.com/tabman83/kvsynk8s/internal/controller"
+	"github.com/tabman83/kvsynk8s/internal/events"
 	// +kubebuilder:scaffold:imports
 )
+
+// eventsChannelBufferSize sizes the channel the queue listener uses to hand
+// matched SecretSync objects to the controller's source.Channel watch. A
+// burst (SC-005: 100+ events/min) can match many SecretSyncs faster than
+// they reconcile; a generously sized buffer means the listener's Receive/
+// delete loop is never stalled waiting for the controller to catch up.
+const eventsChannelBufferSize = 256
 
 // defaultReconcileInterval is the periodic full-reconciliation cadence used
 // when neither --reconcile-interval nor RECONCILE_INTERVAL is set. It is the
@@ -252,20 +261,41 @@ func main() {
 		os.Exit(1)
 	}
 
-	// The queue listener that triggers reconciles on Key Vault change events
-	// (T017-T020) is not wired yet; the reader below is enough for the
-	// engine to fetch values during a normal or periodic reconcile.
 	secretReader, err := azure.NewSecretReader()
 	if err != nil {
 		setupLog.Error(err, "Failed to create key vault secret reader")
 		os.Exit(1)
 	}
 
+	// The queue listener (T017-T019) is optional: US1 must keep working
+	// with the queue completely unconfigured (plan.md checkpoint for US2).
+	// Without --queue-url/QUEUE_URL, eventsCh stays nil and
+	// SetupWithManager adds no WatchesRawSource at all -- the controller's
+	// normal reconcile + periodic requeue path is entirely untouched.
+	var eventsCh chan event.GenericEvent
+	if queueURL != "" {
+		queueSource, err := azure.NewQueueSource(queueURL)
+		if err != nil {
+			setupLog.Error(err, "Failed to create storage queue source")
+			os.Exit(1)
+		}
+
+		eventsCh = make(chan event.GenericEvent, eventsChannelBufferSize)
+		listener := events.NewListener(queueSource, mgr.GetClient(), eventsCh)
+		if err := mgr.Add(listener); err != nil {
+			setupLog.Error(err, "Failed to register queue listener")
+			os.Exit(1)
+		}
+		setupLog.Info("Queue listener enabled", "queueURL", queueURL)
+	} else {
+		setupLog.Info("No queue URL configured; relying on periodic reconciliation only")
+	}
+
 	if err := (&controller.SecretSyncReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
 		Reader: secretReader,
-	}).SetupWithManager(mgr); err != nil {
+	}).SetupWithManager(mgr, eventsCh); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "secretsync")
 		os.Exit(1)
 	}
