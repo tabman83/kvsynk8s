@@ -32,7 +32,7 @@ Standard kubebuilder layout, one Go module, one controller.
   message/syncedVersion/lastSyncTime/observedGeneration).
 - **`internal/controller/secretsync_controller.go`** — the controller-runtime
   reconcile loop: finalizer-driven cleanup on deletion, target-conflict
-  detection (first writer wins), periodic `RequeueAfter` (default 1h) as the
+  detection (first writer wins), periodic `RequeueAfter` (default 4h) as the
   drift/missed-event safety net, `Owns(&corev1.Secret{})` so in-cluster
   edits/deletes of the managed Secret re-trigger a reconcile, and an optional
   `WatchesRawSource(source.Channel(...))` fed by the queue listener.

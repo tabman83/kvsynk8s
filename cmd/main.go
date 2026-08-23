@@ -56,7 +56,7 @@ const eventsChannelBufferSize = 256
 // when neither --reconcile-interval nor RECONCILE_INTERVAL is set. It is the
 // safety net for missed events, vault-side deletions, and in-cluster drift
 // (plan.md, data-model.md).
-const defaultReconcileInterval = time.Hour
+const defaultReconcileInterval = 4 * time.Hour
 
 var (
 	scheme   = runtime.NewScheme()
@@ -117,7 +117,7 @@ func main() {
 		durationFromEnv("RECONCILE_INTERVAL", defaultReconcileInterval),
 		"How often to fully reconcile every SecretSync against Key Vault; the "+
 			"safety net for missed events, vault-side deletions, and in-cluster "+
-			"drift (env: RECONCILE_INTERVAL, default 1h).")
+			"drift (env: RECONCILE_INTERVAL, default 4h).")
 	flag.StringVar(&azureClientID, "azure-client-id", os.Getenv("AZURE_CLIENT_ID"),
 		"Client ID of the Microsoft Entra Workload ID used to authenticate to "+
 			"Azure (env: AZURE_CLIENT_ID). DefaultAzureCredential already reads "+
