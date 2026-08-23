@@ -43,9 +43,11 @@ jobs:
           helm lint charts/kvsynk8s
           helm lint charts/kvsynk8s -f charts/kvsynk8s/ci/nondefault-values.yaml
 
-      # Renders with defaults and with every documented value set to something
-      # non-default. Both must succeed, and both must survive the render checks
-      # (non-empty, no Secret, no duplicate keys, no placeholders).
+      # Renders with defaults, with every documented value set to something
+      # non-default, and under the longest release name Helm accepts. All three
+      # must succeed and survive the render checks (non-empty, no Secret, no
+      # duplicate keys, no colliding or over-long names, no placeholders, no
+      # credential-shaped values).
       - name: Render the chart
         run: |
           mkdir -p /tmp/render
@@ -68,7 +70,9 @@ jobs:
       - name: Values land where the contract says
         run: hack/check-values.sh
 
-      - name: No secret material in the chart source
+      # The renders are checked by check-render.sh above; this covers the chart
+      # source itself, where install.yaml keeps its <SET-ME> annotation.
+      - name: No placeholder values left in the chart source
         run: |
           if grep -rniE '<[[:space:]]*SET[-_ ]?ME[[:space:]]*>' charts/; then
             echo "chart source carries a placeholder that looks like it wants a real value" >&2
