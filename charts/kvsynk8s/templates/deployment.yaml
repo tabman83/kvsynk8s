@@ -54,14 +54,18 @@ spec:
         */}}
         - --leader-elect
         - --health-probe-bind-address=:8081
+        {{- /*
+          Quoted through `quote` so a value with YAML-significant characters in
+          it cannot break the manifest or inject extra args.
+        */}}
         {{- if .Values.operator.queueURL }}
-        - --queue-url={{ .Values.operator.queueURL }}
+        - {{ printf "--queue-url=%s" .Values.operator.queueURL | quote }}
         {{- end }}
         {{- if .Values.operator.reconcileInterval }}
-        - --reconcile-interval={{ .Values.operator.reconcileInterval }}
+        - {{ printf "--reconcile-interval=%s" .Values.operator.reconcileInterval | quote }}
         {{- end }}
         {{- if .Values.azure.clientID }}
-        - --azure-client-id={{ .Values.azure.clientID }}
+        - {{ printf "--azure-client-id=%s" .Values.azure.clientID | quote }}
         {{- end }}
         ports:
         - containerPort: 8081

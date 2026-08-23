@@ -3,22 +3,25 @@ kvsynk8s {{ .Chart.AppVersion }} is installed as release "{{ .Release.Name }}" i
 Check the operator is running:
 
   kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "kvsynk8s.name" (dict "ctx" . "suffix" "operator") }}
-{{ if .Values.crds.install }}
+
+{{ if .Values.crds.install -}}
 The SecretSync CRD is part of this release:
 
   kubectl get crd secretsyncs.kvsynk8s.io
-{{- if .Values.crds.keep }}
+
+{{ if .Values.crds.keep -}}
 It is annotated helm.sh/resource-policy: keep, so "helm uninstall" leaves the
 CRD and every SecretSync object in the cluster.
-{{- else }}
+{{- else -}}
 WARNING: crds.keep is false. "helm uninstall" will DELETE the CRD, and with it
 every SecretSync object in the cluster.
 {{- end }}
-{{- else }}
+{{- else -}}
 crds.install is false: this release does not manage the SecretSync CRD. Make
 sure the cluster already has it, or nothing will reconcile.
 {{- end }}
-{{ if not .Values.azure.clientID }}
+
+{{ if not .Values.azure.clientID -}}
 NEXT STEP — Azure authentication is not configured yet.
 
 The operator authenticates to Key Vault with Microsoft Entra Workload ID. Set
@@ -31,19 +34,21 @@ create a federated credential on that identity for:
     --set azure.clientID=<managed-identity-client-id>
 
 Until then every SecretSync will report Failing.
-{{- else }}
+{{- else -}}
 Azure workload identity is wired to client ID {{ .Values.azure.clientID }}.
-Make sure that identity has a federated credential for:
+That identity needs a federated credential for:
 
   system:serviceaccount:{{ .Release.Namespace }}:{{ include "kvsynk8s.serviceAccountName" . }}
 
-and a Key Vault access policy or RBAC role that allows reading secrets.
+and permission to read secrets from the vaults you sync from.
 {{- end }}
-{{ if not .Values.operator.queueURL }}
+
+{{ if not .Values.operator.queueURL -}}
 No queue is configured, so the operator only reconciles on its periodic timer
 (default 4h). Set operator.queueURL to the Azure Storage Queue that Event Grid
 delivers Key Vault events to and rotations reach the cluster in seconds.
-{{- end }}
+
+{{ end -}}
 Create your first sync:
 
   apiVersion: kvsynk8s.io/v1alpha1

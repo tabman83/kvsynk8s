@@ -101,28 +101,72 @@ CI equivalent: the `helm.yml` workflow fails any PR where
 
 ```bash
 kind create cluster --name helm-quickstart
+
+# The chart's default image tag is the appVersion, which is the 0.0.0 dev
+# placeholder in git, so build and load a local image for this run.
+make docker-build IMG=kvsynk8s:helm-test
+kind load docker-image kvsynk8s:helm-test --name helm-quickstart
+
 helm install kvsynk8s charts/kvsynk8s --namespace kvsynk8s --create-namespace \
-  --set image.tag=v0.0.0-dev   # or a released tag
+  --set image.repository=kvsynk8s --set image.tag=helm-test --set image.pullPolicy=Never
 kubectl -n kvsynk8s rollout status deploy/kvsynk8s-operator
 kubectl get crd secretsyncs.kvsynk8s.io
 
-# create a SecretSync, then exercise uninstall/reinstall:
-kubectl apply -f config/samples/
+# Create a couple of SecretSync objects. Do NOT use config/samples/ — the
+# scaffolded sample there still has an empty spec and the CRD rejects it.
+cat <<'EOF' | kubectl apply -f -
+apiVersion: kvsynk8s.io/v1alpha1
+kind: SecretSync
+metadata: {name: demo-one, namespace: default}
+spec: {vault: {name: my-vault, secret: demo-password}}
+---
+apiVersion: kvsynk8s.io/v1alpha1
+kind: SecretSync
+metadata: {name: demo-two, namespace: kube-system}
+spec: {vault: {name: my-vault, secret: other-password}, target: {secretName: renamed, dataKey: pw}}
+EOF
+
 helm uninstall kvsynk8s -n kvsynk8s
 kubectl get crd secretsyncs.kvsynk8s.io      # expected: still present (crds.keep)
-kubectl get secretsyncs -A                    # expected: objects still present
+kubectl get secretsyncs -A                    # expected: both objects still present
 
-# reinstall requires adopting the kept CRD (research.md R2):
-kubectl label crd secretsyncs.kvsynk8s.io app.kubernetes.io/managed-by=Helm
-kubectl annotate crd secretsyncs.kvsynk8s.io \
-  meta.helm.sh/release-name=kvsynk8s meta.helm.sh/release-namespace=kvsynk8s
-helm install kvsynk8s charts/kvsynk8s --namespace kvsynk8s
+# Reinstalling under the same release name and namespace needs no adoption
+# step: the kept CRD still carries Helm's ownership label and annotations.
+helm install kvsynk8s charts/kvsynk8s --namespace kvsynk8s \
+  --set image.repository=kvsynk8s --set image.tag=helm-test --set image.pullPolicy=Never
+kubectl get secretsyncs -A                    # expected: still both, statuses being set again
+
 kind delete cluster --name helm-quickstart
 ```
 
 Expected: zero SecretSync objects lost across the cycle. (Without Azure
-credentials the operator reports `Failing` status on the sample — that is
-fine; this scenario validates lifecycle, not sync.)
+credentials the operator reports `Failing` / `TransientError` on both objects —
+that is fine; this scenario validates lifecycle, not sync.)
+
+The research.md R2 adoption commands are for the *other* case: a CRD that Helm
+never owned, i.e. one created by `kubectl apply -f install.yaml`. To exercise
+that path, strip the ownership metadata first and watch the install refuse:
+
+```bash
+kubectl label crd secretsyncs.kvsynk8s.io app.kubernetes.io/managed-by-
+kubectl annotate crd secretsyncs.kvsynk8s.io \
+  meta.helm.sh/release-name- meta.helm.sh/release-namespace-
+helm install kvsynk8s charts/kvsynk8s -n kvsynk8s   # expected: fails, naming all three fields
+
+kubectl label crd secretsyncs.kvsynk8s.io app.kubernetes.io/managed-by=Helm
+kubectl annotate crd secretsyncs.kvsynk8s.io \
+  meta.helm.sh/release-name=kvsynk8s meta.helm.sh/release-namespace=kvsynk8s
+helm install kvsynk8s charts/kvsynk8s -n kvsynk8s   # expected: succeeds, objects intact
+```
+
+Finally, the destructive branch of the data-model state table:
+
+```bash
+helm upgrade kvsynk8s charts/kvsynk8s -n kvsynk8s --set crds.keep=false
+helm uninstall kvsynk8s -n kvsynk8s
+kubectl get crd secretsyncs.kvsynk8s.io   # expected: NotFound
+kubectl get secretsyncs -A                 # expected: NotFound (the CRD took them with it)
+```
 
 ## 7. Release publishing (US3, FR-014) — after merge, on a real tag
 
