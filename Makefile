@@ -102,6 +102,16 @@ test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expect
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 	@$(KIND) delete cluster --name $(KIND_CLUSTER)
 
+.PHONY: helm-sync
+helm-sync: manifests ## Copy the generated CRD and RBAC rules into the Helm chart.
+	hack/helm-sync.sh
+
+.PHONY: helm-verify
+helm-verify: kustomize helm-sync ## Lint the chart, render it, and check it still matches the kustomize output.
+	helm lint charts/kvsynk8s
+	helm lint charts/kvsynk8s -f charts/kvsynk8s/ci/nondefault-values.yaml
+	KUSTOMIZE="$(KUSTOMIZE)" hack/compare-helm-kustomize.sh
+
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
 	"$(GOLANGCI_LINT)" run

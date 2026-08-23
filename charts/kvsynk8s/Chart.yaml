@@ -1,0 +1,22 @@
+apiVersion: v2
+name: kvsynk8s
+description: Realtime sync from Azure Key Vault to Kubernetes secrets
+type: application
+
+# Dev placeholders. The release pipeline overrides both with the git tag
+# (minus the leading "v") via `helm package --version --app-version`, so
+# nothing ever rewrites this file in git. See specs/002-helm-chart/research.md R4.
+version: 0.0.0
+appVersion: "0.0.0"
+
+home: https://github.com/tabman83/kvsynk8s
+sources:
+  - https://github.com/tabman83/kvsynk8s
+keywords:
+  - azure
+  - key-vault
+  - secrets
+  - operator
+maintainers:
+  - name: tabman83
+    url: https://github.com/tabman83

@@ -1,0 +1,60 @@
+{{/*
+The manager ClusterRole. Everything outside the BEGIN/END marker region is
+hand-maintained; the rules between the markers are copied verbatim from the
+controller-gen output in config/rbac/role.yaml by `make helm-sync`, so the
+chart can never grant more than the operator's kubebuilder markers declare
+(FR-015). CI fails any PR where re-running the sync produces a diff.
+*/}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "kvsynk8s.name" (dict "ctx" . "suffix" "manager-role") }}
+  labels:
+    {{- include "kvsynk8s.labels" . | nindent 4 }}
+# BEGIN generated rules (make helm-sync)
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - update
+  - watch
+- apiGroups:
+  - kvsynk8s.io
+  resources:
+  - secretsyncs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - kvsynk8s.io
+  resources:
+  - secretsyncs/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - kvsynk8s.io
+  resources:
+  - secretsyncs/status
+  verbs:
+  - get
+  - patch
+  - update
+# END generated rules

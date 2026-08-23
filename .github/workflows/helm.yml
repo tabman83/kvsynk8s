@@ -1,0 +1,78 @@
+name: Helm chart
+
+on:
+  push:
+  pull_request:
+
+permissions: {}
+
+env:
+  # The floor the chart documents (OCI is GA from Helm 3.8). Charts that lint
+  # and render here also work on Helm 4.
+  HELM_VERSION: v3.21.4
+
+jobs:
+  chart:
+    permissions:
+      contents: read
+    name: Run on Ubuntu
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Setup Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Make sure PyYAML is available (used by the render and equivalence checks)
+        run: |
+          python3 -c 'import yaml' 2>/dev/null \
+            || python3 -m pip install --quiet --break-system-packages pyyaml
+
+      - name: Lint the chart
+        run: |
+          helm lint charts/kvsynk8s
+          helm lint charts/kvsynk8s -f charts/kvsynk8s/ci/nondefault-values.yaml
+
+      # Renders with defaults and with every documented value set to something
+      # non-default. Both must succeed, and both must survive the render checks
+      # (non-empty, no Secret, no duplicate keys, no placeholders).
+      - name: Render the chart
+        run: |
+          mkdir -p /tmp/render
+          helm template kvsynk8s charts/kvsynk8s --namespace kvsynk8s \
+            > /tmp/render/default.yaml
+          helm template kvsynk8s charts/kvsynk8s --namespace kvsynk8s \
+            -f charts/kvsynk8s/ci/nondefault-values.yaml > /tmp/render/nondefault.yaml
+          hack/check-render.sh /tmp/render/default.yaml /tmp/render/nondefault.yaml
+
+      - name: No secret material in the chart source
+        run: |
+          if grep -rniE '<[[:space:]]*SET[-_ ]?ME[[:space:]]*>' charts/; then
+            echo "chart source carries a placeholder that looks like it wants a real value" >&2
+            exit 1
+          fi
+
+      # The CRD and the manager ClusterRole rules are generated from the Go
+      # kubebuilder markers. If regenerating them changes the chart, the chart
+      # has drifted from the operator and the PR must run `make helm-sync`.
+      - name: Chart is in sync with the generated manifests
+        run: |
+          make manifests helm-sync
+          if ! git diff --exit-code charts/; then
+            echo "::error::charts/ is out of sync — run 'make helm-sync' and commit the result" >&2
+            exit 1
+          fi
+
+      # The default render must stay equivalent to the manifest install.
+      - name: Chart render matches the kustomize output
+        run: make kustomize && KUSTOMIZE=bin/kustomize hack/compare-helm-kustomize.sh

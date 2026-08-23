@@ -1,0 +1,106 @@
+# Default values for kvsynk8s.
+#
+# Everything below is the entire supported configuration surface. Anything not
+# listed here is deliberately not configurable through the chart: the operator
+# is meant to be installed and left alone.
+#
+# An empty values file (all defaults) renders a complete, installable manifest
+# set that matches the install.yaml manifest install.
+
+operator:
+  # Azure Storage Queue that Event Grid delivers Key Vault events to.
+  # Default "": no --queue-url arg, so the operator does not start the queue
+  # listener and relies on the periodic reconcile only. Set it to get the fast
+  # path (a rotated secret reaches the cluster in seconds instead of hours).
+  # Example: https://mystorage.queue.core.windows.net/kv-events
+  queueURL: ""
+
+  # How often every SecretSync is re-read from Key Vault, as a Go duration
+  # ("30m", "4h"). This is the drift/missed-event safety net.
+  # Default "": no --reconcile-interval arg, so the operator's built-in 4h applies.
+  reconcileInterval: ""
+
+azure:
+  # Client ID of the user-assigned managed identity federated with this
+  # operator's ServiceAccount (Microsoft Entra Workload ID).
+  # Default "": no workload-identity wiring is rendered at all.
+  # When set, three things render together: the --azure-client-id container
+  # arg, the pod label azure.workload.identity/use: "true", and the
+  # ServiceAccount annotation azure.workload.identity/client-id.
+  # This is an identity reference, not a credential — no secret goes in here.
+  clientID: ""
+
+image:
+  # Default: the image published by this project's release pipeline.
+  repository: ghcr.io/tabman83/kvsynk8s
+  # Default "": the chart's appVersion is used, which the release pipeline sets
+  # to the release tag. Override to pin or to test a dev build.
+  tag: ""
+  # Default IfNotPresent: released tags are immutable, so there is nothing to re-pull.
+  pullPolicy: IfNotPresent
+
+serviceAccount:
+  # Default "": the ServiceAccount is named <release-name>-controller-manager,
+  # i.e. kvsynk8s-controller-manager for the documented install command.
+  #
+  # WARNING: the Microsoft Entra federated credential is bound to the exact
+  # ServiceAccount name and namespace (system:serviceaccount:<namespace>:<name>).
+  # Renaming the ServiceAccount or installing into a different namespace breaks
+  # Azure authentication until the federated credential on the managed identity
+  # is updated to match.
+  name: ""
+
+# Container resources. Defaults are the same values the manifest install ships.
+# The operator is a small controller: it holds one client cache and does a few
+# HTTP calls per reconcile.
+resources:
+  requests:
+    cpu: 10m
+    memory: 32Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi
+
+# Pod scheduling. Defaults are empty: the operator runs anywhere.
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+metrics:
+  # Default true, matching the manifest install: the operator serves
+  # authenticated HTTPS metrics on :8443 and the chart renders the metrics
+  # Service plus the TokenReview/SubjectAccessReview RBAC that protects it.
+  # Set to false to drop the --metrics-bind-address arg, the Service, and that RBAC.
+  enabled: true
+
+serviceMonitor:
+  # Default false. Set to true to also render a Prometheus Operator
+  # ServiceMonitor pointing at the metrics Service. Needs the Prometheus
+  # Operator CRDs in the cluster, and needs metrics.enabled=true (the chart
+  # fails the render with a clear message otherwise).
+  enabled: false
+
+networkPolicy:
+  # Default false. Set to true to render a NetworkPolicy that only lets Pods in
+  # namespaces labeled "metrics: enabled" reach the metrics port.
+  enabled: false
+
+crds:
+  # Default true: the SecretSync CRD is part of the release, so `helm upgrade`
+  # applies CRD schema changes. Set to false when the CRD is managed elsewhere
+  # (for example a cluster that already has it from an install.yaml install and
+  # that you do not want to adopt into the release).
+  install: true
+  # Default true: the CRD is annotated helm.sh/resource-policy: keep, so
+  # `helm uninstall` leaves the CRD and every SecretSync object in place.
+  # Setting this to false makes uninstall delete the CRD, which deletes every
+  # SecretSync object in the cluster. Only turn it off if you mean that.
+  keep: true
+
+# Deliberately not configurable:
+#   replicas  — fixed at 1. The operator runs without leader election, so a
+#               second replica would reconcile the same Secrets uncoordinated.
+#   namespace — Helm's job: --namespace kvsynk8s --create-namespace.
+#               The chart renders no Namespace object.
+#   leader election, probe ports, log flags, cert paths — not part of the
+#               shipped configuration.

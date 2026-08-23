@@ -66,11 +66,18 @@ metrics-auth/reader RBAC is gone from the full output.
 ## 4. No secret values anywhere (SC-005, Constitution I)
 
 ```bash
-helm template kvsynk8s charts/kvsynk8s --namespace kvsynk8s | grep -i "kind: Secret"
+helm template kvsynk8s charts/kvsynk8s --namespace kvsynk8s > /tmp/render.yaml
+hack/check-render.sh /tmp/render.yaml
 grep -ri "SET-ME" charts/
 ```
 
-Expected: both greps return nothing.
+Expected: `check-render.sh` reports no Secret, no duplicate keys and no
+placeholders; the grep returns nothing.
+
+Note: do not check this with `grep -i "kind: Secret"`. That also matches
+`kind: SecretSync` and `listKind: SecretSyncList` inside the CRD schema, so it
+always "finds" something. `check-render.sh` parses the render and looks at each
+document's actual `kind`, which is the check that means anything.
 
 ## 5. Drift guardrail (US5, SC-006)
 

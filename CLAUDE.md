@@ -49,6 +49,16 @@ Standard kubebuilder layout, one Go module, one controller.
   wrappers around `azsecrets` and `azqueue`, each behind a small interface
   (`SecretReader`, `QueueSource`) so the rest of the codebase never imports
   the Azure SDK directly.
+- **`charts/kvsynk8s/`** — the Helm chart, the second first-class install
+  method next to `install.yaml`. Hand-maintained reviewed source, *except*
+  two machine-managed regions that `make helm-sync` regenerates: the whole of
+  `templates/crds/secretsync-crd.yaml` (wrapped from
+  `config/crd/bases/`, gated by `crds.install`/`crds.keep`) and the rules
+  between the `# BEGIN/END generated rules` markers in
+  `templates/rbac/manager-clusterrole.yaml` (spliced from
+  `config/rbac/role.yaml`). Never edit those two regions by hand. The default
+  render is kept equivalent to `kustomize build config/default` minus the
+  Namespace by `hack/compare-helm-kustomize.sh`.
 - **`internal/events/`** — the Event Grid → Storage Queue path: `parser.go`
   decodes a queue message into a `(vault, secret, version)` tuple or a clean
   discard (wrong event type, wrong object type, malformed body);
@@ -83,7 +93,13 @@ make lint                # golangci-lint run
 make test-integration    # azqueue against Azurite + azsecrets against Lowkey Vault, via testcontainers-go. Needs Docker.
 make test-e2e            # scaffold checks against a kind cluster (spins the cluster up and tears it down);
                          # the SecretSync sync-loop Context is skipped unless KVSYNK8S_E2E_EMULATORS=1 (see T032 above)
+make helm-sync           # regenerate the two machine-managed regions of the chart (runs `manifests` first)
+make helm-verify         # helm lint (defaults + ci/nondefault-values.yaml) + the kustomize equivalence check
 ```
+
+The chart checks need `helm` >= 3.8 and `python3` with PyYAML (used by
+`hack/compare-helm-kustomize.sh` and `hack/check-render.sh`). CI pins helm to
+the version in `HELM_VERSION` in `.github/workflows/helm.yml`.
 
 Run a single test:
 
@@ -98,10 +114,13 @@ go test -tags integration ./internal/azure/... -run TestStorageQueueSource_Batch
 ```
 
 CI runs `make test`, `make lint`, and `make test-integration` on every PR
-(`.github/workflows/test.yml`, `lint.yml`, `test-integration.yml`); `test-e2e`
-runs there too (`test-e2e.yml`) and additionally on `v*` tag pushes as part
-of `release.yml`, which then builds and pushes the multi-arch image to GHCR
-and attaches a rendered install manifest to a GitHub Release.
+(`.github/workflows/test.yml`, `lint.yml`, `test-integration.yml`); `helm.yml`
+lints and renders the chart, fails on `make helm-sync` drift, and runs the
+equivalence check; `test-e2e` runs there too (`test-e2e.yml`) and additionally
+on `v*` tag pushes as part of `release.yml`, which then builds and pushes the
+multi-arch image to GHCR, publishes the chart to
+`oci://ghcr.io/tabman83/charts/kvsynk8s`, and attaches both the rendered
+install manifest and `kvsynk8s-X.Y.Z.tgz` to a GitHub Release.
 
 Once a branch is pushed and its PR is open, watch its checks
 (`gh pr checks <PR#> --watch`) and fix forward on any failure — see the "PR
