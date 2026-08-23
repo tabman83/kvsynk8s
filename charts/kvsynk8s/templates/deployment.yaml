@@ -37,7 +37,14 @@ spec:
           type: RuntimeDefault
       containers:
       - name: manager
-        image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+        {{- /*
+          image.tag empty falls back to the chart's appVersion, which the
+          release pipeline sets to the tag minus the leading "v" (1.4.2).
+          The image itself is pushed under the tag WITH the v (v1.4.2), so the
+          v has to go back on here or a default install pulls a tag that does
+          not exist. trimPrefix keeps it right even if appVersion already has it.
+        */}}
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default (printf "v%s" (.Chart.AppVersion | trimPrefix "v")) }}"
         imagePullPolicy: {{ .Values.image.pullPolicy }}
         command:
         - /manager

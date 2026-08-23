@@ -148,16 +148,18 @@ if dep_key in by_key_helm and dep_key in by_key_kust:
 else:
     failures.append("Deployment %s missing from one of the renders" % (dep_key,))
 
-# --- 3. manager ClusterRole rules ------------------------------------------
-role_key = ("ClusterRole", "", "kvsynk8s-manager-role")
-if role_key in by_key_helm and role_key in by_key_kust:
-    check(
-        "ClusterRole kvsynk8s-manager-role .rules",
-        by_key_helm[role_key].get("rules"),
-        by_key_kust[role_key].get("rules"),
-    )
-else:
-    failures.append("ClusterRole kvsynk8s-manager-role missing from one of the renders")
+# --- 3. every ClusterRole grants exactly the same rules ---------------------
+# manager-role is synced from config/rbac/role.yaml by make helm-sync, but the
+# other five are hand-mirrored from config/rbac/ and would otherwise be free to
+# drift wider than the manifest install without anything noticing.
+cluster_roles = sorted(k for k in by_key_kust if k[0] == "ClusterRole")
+if len(cluster_roles) < 6:
+    failures.append("expected 6 ClusterRoles in the kustomize output, found %d" % len(cluster_roles))
+for rk in cluster_roles:
+    if rk in by_key_helm:
+        check("ClusterRole %s .rules" % rk[2], by_key_helm[rk].get("rules"), by_key_kust[rk].get("rules"))
+    else:
+        failures.append("ClusterRole %s missing from the chart render" % rk[2])
 
 # --- 4. bindings reference the same role/subject pairs ---------------------
 for name in ("kvsynk8s-manager-rolebinding", "kvsynk8s-metrics-auth-rolebinding"):

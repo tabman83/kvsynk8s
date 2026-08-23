@@ -76,3 +76,15 @@ jobs:
       # The default render must stay equivalent to the manifest install.
       - name: Chart render matches the kustomize output
         run: make kustomize && KUSTOMIZE=bin/kustomize hack/compare-helm-kustomize.sh
+
+      # The release pipeline pushes the image as :vX.Y.Z but packages the chart
+      # with appVersion X.Y.Z, so the chart has to put the "v" back. Without
+      # this check a default `helm install` of a real release pulls a tag that
+      # does not exist, and nothing else here would notice.
+      - name: Default image tag resolves to the tag the release actually pushes
+        run: |
+          helm package charts/kvsynk8s --version 9.9.9 --app-version 9.9.9 --destination /tmp/pkg
+          got="$(helm template kvsynk8s /tmp/pkg/kvsynk8s-9.9.9.tgz --namespace kvsynk8s \
+                 | grep -m1 -oE 'ghcr\.io/tabman83/kvsynk8s:[^"]+')"
+          echo "rendered image: $got"
+          test "$got" = "ghcr.io/tabman83/kvsynk8s:v9.9.9"

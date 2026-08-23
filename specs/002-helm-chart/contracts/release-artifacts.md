@@ -16,8 +16,12 @@ For every tag `vX.Y.Z`, a successful release run MUST produce all of:
 ## Version invariants
 
 - Chart `version` == chart `appVersion` == `X.Y.Z` (tag minus `v` prefix).
-- Default `image.tag` inside the chart resolves to the appVersion, so a chart
-  install pulls image #1 without any values set.
+- The image is pushed under the tag **with** the `v` (`:vX.Y.Z`, artifact #1),
+  because the image build uses the git ref name directly. The chart's default
+  `image.tag` is therefore `v` + appVersion, not the bare appVersion, so a
+  chart install pulls image #1 without any values set. Getting this wrong makes
+  every default install fail with ImagePullBackOff and nothing else in CI
+  notices, so `.github/workflows/helm.yml` asserts the rendered tag explicitly.
 - `Chart.yaml` in git stays at the `0.0.0` placeholder; versions are applied
   by `helm package --version --app-version` in the pipeline only.
 
