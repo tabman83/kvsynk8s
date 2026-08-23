@@ -212,7 +212,7 @@ exists), all read in `cmd/main.go`:
 | Flag | Env var | Default | What it does |
 |---|---|---|---|
 | `--queue-url` | `QUEUE_URL` | empty | Storage Queue URL that receives Key Vault Event Grid notifications. Optional — without it, the operator relies entirely on periodic reconciliation and still converges correctly, just without near-realtime propagation. |
-| `--reconcile-interval` | `RECONCILE_INTERVAL` | `1h` | How often every `SecretSync` is fully reconciled against Key Vault regardless of notifications — the safety net for missed events, vault-side deletions, and in-cluster drift. Any value `time.ParseDuration` accepts (e.g. `30m`, `2h`). |
+| `--reconcile-interval` | `RECONCILE_INTERVAL` | `4h` | How often every `SecretSync` is fully reconciled against Key Vault regardless of notifications — the safety net for missed events, vault-side deletions, and in-cluster drift. Any value `time.ParseDuration` accepts (e.g. `30m`, `1h`). |
 | `--azure-client-id` | `AZURE_CLIENT_ID` | empty | Client ID of the workload identity used to authenticate to Azure. `DefaultAzureCredential` already reads `AZURE_CLIENT_ID` from the environment on its own; this flag is an alternative way to set the same thing (it just sets the env var internally) for a Deployment that only supports passing command-line args. |
 | `--metrics-bind-address` | — | `0` (disabled) | Address the metrics endpoint binds to. `:8080` for HTTP, `:8443` for HTTPS, or `0` to disable it. |
 | `--metrics-secure` | — | `true` | Serve metrics over HTTPS. `--metrics-secure=false` for HTTP instead. |
@@ -245,7 +245,7 @@ queue, that its `--included-event-types` still includes
 `Microsoft.KeyVault.SecretNewVersionCreated`, and that the operator's identity
 still has `Storage Queue Data Message Processor` on it. None of this leaves
 the cluster stuck: periodic reconciliation (`--reconcile-interval`, default
-1h) is the safety net and will converge every `SecretSync` to the current
+4h) is the safety net and will converge every `SecretSync` to the current
 vault value on its own — you lose the near-realtime property, not
 correctness. Check `status.lastSyncTime` per `SecretSync` to see whether
 reconciliation is still happening on schedule.

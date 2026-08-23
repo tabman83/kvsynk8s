@@ -58,7 +58,7 @@ const finalizerName = "kvsynk8s.io/secretsync-finalizer"
 // when ReconcileInterval is left unset: the safety net for missed events,
 // vault-side deletions, and in-cluster drift (plan.md, data-model.md). It
 // mirrors cmd/main.go's own default.
-const defaultReconcileInterval = time.Hour
+const defaultReconcileInterval = 4 * time.Hour
 
 // SecretSyncReconciler reconciles a SecretSync object
 type SecretSyncReconciler struct {
