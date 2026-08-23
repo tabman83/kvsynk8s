@@ -26,7 +26,7 @@ this file is the review-time contract for that.
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `image.repository` | string | `ghcr.io/tabman83/kvsynk8s` | |
-| `image.tag` | string | `""` | empty ⇒ `.Chart.AppVersion` (i.e. the release version) |
+| `image.tag` | string | `""` | empty ⇒ `v` + `.Chart.AppVersion`, i.e. `vX.Y.Z`. The **`v` is required**: the release pipeline packages the chart with appVersion `X.Y.Z` (tag minus `v`) but pushes the image under `:vX.Y.Z`, so a bare `.Chart.AppVersion` here pulls a tag that does not exist. See [release-artifacts.md](release-artifacts.md); `.github/workflows/helm.yml` asserts the rendered tag against a packaged chart. |
 | `image.pullPolicy` | string | `IfNotPresent` | |
 
 ## ServiceAccount

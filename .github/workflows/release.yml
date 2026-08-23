@@ -108,9 +108,58 @@ jobs:
           go mod tidy
           make test-e2e
 
+  helm:
+    permissions:
+      contents: read
+    name: Run on Ubuntu
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Setup Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Make sure PyYAML is available
+        run: |
+          python3 -c 'import yaml' 2>/dev/null \
+            || python3 -m pip install --quiet --break-system-packages pyyaml
+
+      # `helm package` never executes templates, so without this a chart that
+      # cannot render would still be packaged and pushed to GHCR by
+      # publish-chart, and the release would go green.
+      - name: Verify the chart
+        run: |
+          helm lint charts/kvsynk8s
+          helm lint charts/kvsynk8s -f charts/kvsynk8s/ci/nondefault-values.yaml
+          mkdir -p /tmp/render
+          helm template kvsynk8s charts/kvsynk8s --namespace kvsynk8s > /tmp/render/default.yaml
+          helm template kvsynk8s charts/kvsynk8s --namespace kvsynk8s \
+            -f charts/kvsynk8s/ci/nondefault-values.yaml > /tmp/render/nondefault.yaml
+          hack/check-render.sh /tmp/render/default.yaml /tmp/render/nondefault.yaml
+          hack/check-values.sh
+
+      - name: Chart is in sync with the generated manifests
+        run: |
+          make manifests helm-sync
+          git add -A charts/
+          git diff --cached --exit-code charts/
+
+      - name: Chart render matches the kustomize output
+        run: make kustomize && KUSTOMIZE=bin/kustomize hack/compare-helm-kustomize.sh
+
   build-and-push:
     name: Build and push multi-arch image
-    needs: [test, lint, test-integration, test-e2e]
+    needs: [test, lint, test-integration, test-e2e, helm]
     permissions:
       contents: read
       packages: write
@@ -148,6 +197,10 @@ jobs:
           name: install-manifest
           path: dist/install.yaml
           if-no-files-found: error
+          # Artifact names are unique per workflow RUN, not per attempt, so
+          # without this a "Re-run all jobs" dies with a 409 instead of
+          # converging the way the release contract says it does.
+          overwrite: true
 
   publish-chart:
     name: Package and publish the Helm chart
@@ -201,6 +254,7 @@ jobs:
           name: chart-package
           path: kvsynk8s-*.tgz
           if-no-files-found: error
+          overwrite: true
 
   release:
     name: Create GitHub Release

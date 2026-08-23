@@ -180,3 +180,11 @@ gh release view vX.Y.Z --json assets -q '.assets[].name'
 
 Expected: the OCI pull succeeds with app version `X.Y.Z`; release assets list
 both `install.yaml` and `kvsynk8s-X.Y.Z.tgz`.
+
+**Do this first, once.** The very first `helm push` creates
+`ghcr.io/tabman83/charts/kvsynk8s` as a *private* package — that is GitHub's
+default for a newly published package, and `helm push` cannot change it. Until
+you set it to Public in the package's GitHub settings, the `helm install`
+above fails with `unauthorized` for everyone but you. Check the same for
+`ghcr.io/tabman83/kvsynk8s` (the image), or the pod will not pull either. See
+[contracts/release-artifacts.md](contracts/release-artifacts.md).

@@ -70,6 +70,14 @@ updates the CRD in place (template, not `crds/` dir — research.md R1).
 `crds.keep` flipping only changes the annotation; it takes effect at the next
 uninstall.
 
+**Flipping `crds.install` true → false on an existing release is a resource
+removal, not just "the chart stops managing it".** Helm deletes resources that
+disappear from a release's manifest. It leaves the CRD alone only because the
+previous revision annotated it `helm.sh/resource-policy: keep`. With the
+default `crds.keep=true` this is safe; with `crds.keep=false` the same upgrade
+deletes the CRD and every SecretSync object in the cluster. Verified on kind.
+`values.yaml` and the README carry this warning.
+
 ## Entity: Release artifacts
 
 Per tag `vX.Y.Z`, the release pipeline produces, in dependency order:

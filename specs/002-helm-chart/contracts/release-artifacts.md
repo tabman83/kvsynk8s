@@ -35,6 +35,25 @@ For every tag `vX.Y.Z`, a successful release run MUST produce all of:
 - Re-running the workflow on the same tag republishes #1–#4 idempotently
   (OCI tags are mutable; `action-gh-release` replaces existing assets).
 
+## One-time manual step: GHCR package visibility
+
+**The first `helm push` creates `ghcr.io/tabman83/charts/kvsynk8s` as a
+PRIVATE package.** GitHub makes newly published personal-account packages
+private by default, and nothing in `helm push` can change that. Until the
+maintainer sets the package to Public in its GitHub package settings, the
+documented anonymous install fails with a 401:
+
+```bash
+helm install kvsynk8s oci://ghcr.io/tabman83/charts/kvsynk8s --version X.Y.Z
+# Error: ... unauthorized
+```
+
+So after the very first release that publishes a chart, go to the package page
+on GitHub → Package settings → Change visibility → Public. This is a one-time
+step per package; later releases inherit the visibility. It is the one place
+SC-003's "zero manual publishing steps" does not hold, and it holds for every
+release after that.
+
 ## Credentials
 
 - Only `GITHUB_TOKEN` with the existing `packages: write` (GHCR) and

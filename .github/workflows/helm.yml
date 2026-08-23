@@ -85,7 +85,11 @@ jobs:
       - name: Chart is in sync with the generated manifests
         run: |
           make manifests helm-sync
-          if ! git diff --exit-code charts/; then
+          # `git add -A` first: `git diff` only looks at tracked files, so a
+          # chart file missing from the commit that helm-sync then recreates
+          # would show up as untracked and the check would call it "in sync".
+          git add -A charts/
+          if ! git diff --cached --exit-code charts/; then
             echo "::error::charts/ is out of sync — run 'make helm-sync' and commit the result" >&2
             exit 1
           fi

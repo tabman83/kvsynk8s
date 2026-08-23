@@ -33,8 +33,11 @@ azure:
 image:
   # Default: the image published by this project's release pipeline.
   repository: ghcr.io/tabman83/kvsynk8s
-  # Default "": the chart's appVersion is used, which the release pipeline sets
-  # to the release tag. Override to pin or to test a dev build.
+  # Default "": the tag becomes "v" + the chart's appVersion, which the release
+  # pipeline sets to the release version. The "v" is deliberate — the image is
+  # published as ghcr.io/tabman83/kvsynk8s:vX.Y.Z while the chart's appVersion
+  # is X.Y.Z, so dropping it would make every default install pull a tag that
+  # does not exist. Override to pin a version or to test a dev build.
   tag: ""
   # Default IfNotPresent: released tags are immutable, so there is nothing to re-pull.
   pullPolicy: IfNotPresent
@@ -90,6 +93,12 @@ crds:
   # applies CRD schema changes. Set to false when the CRD is managed elsewhere
   # (for example a cluster that already has it from an install.yaml install and
   # that you do not want to adopt into the release).
+  #
+  # Turning this false on an EXISTING release removes the CRD from the rendered
+  # manifest, which is a resource removal. Helm only leaves it alone because
+  # `keep` below put helm.sh/resource-policy: keep on it. If you set both
+  # install=false and keep=false, that upgrade deletes the CRD and every
+  # SecretSync object in the cluster.
   install: true
   # Default true: the CRD is annotated helm.sh/resource-policy: keep, so
   # `helm uninstall` leaves the CRD and every SecretSync object in place.

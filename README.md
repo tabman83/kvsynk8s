@@ -49,6 +49,12 @@ The chart version is always the release version, and the image tag defaults to
 it, so you never have to line up two versions by hand. You still need the
 Azure setup below.
 
+If that install fails with `unauthorized`, the GHCR package is still private.
+GitHub publishes new packages as private by default, so after the first
+release that ships a chart the maintainer has to set
+`ghcr.io/tabman83/charts/kvsynk8s` to Public once in its GitHub package
+settings. Nothing in the pipeline can do it.
+
 Values you can set (the full list is in `charts/kvsynk8s/values.yaml`, each one
 with a comment):
 
@@ -57,7 +63,7 @@ with a comment):
 | `operator.queueURL` | `""` | Storage queue with the Key Vault events. Unset means periodic reconcile only. |
 | `operator.reconcileInterval` | `""` | Go duration. Unset means the built-in 4h. |
 | `azure.clientID` | `""` | Managed identity client ID. Setting it wires up workload identity. |
-| `image.repository` / `image.tag` / `image.pullPolicy` | `ghcr.io/tabman83/kvsynk8s` / chart appVersion / `IfNotPresent` | The operator image. |
+| `image.repository` / `image.tag` / `image.pullPolicy` | `ghcr.io/tabman83/kvsynk8s` / `v` + chart appVersion / `IfNotPresent` | The operator image. Empty `image.tag` resolves to the release's own image, e.g. `:v1.2.3`. |
 | `serviceAccount.name` | `""` | Defaults to `<release-name>-controller-manager`. |
 | `resources`, `nodeSelector`, `tolerations`, `affinity` | see values.yaml | Pod scheduling and limits. |
 | `metrics.enabled` | `true` | Metrics Service, `:8443` arg, and the RBAC that protects it. |
@@ -103,6 +109,13 @@ Then delete the rest of the manifest install (not the CRD) and run
 If you would rather keep the CRD out of the release entirely — because
 something else manages it — install with `--set crds.install=false`. The
 cluster must already have the CRD in that case.
+
+Careful when flipping `crds.install` to false on a release that already exists.
+Removing the CRD from the manifest is a resource removal, so Helm would delete
+it. It does not, because `crds.keep` (true by default) annotated the CRD
+`helm.sh/resource-policy: keep`. But if you set both `crds.install=false` and
+`crds.keep=false`, that upgrade deletes the CRD and every SecretSync object in
+the cluster.
 
 #### Uninstall
 
