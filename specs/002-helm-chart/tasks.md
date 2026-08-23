@@ -23,8 +23,8 @@ Repository root; chart at `charts/kvsynk8s/`, scripts at `hack/`, workflows at `
 
 **Purpose**: Minimal chart scaffold every later task builds on.
 
-- [ ] T001 Create chart skeleton: `charts/kvsynk8s/Chart.yaml` (apiVersion `v2`, name `kvsynk8s`, `version: 0.0.0` and `appVersion: 0.0.0` as dev placeholders per research.md R4, description, home/sources) and `charts/kvsynk8s/.helmignore`
-- [ ] T002 [P] Create `charts/kvsynk8s/templates/_helpers.tpl` with helpers per research.md R10: name prefix equal to the release name (DNS-truncated), common labels (`app.kubernetes.io/name: kvsynk8s`, `control-plane: controller-manager` for selector compatibility), and the ServiceAccount-name helper (`serviceAccount.name` override, else `<prefix>-controller-manager`)
+- [X] T001 Create chart skeleton: `charts/kvsynk8s/Chart.yaml` (apiVersion `v2`, name `kvsynk8s`, `version: 0.0.0` and `appVersion: 0.0.0` as dev placeholders per research.md R4, description, home/sources) and `charts/kvsynk8s/.helmignore`
+- [X] T002 [P] Create `charts/kvsynk8s/templates/_helpers.tpl` with helpers per research.md R10: name prefix equal to the release name (DNS-truncated), common labels (`app.kubernetes.io/name: kvsynk8s`, `control-plane: controller-manager` for selector compatibility), and the ServiceAccount-name helper (`serviceAccount.name` override, else `<prefix>-controller-manager`)
 
 ---
 
@@ -32,10 +32,10 @@ Repository root; chart at `charts/kvsynk8s/`, scripts at `hack/`, workflows at `
 
 **Purpose**: The sync tooling that produces the CRD template and RBAC rules the chart cannot ship without. BLOCKS all user stories: US1 needs the synced CRD and ClusterRole content; US5 CI enforces this same tooling.
 
-- [ ] T003 Create `charts/kvsynk8s/templates/rbac/manager-clusterrole.yaml` wrapper: ClusterRole `<prefix>-manager-role` metadata plus empty `# BEGIN generated rules (make helm-sync)` / `# END generated rules` marker region (research.md R5)
-- [ ] T004 Create `hack/helm-sync.sh` (executable) implementing research.md R5: (1) wrap `config/crd/bases/kvsynk8s.io_secretsyncs.yaml` verbatim into `charts/kvsynk8s/templates/crds/secretsync-crd.yaml` with the `{{- if .Values.crds.install }}` gate and a `crds.keep`-gated `helm.sh/resource-policy: keep` annotation injected into `metadata.annotations`; (2) splice the `rules:` block of `config/rbac/role.yaml` between the markers in `charts/kvsynk8s/templates/rbac/manager-clusterrole.yaml`. Output must be byte-stable across runs
-- [ ] T005 Add `helm-sync` target to `Makefile` (depends on the existing `manifests` target, invokes `hack/helm-sync.sh`)
-- [ ] T006 Run `make helm-sync`; commit the generated `charts/kvsynk8s/templates/crds/secretsync-crd.yaml` and populated rules region; re-run and verify `git diff --exit-code charts/` is clean (byte-stability)
+- [X] T003 Create `charts/kvsynk8s/templates/rbac/manager-clusterrole.yaml` wrapper: ClusterRole `<prefix>-manager-role` metadata plus empty `# BEGIN generated rules (make helm-sync)` / `# END generated rules` marker region (research.md R5)
+- [X] T004 Create `hack/helm-sync.sh` (executable) implementing research.md R5: (1) wrap `config/crd/bases/kvsynk8s.io_secretsyncs.yaml` verbatim into `charts/kvsynk8s/templates/crds/secretsync-crd.yaml` with the `{{- if .Values.crds.install }}` gate and a `crds.keep`-gated `helm.sh/resource-policy: keep` annotation injected into `metadata.annotations`; (2) splice the `rules:` block of `config/rbac/role.yaml` between the markers in `charts/kvsynk8s/templates/rbac/manager-clusterrole.yaml`. Output must be byte-stable across runs
+- [X] T005 Add `helm-sync` target to `Makefile` (depends on the existing `manifests` target, invokes `hack/helm-sync.sh`)
+- [X] T006 Run `make helm-sync`; commit the generated `charts/kvsynk8s/templates/crds/secretsync-crd.yaml` and populated rules region; re-run and verify `git diff --exit-code charts/` is clean (byte-stability)
 
 **Checkpoint**: CRD template and manager ClusterRole rules exist in the chart and regenerate deterministically.
 
@@ -49,17 +49,17 @@ Repository root; chart at `charts/kvsynk8s/`, scripts at `hack/`, workflows at `
 
 ### Implementation for User Story 1
 
-- [ ] T007 [US1] Write `charts/kvsynk8s/values.yaml` with the complete documented surface from contracts/values.md: `operator.queueURL`/`operator.reconcileInterval` (both `""`), `azure.clientID` (`""`), `image.{repository: ghcr.io/tabman83/kvsynk8s, tag: "", pullPolicy: IfNotPresent}`, `serviceAccount.name` (`""`), `resources` (requests 10m/32Mi, limits 200m/128Mi), `nodeSelector`/`tolerations`/`affinity`, `metrics.enabled: true`, `serviceMonitor.enabled: false`, `networkPolicy.enabled: false`, `crds.{install: true, keep: true}` — each with an inline comment stating default and effect, including the FR-012 federated-credential warning next to `serviceAccount.name`
-- [ ] T008 [P] [US1] Create `charts/kvsynk8s/templates/rbac/serviceaccount.yaml`: name from the helper, `azure.workload.identity/client-id` annotation rendered only when `azure.clientID` is set
-- [ ] T009 [P] [US1] Create `charts/kvsynk8s/templates/rbac/manager-clusterrolebinding.yaml` binding `<prefix>-manager-role` to the ServiceAccount (same role/SA pair as install.yaml)
-- [ ] T010 [P] [US1] Create the metrics RBAC templates, each wrapped in `{{- if .Values.metrics.enabled }}`: `charts/kvsynk8s/templates/rbac/metrics-auth-clusterrole.yaml`, `charts/kvsynk8s/templates/rbac/metrics-auth-clusterrolebinding.yaml`, `charts/kvsynk8s/templates/rbac/metrics-reader-clusterrole.yaml` (content mirrored from `config/rbac/`)
-- [ ] T011 [P] [US1] Create the aggregation ClusterRoles mirrored from `config/rbac/`: `charts/kvsynk8s/templates/rbac/secretsync-admin-clusterrole.yaml`, `charts/kvsynk8s/templates/rbac/secretsync-editor-clusterrole.yaml`, `charts/kvsynk8s/templates/rbac/secretsync-viewer-clusterrole.yaml`
-- [ ] T012 [P] [US1] Create `charts/kvsynk8s/templates/deployment.yaml` per contracts/rendered-resources.md: name `<prefix>-operator`, `replicas: 1` hardcoded with a comment explaining no leader election (FR-009), pod securityContext (`runAsNonRoot`, `seccompProfile: RuntimeDefault`), container securityContext (`readOnlyRootFilesystem`, `allowPrivilegeEscalation: false`, drop ALL), probes (liveness `/healthz:8081` 15s/20s, readiness `/readyz:8081` 5s/10s), `terminationGracePeriodSeconds: 10`, container port 8081 (name `health`), pod annotation `kubectl.kubernetes.io/default-container: manager`, args: `--leader-elect` (kept only for install.yaml equivalence — the operator hardcodes `LeaderElection: false` in `cmd/main.go` and ignores the flag; add a template comment saying so, do not drop it), `--health-probe-bind-address=:8081`, `--metrics-bind-address=:8443` gated by `metrics.enabled`, plus `--queue-url`/`--reconcile-interval`/`--azure-client-id` each rendered only when its value is set; image `repository:tag|.Chart.AppVersion` with `pullPolicy`; `resources`/`nodeSelector`/`tolerations`/`affinity` from values; pod label `azure.workload.identity/use: "true"` only when `azure.clientID` is set
-- [ ] T013 [P] [US1] Create `charts/kvsynk8s/templates/metrics-service.yaml`: Service `<prefix>-controller-manager-metrics-service` (port 8443, selector `control-plane: controller-manager`), gated by `metrics.enabled`
-- [ ] T014 [P] [US1] Create `charts/kvsynk8s/templates/NOTES.txt` with post-install pointers: CRD presence check, workload-identity/federated-credential setup reminder, link to README
-- [ ] T015 [US1] Verify quickstart.md §1: `helm lint charts/kvsynk8s` passes with 0 failures; `helm template kvsynk8s charts/kvsynk8s --namespace kvsynk8s` renders exactly the 12-resource inventory of contracts/rendered-resources.md (no Namespace, no ServiceMonitor, no NetworkPolicy, no WI label/annotation); fix templates until true
-- [ ] T016 [US1] Create `hack/compare-helm-kustomize.sh` (executable) per research.md R8: render `helm template kvsynk8s charts/kvsynk8s --namespace kvsynk8s` and `bin/kustomize build config/default`, compare the sorted kind/namespace/name inventory (excluding the Namespace object) and assert the Deployment's security contexts, probes, args, resources, serviceAccountName, replicas, container ports, and the `kubectl.kubernetes.io/default-container` pod annotation match; print a diff on failure
-- [ ] T017 [US1] Run `hack/compare-helm-kustomize.sh` and fix chart output until it exits 0 (SC-002, FR-004)
+- [X] T007 [US1] Write `charts/kvsynk8s/values.yaml` with the complete documented surface from contracts/values.md: `operator.queueURL`/`operator.reconcileInterval` (both `""`), `azure.clientID` (`""`), `image.{repository: ghcr.io/tabman83/kvsynk8s, tag: "", pullPolicy: IfNotPresent}`, `serviceAccount.name` (`""`), `resources` (requests 10m/32Mi, limits 200m/128Mi), `nodeSelector`/`tolerations`/`affinity`, `metrics.enabled: true`, `serviceMonitor.enabled: false`, `networkPolicy.enabled: false`, `crds.{install: true, keep: true}` — each with an inline comment stating default and effect, including the FR-012 federated-credential warning next to `serviceAccount.name`
+- [X] T008 [P] [US1] Create `charts/kvsynk8s/templates/rbac/serviceaccount.yaml`: name from the helper, `azure.workload.identity/client-id` annotation rendered only when `azure.clientID` is set
+- [X] T009 [P] [US1] Create `charts/kvsynk8s/templates/rbac/manager-clusterrolebinding.yaml` binding `<prefix>-manager-role` to the ServiceAccount (same role/SA pair as install.yaml)
+- [X] T010 [P] [US1] Create the metrics RBAC templates, each wrapped in `{{- if .Values.metrics.enabled }}`: `charts/kvsynk8s/templates/rbac/metrics-auth-clusterrole.yaml`, `charts/kvsynk8s/templates/rbac/metrics-auth-clusterrolebinding.yaml`, `charts/kvsynk8s/templates/rbac/metrics-reader-clusterrole.yaml` (content mirrored from `config/rbac/`)
+- [X] T011 [P] [US1] Create the aggregation ClusterRoles mirrored from `config/rbac/`: `charts/kvsynk8s/templates/rbac/secretsync-admin-clusterrole.yaml`, `charts/kvsynk8s/templates/rbac/secretsync-editor-clusterrole.yaml`, `charts/kvsynk8s/templates/rbac/secretsync-viewer-clusterrole.yaml`
+- [X] T012 [P] [US1] Create `charts/kvsynk8s/templates/deployment.yaml` per contracts/rendered-resources.md: name `<prefix>-operator`, `replicas: 1` hardcoded with a comment explaining no leader election (FR-009), pod securityContext (`runAsNonRoot`, `seccompProfile: RuntimeDefault`), container securityContext (`readOnlyRootFilesystem`, `allowPrivilegeEscalation: false`, drop ALL), probes (liveness `/healthz:8081` 15s/20s, readiness `/readyz:8081` 5s/10s), `terminationGracePeriodSeconds: 10`, container port 8081 (name `health`), pod annotation `kubectl.kubernetes.io/default-container: manager`, args: `--leader-elect` (kept only for install.yaml equivalence — the operator hardcodes `LeaderElection: false` in `cmd/main.go` and ignores the flag; add a template comment saying so, do not drop it), `--health-probe-bind-address=:8081`, `--metrics-bind-address=:8443` gated by `metrics.enabled`, plus `--queue-url`/`--reconcile-interval`/`--azure-client-id` each rendered only when its value is set; image `repository:tag|.Chart.AppVersion` with `pullPolicy`; `resources`/`nodeSelector`/`tolerations`/`affinity` from values; pod label `azure.workload.identity/use: "true"` only when `azure.clientID` is set
+- [X] T013 [P] [US1] Create `charts/kvsynk8s/templates/metrics-service.yaml`: Service `<prefix>-controller-manager-metrics-service` (port 8443, selector `control-plane: controller-manager`), gated by `metrics.enabled`
+- [X] T014 [P] [US1] Create `charts/kvsynk8s/templates/NOTES.txt` with post-install pointers: CRD presence check, workload-identity/federated-credential setup reminder, link to README
+- [X] T015 [US1] Verify quickstart.md §1: `helm lint charts/kvsynk8s` passes with 0 failures; `helm template kvsynk8s charts/kvsynk8s --namespace kvsynk8s` renders exactly the 12-resource inventory of contracts/rendered-resources.md (no Namespace, no ServiceMonitor, no NetworkPolicy, no WI label/annotation); fix templates until true
+- [X] T016 [US1] Create `hack/compare-helm-kustomize.sh` (executable) per research.md R8: render `helm template kvsynk8s charts/kvsynk8s --namespace kvsynk8s` and `bin/kustomize build config/default`, compare the sorted kind/namespace/name inventory (excluding the Namespace object) and assert the Deployment's security contexts, probes, args, resources, serviceAccountName, replicas, container ports, and the `kubectl.kubernetes.io/default-container` pod annotation match; print a diff on failure
+- [X] T017 [US1] Run `hack/compare-helm-kustomize.sh` and fix chart output until it exits 0 (SC-002, FR-004)
 
 **Checkpoint**: Default chart render is equivalent to install.yaml; chart installs standalone (kind smoke via quickstart §6 first half is possible now).
 
@@ -73,10 +73,10 @@ Repository root; chart at `charts/kvsynk8s/`, scripts at `hack/`, workflows at `
 
 ### Implementation for User Story 2
 
-- [ ] T018 [P] [US2] Create `charts/kvsynk8s/templates/servicemonitor.yaml`: gated by `serviceMonitor.enabled`; calls `fail` with a clear message when `serviceMonitor.enabled=true` but `metrics.enabled=false` (contracts/values.md); targets the metrics Service like the kustomize `config/prometheus` overlay
-- [ ] T019 [P] [US2] Create `charts/kvsynk8s/templates/networkpolicy.yaml`: gated by `networkPolicy.enabled`; allows metrics scraping only from namespaces labeled `metrics: enabled`, selector matching the kustomize `config/network-policy` overlay
-- [ ] T020 [US2] Verify quickstart.md §3: render with `operator.queueURL`, `operator.reconcileInterval=30m`, `azure.clientID`, `serviceMonitor.enabled=true`, `networkPolicy.enabled=true`, `image.tag=test` set — confirm args, the three WI markers rendering together (FR-011), ServiceMonitor and NetworkPolicy presence, image tag; then render with `metrics.enabled=false` and confirm no metrics Service, no `--metrics-bind-address` arg, no metrics-auth/reader RBAC
-- [ ] T021 [US2] Verify the no-secret contract (SC-005, FR-013) per quickstart.md §4: default and all-values renders contain no `kind: Secret`; `grep -ri "SET-ME" charts/` is empty; no secret-looking material in chart source
+- [X] T018 [P] [US2] Create `charts/kvsynk8s/templates/servicemonitor.yaml`: gated by `serviceMonitor.enabled`; calls `fail` with a clear message when `serviceMonitor.enabled=true` but `metrics.enabled=false` (contracts/values.md); targets the metrics Service like the kustomize `config/prometheus` overlay
+- [X] T019 [P] [US2] Create `charts/kvsynk8s/templates/networkpolicy.yaml`: gated by `networkPolicy.enabled`; allows metrics scraping only from namespaces labeled `metrics: enabled`, selector matching the kustomize `config/network-policy` overlay
+- [X] T020 [US2] Verify quickstart.md §3: render with `operator.queueURL`, `operator.reconcileInterval=30m`, `azure.clientID`, `serviceMonitor.enabled=true`, `networkPolicy.enabled=true`, `image.tag=test` set — confirm args, the three WI markers rendering together (FR-011), ServiceMonitor and NetworkPolicy presence, image tag; then render with `metrics.enabled=false` and confirm no metrics Service, no `--metrics-bind-address` arg, no metrics-auth/reader RBAC
+- [X] T021 [US2] Verify the no-secret contract (SC-005, FR-013) per quickstart.md §4: default and all-values renders contain no `kind: Secret`; `grep -ri "SET-ME" charts/` is empty; no secret-looking material in chart source
 
 **Checkpoint**: Full values surface works; both stories independently verifiable.
 
@@ -90,9 +90,9 @@ Repository root; chart at `charts/kvsynk8s/`, scripts at `hack/`, workflows at `
 
 ### Implementation for User Story 3
 
-- [ ] T022 [US3] Modify `.github/workflows/release.yml`: add a chart-publish job with `needs: build-and-push` per research.md R3/R9 — `VERSION="${GITHUB_REF_NAME#v}"`, `helm package charts/kvsynk8s --version "$VERSION" --app-version "$VERSION"`, `helm registry login ghcr.io` with `GITHUB_TOKEN` (`packages: write`), `helm push` to `oci://ghcr.io/tabman83/charts`, upload the `.tgz` as a workflow artifact
-- [ ] T023 [US3] Modify the GitHub Release job in `.github/workflows/release.yml` to `needs:` the chart-publish job, download the `.tgz` artifact, and add `kvsynk8s-*.tgz` to the `softprops/action-gh-release` `files:` list next to `dist/install.yaml`; confirm a re-run on the same tag republishes idempotently (contracts/release-artifacts.md)
-- [ ] T024 [US3] Manual post-merge validation (maintainer, after first tag): run quickstart.md §7 — OCI pull resolves with app version `X.Y.Z`, release assets list both `install.yaml` and `kvsynk8s-X.Y.Z.tgz` (SC-003, FR-014)
+- [X] T022 [US3] Modify `.github/workflows/release.yml`: add a chart-publish job with `needs: build-and-push` per research.md R3/R9 — `VERSION="${GITHUB_REF_NAME#v}"`, `helm package charts/kvsynk8s --version "$VERSION" --app-version "$VERSION"`, `helm registry login ghcr.io` with `GITHUB_TOKEN` (`packages: write`), `helm push` to `oci://ghcr.io/tabman83/charts`, upload the `.tgz` as a workflow artifact
+- [X] T023 [US3] Modify the GitHub Release job in `.github/workflows/release.yml` to `needs:` the chart-publish job, download the `.tgz` artifact, and add `kvsynk8s-*.tgz` to the `softprops/action-gh-release` `files:` list next to `dist/install.yaml`; confirm a re-run on the same tag republishes idempotently (contracts/release-artifacts.md)
+- [ ] T024 [US3] Manual post-merge validation (maintainer, after first tag): run quickstart.md §7 — OCI pull resolves with app version `X.Y.Z`, release assets list both `install.yaml` and `kvsynk8s-X.Y.Z.tgz` (SC-003, FR-014). **Still open** — it needs a real `v*` tag pushed after merge, so it cannot be done on the branch. What was verified locally instead: `helm package --version 1.4.2 --app-version 1.4.2` produces `kvsynk8s-1.4.2.tgz` with `version == appVersion == 1.4.2`, `ci/` excluded by `.helmignore`, and a default render from the package resolving the image to `ghcr.io/tabman83/kvsynk8s:1.4.2` with no values set.
 
 **Checkpoint**: Release pipeline ships both install methods with matching versions, zero manual steps.
 
@@ -106,8 +106,8 @@ Repository root; chart at `charts/kvsynk8s/`, scripts at `hack/`, workflows at `
 
 ### Implementation for User Story 4
 
-- [ ] T025 [US4] Verify CRD gating renders per data-model.md (CRD lifecycle settings): default render includes the CRD with `helm.sh/resource-policy: keep`; `--set crds.keep=false` renders it without the annotation; `--set crds.install=false` omits the CRD entirely while everything else still renders — adjust `hack/helm-sync.sh` wrapper output in `charts/kvsynk8s/templates/crds/secretsync-crd.yaml` if any case fails (FR-005, FR-006)
-- [ ] T026 [US4] Manual kind lifecycle validation per quickstart.md §6: install → apply `config/samples/` → `helm uninstall` → CRD and SecretSync objects still present → adopt CRD via the research.md R2 label/annotate commands → reinstall → operator resumes managing objects; record zero objects lost (SC-004)
+- [X] T025 [US4] Verify CRD gating renders per data-model.md (CRD lifecycle settings): default render includes the CRD with `helm.sh/resource-policy: keep`; `--set crds.keep=false` renders it without the annotation; `--set crds.install=false` omits the CRD entirely while everything else still renders — adjust `hack/helm-sync.sh` wrapper output in `charts/kvsynk8s/templates/crds/secretsync-crd.yaml` if any case fails (FR-005, FR-006)
+- [X] T026 [US4] Manual kind lifecycle validation per quickstart.md §6: install → apply `config/samples/` → `helm uninstall` → CRD and SecretSync objects still present → adopt CRD via the research.md R2 label/annotate commands → reinstall → operator resumes managing objects; record zero objects lost (SC-004)
 
 **Checkpoint**: Lifecycle semantics proven end-to-end on a real cluster.
 
@@ -121,9 +121,9 @@ Repository root; chart at `charts/kvsynk8s/`, scripts at `hack/`, workflows at `
 
 ### Implementation for User Story 5
 
-- [ ] T027 [P] [US5] Create `charts/kvsynk8s/ci/nondefault-values.yaml`: queue URL, reconcile interval, `azure.clientID`, `serviceMonitor.enabled=true`, `networkPolicy.enabled=true`, image override — the representative non-default values file for the CI render matrix (research.md R8; `helm lint` picks up `ci/*-values.yaml` automatically)
-- [ ] T028 [US5] Create `.github/workflows/helm.yml` on `pull_request` and `push` to master per research.md R8: pin helm via `azure/setup-helm`; `helm lint charts/kvsynk8s`; `helm template` with defaults (must succeed, non-empty); `helm template` with `charts/kvsynk8s/ci/nondefault-values.yaml`; drift check `make manifests helm-sync && git diff --exit-code charts/`; equivalence check `hack/compare-helm-kustomize.sh`; no-secret grep over source and both renders (contracts/values.md CI tests)
-- [ ] T029 [US5] Verify the drift guardrail locally per quickstart.md §5: simulate drift by adding a verb to the kubebuilder RBAC marker in `internal/controller/secretsync_controller.go`, confirm `make manifests helm-sync` produces a `charts/` diff, restore, confirm clean (SC-006, FR-015)
+- [X] T027 [P] [US5] Create `charts/kvsynk8s/ci/nondefault-values.yaml`: queue URL, reconcile interval, `azure.clientID`, `serviceMonitor.enabled=true`, `networkPolicy.enabled=true`, image override — the representative non-default values file for the CI render matrix (research.md R8; `helm lint` picks up `ci/*-values.yaml` automatically)
+- [X] T028 [US5] Create `.github/workflows/helm.yml` on `pull_request` and `push` to master per research.md R8: pin helm via `azure/setup-helm`; `helm lint charts/kvsynk8s`; `helm template` with defaults (must succeed, non-empty); `helm template` with `charts/kvsynk8s/ci/nondefault-values.yaml`; drift check `make manifests helm-sync && git diff --exit-code charts/`; equivalence check `hack/compare-helm-kustomize.sh`; no-secret grep over source and both renders (contracts/values.md CI tests)
+- [X] T029 [US5] Verify the drift guardrail locally per quickstart.md §5: simulate drift by adding a verb to the kubebuilder RBAC marker in `internal/controller/secretsync_controller.go`, confirm `make manifests helm-sync` produces a `charts/` diff, restore, confirm clean (SC-006, FR-015)
 
 **Checkpoint**: All five stories complete and independently verified.
 
@@ -133,9 +133,9 @@ Repository root; chart at `charts/kvsynk8s/`, scripts at `hack/`, workflows at `
 
 **Purpose**: Documentation and final validation spanning all stories.
 
-- [ ] T030 [P] Add the Helm install section to `README.md` (FR-017): the one-command install (`--namespace kvsynk8s --create-namespace`), Helm >= 3.8 floor, values overview with the FR-012 federated-credential warning, migration caveat (Helm does not adopt install.yaml resources — remove the manifest install first), the lossless CRD adoption steps from research.md R2, the `crds.install=false` escape hatch, and the `crds.keep=false` uninstall-ordering caveat
-- [ ] T031 [P] Update `CLAUDE.md` (project) build/test section: add `make helm-sync` and the `helm.yml` workflow to the CI list, and mention `charts/kvsynk8s/` in the architecture notes
-- [ ] T032 Run the full `specs/002-helm-chart/quickstart.md` validation (§1–§6; §7 stays post-merge) and fix anything that fails
+- [X] T030 [P] Add the Helm install section to `README.md` (FR-017): the one-command install (`--namespace kvsynk8s --create-namespace`), Helm >= 3.8 floor, values overview with the FR-012 federated-credential warning, migration caveat (Helm does not adopt install.yaml resources — remove the manifest install first), the lossless CRD adoption steps from research.md R2, the `crds.install=false` escape hatch, and the `crds.keep=false` uninstall-ordering caveat
+- [X] T031 [P] Update `CLAUDE.md` (project) build/test section: add `make helm-sync` and the `helm.yml` workflow to the CI list, and mention `charts/kvsynk8s/` in the architecture notes
+- [X] T032 Run the full `specs/002-helm-chart/quickstart.md` validation (§1–§6; §7 stays post-merge) and fix anything that fails
 
 ---
 
@@ -206,6 +206,31 @@ Task: "Create charts/kvsynk8s/templates/NOTES.txt"                              
 Per the repo workflow, all of this lands as one focused PR on a `002-helm-chart` branch (never on master), with checks watched until green; T024 and the first real §7 validation happen after merge on the first tagged release.
 
 ---
+
+## Deviations from the task text
+
+Three things were done differently from what the task said, because the task
+text turned out to be wrong:
+
+- **T027** claims `helm lint` picks up `ci/*-values.yaml` automatically. It does
+  not — that is `ct lint` (chart-testing), not `helm lint`. The file is still
+  there and is still the CI render matrix input, but `helm.yml` and
+  `make helm-verify` pass it explicitly with `-f`.
+- **T021 / quickstart §4** used `grep -i "kind: Secret"`, which always matches
+  `kind: SecretSync` inside the CRD schema and so can never pass. Replaced by
+  `hack/check-render.sh`, which parses the render and checks each document's
+  real `kind`. That script also grew two checks the tasks did not ask for but
+  that caught a real bug: duplicate YAML mapping keys (the first version of
+  `_helpers.tpl` emitted `app.kubernetes.io/name` twice on the Deployment,
+  Service and ServiceMonitor) and `<SET-ME>`-style placeholders.
+- **T026 / quickstart §6** applied `config/samples/`, but the scaffolded sample
+  still has an empty `spec:` and the CRD rejects it. The scenario now creates
+  two valid SecretSync objects inline. The same section claimed a reinstall
+  after a `crds.keep` uninstall needs the research.md R2 adoption commands — it
+  does not: the kept CRD still carries Helm's ownership metadata, so a
+  same-name, same-namespace reinstall just works. The R2 commands are for a CRD
+  Helm never owned (a `kubectl apply -f install.yaml` install). Both paths were
+  run on a kind cluster; quickstart.md now documents both correctly.
 
 ## Notes
 
