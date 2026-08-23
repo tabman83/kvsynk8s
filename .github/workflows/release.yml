@@ -168,8 +168,10 @@ jobs:
           version: ${{ env.HELM_VERSION }}
 
       # Chart.yaml stays at the 0.0.0 dev placeholder in git; the real version
-      # only ever exists here, derived from the tag. Chart version, appVersion
-      # and image tag are therefore always the same release.
+      # only ever exists here, derived from the tag. Chart version == appVersion
+      # == the tag minus the "v". The image above is pushed under the tag WITH
+      # the "v", and the chart's default image.tag puts it back — helm.yml
+      # asserts that, because a mismatch here breaks every default install.
       - name: Package the chart at the release version
         env:
           TAG: ${{ github.ref_name }}
