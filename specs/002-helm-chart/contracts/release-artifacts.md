@@ -37,22 +37,24 @@ For every tag `vX.Y.Z`, a successful release run MUST produce all of:
 
 ## One-time manual step: GHCR package visibility
 
-**The first `helm push` creates `ghcr.io/tabman83/charts/kvsynk8s` as a
-PRIVATE package.** GitHub makes newly published personal-account packages
-private by default, and nothing in `helm push` can change that. Until the
-maintainer sets the package to Public in its GitHub package settings, the
-documented anonymous install fails with a 401:
+**Check the visibility of `ghcr.io/tabman83/charts/kvsynk8s` after the first
+release.** GitHub's rules here are not clear-cut: a package published by a
+workflow can inherit the repository's visibility, but a newly published
+package scoped to a personal account defaults to private, and `helm push`
+sends no `org.opencontainers.image.source` label to link the package to this
+repository the way the image build does. Which of the two applies will only be
+known when the first tag is pushed. If the package lands private, the
+documented anonymous install fails with a 401 until it is set to Public:
 
 ```bash
 helm install kvsynk8s oci://ghcr.io/tabman83/charts/kvsynk8s --version X.Y.Z
 # Error: ... unauthorized
 ```
 
-So after the very first release that publishes a chart, go to the package page
-on GitHub → Package settings → Change visibility → Public. This is a one-time
-step per package; later releases inherit the visibility. It is the one place
-SC-003's "zero manual publishing steps" does not hold, and it holds for every
-release after that.
+The fix is a one-time step per package: package page on GitHub → Package
+settings → Change visibility → Public. Later releases keep whatever visibility
+the package has. If it is needed, it is the one place SC-003's "zero manual
+publishing steps" does not hold, and only for the first release.
 
 ## Credentials
 
