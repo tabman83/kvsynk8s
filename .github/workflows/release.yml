@@ -9,8 +9,9 @@ permissions: {}
 
 env:
   IMAGE: ghcr.io/tabman83/kvsynk8s
-  # Pinned to the latest Helm 3, which is the floor the chart documents
-  # (OCI support is GA from 3.8). Charts packaged with it install fine on Helm 4.
+  # The chart is PACKAGED with the floor version it documents, so the artifact
+  # is readable by every supported Helm. The `helm` job below validates the
+  # chart on both the 3.x and 4.x lines.
   HELM_VERSION: v3.21.4
 
 jobs:
@@ -111,8 +112,16 @@ jobs:
   helm:
     permissions:
       contents: read
-    name: Run on Ubuntu
+    # Same matrix as helm.yml: the chart has to work on the >= 3.8 floor it
+    # documents and on the Helm 4 line most people are on.
+    name: Run on Ubuntu (helm ${{ matrix.helm }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        helm:
+          - v3.21.4   # latest 3.x — the floor the chart documents
+          - v4.2.4    # latest 4.x
     steps:
       - name: Clone the code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -127,7 +136,7 @@ jobs:
       - name: Setup Helm
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
-          version: ${{ env.HELM_VERSION }}
+          version: ${{ matrix.helm }}
 
       - name: Make sure PyYAML is available
         run: |

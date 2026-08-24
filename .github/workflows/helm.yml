@@ -6,17 +6,21 @@ on:
 
 permissions: {}
 
-env:
-  # The floor the chart documents (OCI is GA from Helm 3.8). Charts that lint
-  # and render here also work on Helm 4.
-  HELM_VERSION: v3.21.4
-
 jobs:
   chart:
     permissions:
       contents: read
-    name: Run on Ubuntu
+    # The chart says it supports Helm >= 3.8, and Helm 4 is what most people
+    # will actually have. Both lines get the full check suite so neither can
+    # break without CI saying so.
+    name: Run on Ubuntu (helm ${{ matrix.helm }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        helm:
+          - v3.21.4   # latest 3.x — the floor the chart documents
+          - v4.2.4    # latest 4.x
     steps:
       - name: Clone the code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -31,7 +35,7 @@ jobs:
       - name: Setup Helm
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
-          version: ${{ env.HELM_VERSION }}
+          version: ${{ matrix.helm }}
 
       - name: Make sure PyYAML is available (used by the render and equivalence checks)
         run: |
