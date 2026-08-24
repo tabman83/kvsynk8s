@@ -33,7 +33,108 @@ secret mapped to one Kubernetes Secret.
 
 ## Install
 
-### Option A — release manifest (once a release exists)
+### Option A — Helm (recommended)
+
+Needs Helm 3.8 or newer (that is where OCI support went GA).
+
+```bash
+helm install kvsynk8s oci://ghcr.io/tabman83/charts/kvsynk8s \
+  --version X.Y.Z \
+  --namespace kvsynk8s --create-namespace \
+  --set azure.clientID=<managed-identity-client-id> \
+  --set operator.queueURL=https://<storage>.queue.core.windows.net/<queue>
+```
+
+The chart version is always the release version, and the image tag defaults to
+it, so you never have to line up two versions by hand. You still need the
+Azure setup below.
+
+If that install fails with `unauthorized`, the GHCR package is still private.
+GitHub publishes new packages as private by default, so after the first
+release that ships a chart the maintainer has to set
+`ghcr.io/tabman83/charts/kvsynk8s` to Public once in its GitHub package
+settings. Nothing in the pipeline can do it.
+
+Values you can set (the full list is in `charts/kvsynk8s/values.yaml`, each one
+with a comment):
+
+| Value | Default | What it does |
+|---|---|---|
+| `operator.queueURL` | `""` | Storage queue with the Key Vault events. Unset means periodic reconcile only. |
+| `operator.reconcileInterval` | `""` | Go duration. Unset means the built-in 4h. |
+| `azure.clientID` | `""` | Managed identity client ID. Setting it wires up workload identity. |
+| `image.repository` / `image.tag` / `image.pullPolicy` | `ghcr.io/tabman83/kvsynk8s` / `v` + chart appVersion / `IfNotPresent` | The operator image. Empty `image.tag` resolves to the release's own image, e.g. `:v1.2.3`. |
+| `serviceAccount.name` | `""` | Defaults to `<release-name>-controller-manager`. |
+| `resources`, `nodeSelector`, `tolerations`, `affinity` | see values.yaml | Pod scheduling and limits. |
+| `metrics.enabled` | `true` | Metrics Service, `:8443` arg, and the RBAC that protects it. |
+| `serviceMonitor.enabled` | `false` | Prometheus Operator ServiceMonitor. Needs `metrics.enabled=true`. |
+| `networkPolicy.enabled` | `false` | Only namespaces labeled `metrics: enabled` may scrape. |
+| `crds.install` | `true` | The SecretSync CRD is part of the release, so upgrades update it. |
+| `crds.keep` | `true` | `helm uninstall` leaves the CRD and all SecretSync objects alone. |
+
+There is no `replicas` value. The operator runs without leader election, so a
+second replica would reconcile the same SecretSync objects and write the same
+Secrets uncoordinated.
+
+**Warning about `serviceAccount.name` and the namespace.** The Entra federated
+credential is bound to the exact ServiceAccount name and namespace
+(`system:serviceaccount:<namespace>:<name>`). Renaming the ServiceAccount or
+installing into a different namespace breaks Azure authentication until you
+update the federated credential on the managed identity to match.
+
+#### Coming from the install.yaml manifest
+
+Helm does not adopt resources it did not create. Installing the chart over a
+manifest install fails on the existing objects. Remove the manifest install
+first:
+
+```bash
+kubectl delete -f https://github.com/tabman83/kvsynk8s/releases/download/vX.Y.Z/install.yaml
+```
+
+That deletes the CRD too, and with it every SecretSync object. If you want to
+keep them, hand the CRD over to Helm instead of deleting it. Helm checks
+exactly three fields before it takes ownership:
+
+```bash
+kubectl label crd secretsyncs.kvsynk8s.io app.kubernetes.io/managed-by=Helm
+kubectl annotate crd secretsyncs.kvsynk8s.io \
+  meta.helm.sh/release-name=kvsynk8s \
+  meta.helm.sh/release-namespace=kvsynk8s
+```
+
+Then delete the rest of the manifest install (not the CRD) and run
+`helm install`. The CRD object and every SecretSync in the cluster survive.
+
+If you would rather keep the CRD out of the release entirely — because
+something else manages it — install with `--set crds.install=false`. The
+cluster must already have the CRD in that case.
+
+Careful when flipping `crds.install` to false on a release that already exists.
+Removing the CRD from the manifest is a resource removal, so Helm would delete
+it. It does not, because `crds.keep` (true by default) annotated the CRD
+`helm.sh/resource-policy: keep`. But if you set both `crds.install=false` and
+`crds.keep=false`, that upgrade deletes the CRD and every SecretSync object in
+the cluster.
+
+#### Uninstall
+
+```bash
+helm uninstall kvsynk8s --namespace kvsynk8s
+```
+
+By default the CRD stays (`crds.keep=true`), so your SecretSync objects and
+the Secrets the operator wrote are untouched and a reinstall picks up where it
+left off.
+
+With `crds.keep=false`, uninstall deletes the CRD, which deletes every
+SecretSync object. Note the ordering: Helm removes the operator Deployment in
+the same operation, so the finalizer that cleans up managed Secrets may not get
+to run, leaving orphaned Secrets behind. If you really want everything gone,
+delete the SecretSync objects first, wait for them to disappear, then
+uninstall.
+
+### Option B — release manifest (once a release exists)
 
 ```bash
 kubectl apply -f https://github.com/tabman83/kvsynk8s/releases/download/vX.Y.Z/install.yaml
@@ -43,7 +144,7 @@ This is the file `.github/workflows/release.yml` builds and attaches to each
 GitHub Release: the CRD, RBAC, and the operator Deployment, with the image
 already pinned to that release's tag.
 
-### Option B — from source
+### Option C — from source
 
 ```bash
 git clone https://github.com/tabman83/kvsynk8s.git
@@ -53,9 +154,10 @@ make docker-push IMG=<your-registry>/kvsynk8s:dev
 make deploy IMG=<your-registry>/kvsynk8s:dev   # kustomize edit set image + kubectl apply -k
 ```
 
-Either way, before the operator can do anything useful you need the Azure-side
-setup below, and you need to edit two things the manifest ships as
-placeholders:
+Whichever option you pick, before the operator can do anything useful you need
+the Azure-side setup below. With Helm you pass `azure.clientID` and
+`operator.queueURL` as values. With the manifest install you have to edit two
+things it ships as placeholders:
 
 - `config/rbac/service_account.yaml`'s
   `azure.workload.identity/client-id: "<SET-ME>"` annotation — the client ID

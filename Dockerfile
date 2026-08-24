@@ -24,6 +24,13 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o ma
 # Use distroless as minimal base image to package the manager binary
 # Refer to https://github.com/GoogleContainerTools/distroless for more details
 FROM gcr.io/distroless/static:nonroot
+
+# Links the published package to this repository, so it shows up on the repo
+# page and inherits the repository's access permissions. Note this controls
+# linking only: a newly published GHCR package is private until it is made
+# public once in its package settings.
+LABEL org.opencontainers.image.source=https://github.com/tabman83/kvsynk8s
+
 WORKDIR /
 COPY --from=builder /workspace/manager .
 USER 65532:65532

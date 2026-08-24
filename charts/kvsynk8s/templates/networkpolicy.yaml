@@ -1,0 +1,35 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- /*
+  Mirrors the kustomize config/network-policy overlay: only Pods in namespaces
+  labeled "metrics: enabled" may reach the operator's metrics port. Label the
+  scraping namespace to let it through, e.g.
+
+    kubectl label namespace monitoring metrics=enabled
+
+  Note this is an ingress policy on the operator Pod. Selecting the Pod at all
+  means any ingress not listed here is denied, which is fine: the operator
+  serves nothing but /metrics and the health probes. Probes come from the
+  kubelet on the node, which is not subject to NetworkPolicy.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "kvsynk8s.name" (dict "ctx" . "suffix" "allow-metrics-traffic") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kvsynk8s.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "kvsynk8s.selectorLabels" . | nindent 6 }}
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          metrics: enabled
+    ports:
+    - port: 8443
+      protocol: TCP
+{{- end }}

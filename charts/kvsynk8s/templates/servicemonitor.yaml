@@ -1,0 +1,34 @@
+{{- if .Values.serviceMonitor.enabled }}
+{{- if not .Values.metrics.enabled }}
+{{- fail "serviceMonitor.enabled=true needs metrics.enabled=true: with metrics off there is no metrics Service for Prometheus to scrape. Set metrics.enabled=true, or set serviceMonitor.enabled=false." }}
+{{- end }}
+{{- /*
+  Mirrors the kustomize config/prometheus overlay. Needs the Prometheus
+  Operator CRDs in the cluster.
+
+  insecureSkipVerify: true matches what the manifest install ships. The metrics
+  endpoint serves a self-signed certificate, so Prometheus cannot verify it;
+  authentication still happens through the bearer token and the TokenReview /
+  SubjectAccessReview RBAC this chart installs. For a verified connection,
+  front the metrics endpoint with a cert-manager certificate and point
+  tlsConfig at it.
+*/}}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "kvsynk8s.name" (dict "ctx" . "suffix" "controller-manager-metrics-monitor") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kvsynk8s.workloadLabels" . | nindent 4 }}
+spec:
+  endpoints:
+  - path: /metrics
+    port: https
+    scheme: https
+    bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+    tlsConfig:
+      insecureSkipVerify: true
+  selector:
+    matchLabels:
+      {{- include "kvsynk8s.selectorLabels" . | nindent 6 }}
+{{- end }}

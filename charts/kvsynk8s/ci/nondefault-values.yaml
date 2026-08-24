@@ -1,0 +1,58 @@
+# Representative non-default values, used by the helm.yml workflow (and
+# `make helm-verify`) so every documented knob is rendered at least once in CI.
+# Not shipped in the packaged chart — see .helmignore.
+#
+# The client ID below is an all-zeros placeholder GUID, not a credential.
+operator:
+  queueURL: https://examplestorage.queue.core.windows.net/kv-events
+  reconcileInterval: 30m
+
+azure:
+  clientID: 00000000-0000-0000-0000-000000000000
+
+image:
+  repository: ghcr.io/tabman83/kvsynk8s
+  tag: ci-test
+  pullPolicy: Always
+
+serviceAccount:
+  name: kvsynk8s-ci
+
+resources:
+  requests:
+    cpu: 25m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+nodeSelector:
+  kubernetes.io/os: linux
+
+tolerations:
+  - key: CriticalAddonsOnly
+    operator: Exists
+
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/arch
+              operator: In
+              values:
+                - amd64
+                - arm64
+
+metrics:
+  enabled: true
+
+serviceMonitor:
+  enabled: true
+
+networkPolicy:
+  enabled: true
+
+crds:
+  install: true
+  keep: true

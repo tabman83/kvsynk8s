@@ -1,0 +1,115 @@
+name: Helm chart
+
+on:
+  push:
+  pull_request:
+
+permissions: {}
+
+jobs:
+  chart:
+    permissions:
+      contents: read
+    # The chart says it supports Helm >= 3.8, and Helm 4 is what most people
+    # will actually have. Both lines get the full check suite so neither can
+    # break without CI saying so.
+    name: Run on Ubuntu (helm ${{ matrix.helm }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        helm:
+          - v3.21.4   # latest 3.x — the floor the chart documents
+          - v4.2.4    # latest 4.x
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Setup Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ matrix.helm }}
+
+      - name: Make sure PyYAML is available (used by the render and equivalence checks)
+        run: |
+          python3 -c 'import yaml' 2>/dev/null \
+            || python3 -m pip install --quiet --break-system-packages pyyaml
+
+      - name: Lint the chart
+        run: |
+          helm lint charts/kvsynk8s
+          helm lint charts/kvsynk8s -f charts/kvsynk8s/ci/nondefault-values.yaml
+
+      # Renders with defaults, with every documented value set to something
+      # non-default, and under the longest release name Helm accepts. All three
+      # must succeed and survive the render checks (non-empty, no Secret, no
+      # duplicate keys, no colliding or over-long names, no placeholders, no
+      # credential-shaped values).
+      - name: Render the chart
+        run: |
+          mkdir -p /tmp/render
+          helm template kvsynk8s charts/kvsynk8s --namespace kvsynk8s \
+            > /tmp/render/default.yaml
+          helm template kvsynk8s charts/kvsynk8s --namespace kvsynk8s \
+            -f charts/kvsynk8s/ci/nondefault-values.yaml > /tmp/render/nondefault.yaml
+          # The longest release name Helm accepts. Names are built by truncating
+          # the prefix, so every suffix must survive intact and no two resources
+          # may end up sharing a name.
+          helm template "$(printf 'r%.0s' $(seq 53))" charts/kvsynk8s \
+            --namespace kvsynk8s > /tmp/render/longname.yaml
+          hack/check-render.sh /tmp/render/default.yaml /tmp/render/nondefault.yaml \
+            /tmp/render/longname.yaml
+
+      # helm lint and the equivalence check only ever look at the default
+      # render, so a template could quietly stop honouring a value and nothing
+      # would fail. This renders the toggles on and off and asserts each value
+      # lands where contracts/values.md says.
+      - name: Values land where the contract says
+        run: hack/check-values.sh
+
+      # The renders are checked by check-render.sh above; this covers the chart
+      # source itself, where install.yaml keeps its <SET-ME> annotation.
+      - name: No placeholder values left in the chart source
+        run: |
+          if grep -rniE '<[[:space:]]*SET[-_ ]?ME[[:space:]]*>' charts/; then
+            echo "chart source carries a placeholder that looks like it wants a real value" >&2
+            exit 1
+          fi
+
+      # The CRD and the manager ClusterRole rules are generated from the Go
+      # kubebuilder markers. If regenerating them changes the chart, the chart
+      # has drifted from the operator and the PR must run `make helm-sync`.
+      - name: Chart is in sync with the generated manifests
+        run: |
+          make manifests helm-sync
+          # `git add -A` first: `git diff` only looks at tracked files, so a
+          # chart file missing from the commit that helm-sync then recreates
+          # would show up as untracked and the check would call it "in sync".
+          git add -A charts/
+          if ! git diff --cached --exit-code charts/; then
+            echo "::error::charts/ is out of sync — run 'make helm-sync' and commit the result" >&2
+            exit 1
+          fi
+
+      # The default render must stay equivalent to the manifest install.
+      - name: Chart render matches the kustomize output
+        run: make kustomize && KUSTOMIZE=bin/kustomize hack/compare-helm-kustomize.sh
+
+      # The release pipeline pushes the image as :vX.Y.Z but packages the chart
+      # with appVersion X.Y.Z, so the chart has to put the "v" back. Without
+      # this check a default `helm install` of a real release pulls a tag that
+      # does not exist, and nothing else here would notice.
+      - name: Default image tag resolves to the tag the release actually pushes
+        run: |
+          helm package charts/kvsynk8s --version 9.9.9 --app-version 9.9.9 --destination /tmp/pkg
+          got="$(helm template kvsynk8s /tmp/pkg/kvsynk8s-9.9.9.tgz --namespace kvsynk8s \
+                 | grep -m1 -oE 'ghcr\.io/tabman83/kvsynk8s:[^"]+')"
+          echo "rendered image: $got"
+          test "$got" = "ghcr.io/tabman83/kvsynk8s:v9.9.9"

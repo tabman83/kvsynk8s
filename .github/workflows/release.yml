@@ -9,6 +9,10 @@ permissions: {}
 
 env:
   IMAGE: ghcr.io/tabman83/kvsynk8s
+  # The chart is PACKAGED with the floor version it documents, so the artifact
+  # is readable by every supported Helm. The `helm` job below validates the
+  # chart on both the 3.x and 4.x lines.
+  HELM_VERSION: v3.21.4
 
 jobs:
   test:
@@ -105,9 +109,66 @@ jobs:
           go mod tidy
           make test-e2e
 
+  helm:
+    permissions:
+      contents: read
+    # Same matrix as helm.yml: the chart has to work on the >= 3.8 floor it
+    # documents and on the Helm 4 line most people are on.
+    name: Run on Ubuntu (helm ${{ matrix.helm }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        helm:
+          - v3.21.4   # latest 3.x — the floor the chart documents
+          - v4.2.4    # latest 4.x
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Setup Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ matrix.helm }}
+
+      - name: Make sure PyYAML is available
+        run: |
+          python3 -c 'import yaml' 2>/dev/null \
+            || python3 -m pip install --quiet --break-system-packages pyyaml
+
+      # `helm package` never executes templates, so without this a chart that
+      # cannot render would still be packaged and pushed to GHCR by
+      # publish-chart, and the release would go green.
+      - name: Verify the chart
+        run: |
+          helm lint charts/kvsynk8s
+          helm lint charts/kvsynk8s -f charts/kvsynk8s/ci/nondefault-values.yaml
+          mkdir -p /tmp/render
+          helm template kvsynk8s charts/kvsynk8s --namespace kvsynk8s > /tmp/render/default.yaml
+          helm template kvsynk8s charts/kvsynk8s --namespace kvsynk8s \
+            -f charts/kvsynk8s/ci/nondefault-values.yaml > /tmp/render/nondefault.yaml
+          hack/check-render.sh /tmp/render/default.yaml /tmp/render/nondefault.yaml
+          hack/check-values.sh
+
+      - name: Chart is in sync with the generated manifests
+        run: |
+          make manifests helm-sync
+          git add -A charts/
+          git diff --cached --exit-code charts/
+
+      - name: Chart render matches the kustomize output
+        run: make kustomize && KUSTOMIZE=bin/kustomize hack/compare-helm-kustomize.sh
+
   build-and-push:
     name: Build and push multi-arch image
-    needs: [test, lint, test-integration, test-e2e]
+    needs: [test, lint, test-integration, test-e2e, helm]
     permissions:
       contents: read
       packages: write
@@ -145,10 +206,68 @@ jobs:
           name: install-manifest
           path: dist/install.yaml
           if-no-files-found: error
+          # Artifact names are unique per workflow RUN, not per attempt, so
+          # without this a "Re-run all jobs" dies with a 409 instead of
+          # converging the way the release contract says it does.
+          overwrite: true
+
+  publish-chart:
+    name: Package and publish the Helm chart
+    needs: build-and-push
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      # Chart.yaml stays at the 0.0.0 dev placeholder in git; the real version
+      # only ever exists here, derived from the tag. Chart version == appVersion
+      # == the tag minus the "v". The image above is pushed under the tag WITH
+      # the "v", and the chart's default image.tag puts it back — helm.yml
+      # asserts that, because a mismatch here breaks every default install.
+      - name: Package the chart at the release version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          VERSION="${TAG#v}"
+          helm package charts/kvsynk8s --version "$VERSION" --app-version "$VERSION"
+          test -f "kvsynk8s-${VERSION}.tgz"
+
+      - name: Log in to GitHub Container Registry
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_ACTOR: ${{ github.actor }}
+        run: printf '%s' "$GH_TOKEN" | helm registry login ghcr.io -u "$GH_ACTOR" --password-stdin
+
+      # OCI tags are mutable, so re-running the workflow on the same tag
+      # republishes the same version cleanly instead of needing cleanup.
+      - name: Push the chart to ghcr.io
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          VERSION="${TAG#v}"
+          helm push "kvsynk8s-${VERSION}.tgz" oci://ghcr.io/tabman83/charts
+
+      - name: Upload the chart archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: chart-package
+          path: kvsynk8s-*.tgz
+          if-no-files-found: error
+          overwrite: true
 
   release:
     name: Create GitHub Release
-    needs: build-and-push
+    needs: [build-and-push, publish-chart]
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -159,8 +278,16 @@ jobs:
           name: install-manifest
           path: dist
 
+      - name: Download the chart archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: chart-package
+          path: dist
+
       - name: Create release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
-          files: dist/install.yaml
+          files: |
+            dist/install.yaml
+            dist/kvsynk8s-*.tgz
           generate_release_notes: true

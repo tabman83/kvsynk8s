@@ -1,0 +1,26 @@
+{{- if .Values.metrics.enabled }}
+{{/*
+Lets the operator's metrics server authenticate and authorize scrapers through
+the API server (TokenReview / SubjectAccessReview), which is what makes the
+:8443 endpoint safe to expose. Mirrored from config/rbac/metrics_auth_role.yaml.
+*/}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "kvsynk8s.name" (dict "ctx" . "suffix" "metrics-auth-role") }}
+  labels:
+    {{- include "kvsynk8s.labels" . | nindent 4 }}
+rules:
+- apiGroups:
+  - authentication.k8s.io
+  resources:
+  - tokenreviews
+  verbs:
+  - create
+- apiGroups:
+  - authorization.k8s.io
+  resources:
+  - subjectaccessreviews
+  verbs:
+  - create
+{{- end }}

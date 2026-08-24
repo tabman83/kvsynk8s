@@ -16,8 +16,12 @@ For every tag `vX.Y.Z`, a successful release run MUST produce all of:
 ## Version invariants
 
 - Chart `version` == chart `appVersion` == `X.Y.Z` (tag minus `v` prefix).
-- Default `image.tag` inside the chart resolves to the appVersion, so a chart
-  install pulls image #1 without any values set.
+- The image is pushed under the tag **with** the `v` (`:vX.Y.Z`, artifact #1),
+  because the image build uses the git ref name directly. The chart's default
+  `image.tag` is therefore `v` + appVersion, not the bare appVersion, so a
+  chart install pulls image #1 without any values set. Getting this wrong makes
+  every default install fail with ImagePullBackOff and nothing else in CI
+  notices, so `.github/workflows/helm.yml` asserts the rendered tag explicitly.
 - `Chart.yaml` in git stays at the `0.0.0` placeholder; versions are applied
   by `helm package --version --app-version` in the pipeline only.
 
@@ -30,6 +34,27 @@ For every tag `vX.Y.Z`, a successful release run MUST produce all of:
   reported green.
 - Re-running the workflow on the same tag republishes #1–#4 idempotently
   (OCI tags are mutable; `action-gh-release` replaces existing assets).
+
+## One-time manual step: GHCR package visibility
+
+**Check the visibility of `ghcr.io/tabman83/charts/kvsynk8s` after the first
+release.** GitHub's rules here are not clear-cut: a package published by a
+workflow can inherit the repository's visibility, but a newly published
+package scoped to a personal account defaults to private, and `helm push`
+sends no `org.opencontainers.image.source` label to link the package to this
+repository the way the image build does. Which of the two applies will only be
+known when the first tag is pushed. If the package lands private, the
+documented anonymous install fails with a 401 until it is set to Public:
+
+```bash
+helm install kvsynk8s oci://ghcr.io/tabman83/charts/kvsynk8s --version X.Y.Z
+# Error: ... unauthorized
+```
+
+The fix is a one-time step per package: package page on GitHub → Package
+settings → Change visibility → Public. Later releases keep whatever visibility
+the package has. If it is needed, it is the one place SC-003's "zero manual
+publishing steps" does not hold, and only for the first release.
 
 ## Credentials
 

@@ -102,6 +102,21 @@ test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expect
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 	@$(KIND) delete cluster --name $(KIND_CLUSTER)
 
+.PHONY: helm-sync
+helm-sync: manifests ## Copy the generated CRD and RBAC rules into the Helm chart.
+	hack/helm-sync.sh
+
+# CI runs this suite over both the 3.x and 4.x lines (see the helm matrix in
+# .github/workflows/helm.yml). Locally it uses whatever `helm` is on PATH;
+# point HELM at another binary to check the other line, e.g.
+#   make helm-verify HELM=/path/to/helm3
+.PHONY: helm-verify
+helm-verify: kustomize helm-sync ## Lint the chart, check the values contract, and compare against the kustomize output.
+	"$(HELM)" lint charts/kvsynk8s
+	"$(HELM)" lint charts/kvsynk8s -f charts/kvsynk8s/ci/nondefault-values.yaml
+	HELM="$(HELM)" hack/check-values.sh
+	HELM="$(HELM)" KUSTOMIZE="$(KUSTOMIZE)" hack/compare-helm-kustomize.sh
+
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
 	"$(GOLANGCI_LINT)" run
@@ -196,6 +211,7 @@ $(LOCALBIN):
 	mkdir -p "$(LOCALBIN)"
 
 ## Tool Binaries
+HELM ?= helm
 KUBECTL ?= kubectl
 KIND ?= kind
 KUSTOMIZE ?= $(LOCALBIN)/kustomize
