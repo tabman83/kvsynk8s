@@ -20,3 +20,11 @@ keywords:
 maintainers:
   - name: tabman83
     url: https://github.com/tabman83
+
+# helm push copies these into the OCI manifest. image.source links the
+# published package to this repository, so it shows up on the repo page and
+# inherits the repository's access permissions. Linking only: a newly
+# published GHCR package is private until it is made public once in its
+# package settings.
+annotations:
+  org.opencontainers.image.source: https://github.com/tabman83/kvsynk8s
