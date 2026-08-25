@@ -14,6 +14,19 @@ A working kubebuilder operator. All of Phases 1-8 in
 - T038 (the real-AKS validation run, which needs a live subscription and is
   done by hand, not by an agent).
 
+Feature `002-helm-chart` is complete and merged: the chart lives at
+`charts/kvsynk8s/` and is a second first-class install method. Its only open
+task is T024's follow-up, the parts of the release contract a dev build cannot
+exercise.
+
+**The project has shipped.** `v0.1.0` is released, and both install methods are
+live and verified working anonymously:
+`helm install kvsynk8s oci://ghcr.io/tabman83/charts/kvsynk8s --version 0.1.0`
+and the `install.yaml` asset on the GitHub Release. Both GHCR packages are
+public. Every merge to `master` also publishes a dev build
+(`<next patch>-dev.<run number>`) to the registry only — no tag, no GitHub
+Release — so the releases page stays clean. See "Cutting a release" below.
+
 T032 is done: the E2E suite in `test/e2e/secretsync_test.go` exercises the
 actual sync loop (create, SC-001 queue propagation, drift repair, deletion,
 TargetConflict, log redaction) against Azurite/Lowkey Vault, and it runs by
