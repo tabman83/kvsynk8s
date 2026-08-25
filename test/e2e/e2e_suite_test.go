@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -51,9 +52,35 @@ func TestE2E(t *testing.T) {
 }
 
 var _ = BeforeSuite(func() {
+	// `make deploy` / `make build-installer` run
+	// `kustomize edit set image controller=<img>`, which rewrites the TRACKED
+	// file config/manager/kustomization.yaml. Running the e2e suite therefore
+	// leaves a developer's working tree dirty with an images: block they never
+	// asked for, and it is easy to commit by accident.
+	//
+	// Snapshot it here and put it back afterwards. DeferCleanup rather than
+	// AfterSuite so it is restored even when the suite fails partway.
+	//
+	// Fixed here rather than in the Makefile on purpose: `make deploy` and
+	// `make build-installer` are explicit, deliberate commands where that
+	// mutation is kubebuilder's documented behaviour, and build-installer is on
+	// the release path. The surprise is only in the test suite, so that is
+	// where it gets contained.
+	By("snapshotting config/manager/kustomization.yaml so the suite cannot dirty the tree")
+	projectDir, err := utils.GetProjectDir()
+	Expect(err).NotTo(HaveOccurred())
+	kustomizationPath := filepath.Join(projectDir, "config", "manager", "kustomization.yaml")
+	original, err := os.ReadFile(kustomizationPath)
+	Expect(err).NotTo(HaveOccurred(), "could not read %s", kustomizationPath)
+	DeferCleanup(func() {
+		if err := os.WriteFile(kustomizationPath, original, 0o644); err != nil {
+			_, _ = fmt.Fprintf(GinkgoWriter, "could not restore %s: %v\n", kustomizationPath, err)
+		}
+	})
+
 	By("building the manager image")
 	cmd := exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", managerImage))
-	_, err := utils.Run(cmd)
+	_, err = utils.Run(cmd)
 	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to build the manager image")
 
 	// TODO(user): If you want to change the e2e test vendor from Kind,

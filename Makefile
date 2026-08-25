@@ -82,6 +82,14 @@ KIND_CLUSTER ?= kvsynk8s-test-e2e
 # needed. It is a timeout, not a target: a healthy run is well under it, and if
 # a run ever gets near it something is genuinely stuck.
 E2E_TIMEOUT ?= 30m
+# Ginkgo gets a shorter deadline than `go test` on purpose. Whichever fires
+# first wins, and they behave very differently: go test's timeout panics and
+# kills the process, so AfterAll/AfterSuite/DeferCleanup never run -- no
+# teardown, no drain, and config/manager/kustomization.yaml left rewritten.
+# Ginkgo's own timeout unwinds gracefully and runs all of that. Since the case
+# where a timeout fires is exactly the case where cleanup matters most, Ginkgo
+# must be the one to notice.
+E2E_GINKGO_TIMEOUT ?= 25m
 
 .PHONY: setup-test-e2e
 setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
@@ -100,7 +108,7 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 .PHONY: test-e2e
 test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
 	@set +e; \
-	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v -timeout $(E2E_TIMEOUT); \
+	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v -timeout $(E2E_TIMEOUT) -ginkgo.timeout $(E2E_GINKGO_TIMEOUT); \
 	result=$$?; \
 	set -e; \
 	$(MAKE) cleanup-test-e2e; \
@@ -198,6 +206,14 @@ ifndef ignore-not-found
   ignore-not-found = false
 endif
 
+# Bound every teardown delete. A SecretSync whose finalizer nothing can clear
+# (because undeploy removes the operator and the namespace together) otherwise
+# leaves the namespace in Terminating and kubectl blocks forever: the e2e suite
+# hit exactly that and hung for 30 minutes with no failure message. A timeout
+# turns that into a visible error. The e2e suite also drains SecretSyncs before
+# calling these targets, so this is the backstop, not the primary defence.
+DELETE_TIMEOUT ?= 120s
+
 .PHONY: install
 install: manifests kustomize ## Install CRDs into the K8s cluster specified in ~/.kube/config.
 	@out="$$( "$(KUSTOMIZE)" build config/crd 2>/dev/null || true )"; \
@@ -206,7 +222,7 @@ install: manifests kustomize ## Install CRDs into the K8s cluster specified in ~
 .PHONY: uninstall
 uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
 	@out="$$( "$(KUSTOMIZE)" build config/crd 2>/dev/null || true )"; \
-	if [ -n "$$out" ]; then echo "$$out" | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) -f -; else echo "No CRDs to delete; skipping."; fi
+	if [ -n "$$out" ]; then echo "$$out" | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) --timeout=$(DELETE_TIMEOUT) -f -; else echo "No CRDs to delete; skipping."; fi
 
 .PHONY: deploy
 deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
@@ -215,7 +231,7 @@ deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in
 
 .PHONY: undeploy
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
-	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) -f -
+	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) --timeout=$(DELETE_TIMEOUT) -f -
 
 ##@ Dependencies
 

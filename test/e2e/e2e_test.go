@@ -81,17 +81,41 @@ var _ = Describe("Manager", Ordered, func() {
 		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
 		_, _ = utils.Run(cmd)
 
+		// Backstop. The T032 AfterAll already drains, but this covers any spec
+		// that ever leaves a SecretSync behind: undeploy removes the operator,
+		// the CRD and the namespace together, so a single object still holding
+		// kvsynk8s.io/secretsync-finalizer leaves nothing that can clear it and
+		// kubectl blocks indefinitely. Must run before undeploy, not after.
+		By("draining SecretSync objects so no finalizer can deadlock teardown")
+		drainSecretSyncs()
+
+		// These are bounded by DELETE_TIMEOUT in the Makefile, which is only
+		// worth anything if the resulting error is actually reported. Both used
+		// to be discarded, so a teardown that timed out looked identical to one
+		// that succeeded.
 		By("undeploying the controller-manager")
 		cmd = exec.Command("make", "undeploy")
-		_, _ = utils.Run(cmd)
+		if _, err := utils.Run(cmd); err != nil {
+			_, _ = fmt.Fprintf(GinkgoWriter, "make undeploy did not complete: %v\n", err)
+		}
 
 		By("uninstalling CRDs")
 		cmd = exec.Command("make", "uninstall")
-		_, _ = utils.Run(cmd)
+		if _, err := utils.Run(cmd); err != nil {
+			_, _ = fmt.Fprintf(GinkgoWriter, "make uninstall did not complete: %v\n", err)
+		}
 
+		// --timeout, for the same reason the Makefile's teardown deletes have
+		// one: namespace deletion blocks on every finalizer inside it, so
+		// without a bound this is just where the 30 minute hang moves to.
 		By("removing manager namespace")
-		cmd = exec.Command("kubectl", "delete", "ns", namespace)
-		_, _ = utils.Run(cmd)
+		cmd = exec.Command("kubectl", "delete", "ns", namespace, "--ignore-not-found", "--timeout=120s")
+		if _, err := utils.Run(cmd); err != nil {
+			_, _ = fmt.Fprintf(GinkgoWriter, "deleting namespace %s did not complete: %v\n", namespace, err)
+		}
+
+		// Last, so the cleanup above always runs first.
+		failIfFinalizersWereForced()
 	})
 
 	// After each test, check for failures and collect logs, events,

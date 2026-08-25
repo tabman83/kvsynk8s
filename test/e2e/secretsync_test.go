@@ -130,6 +130,47 @@ const (
 	// side.
 	lowkeyVaultAlias = "default.lowkey-vault"
 
+	// Why Docker network aliases at all, rather than a headless Service with
+	// hand-written Endpoints pointing at the container IPs?
+	//
+	// A Service would be better: CoreDNS would answer authoritatively out of
+	// cluster.local, so these names would never be forwarded to the public
+	// internet, never be cached as non-cluster names for 30s, and never depend
+	// on Docker's embedded resolver. Several past failures in this suite came
+	// from that path.
+	//
+	// It is NOT blocked. An earlier version of this comment claimed Lowkey Vault
+	// could only ever serve the hostnames it auto-registers, so a cluster DNS
+	// name could not address it. That was wrong, and it was wrong because it was
+	// inferred from the startup log alone. The pinned image takes
+	// LOWKEY_VAULT_ALIASES, reachable through its entrypoint
+	// (sh -c "java ${JAVA_OPTS} -jar /lowkey-vault.jar ${LOWKEY_ARGS}"), so one
+	// extra -e on the docker run below is enough:
+	//
+	//   -e LOWKEY_ARGS=--LOWKEY_VAULT_ALIASES=default.lowkey-vault=lowkey-vault.default.svc.cluster.local:8443
+	//
+	// Verified end to end against docker.io/nagyesta/lowkey-vault:7.3.74: it logs
+	// "Updating aliases of: https://default.lowkey-vault:8443 , adding:
+	// https://lowkey-vault.default.svc.cluster.local:8443", then serves that name
+	// with FULL TLS verification against its own shipped certificate, whose SAN
+	// list already includes DNS:*.default.svc.cluster.local. A secret written via
+	// the alias reads back with the same version id via the original host, so it
+	// is one vault with two authorities. An un-aliased host on the same wildcard
+	// cert returns "Unable to find active vault", so the resolution is real.
+	//
+	// The alias is an AUTHORITY, port included: the value above works and the
+	// same name on another port 404s. A headless Service would therefore have to
+	// expose 8443.
+	//
+	// So this is a deferred choice, not an impossibility. Not done here because
+	// it means Services plus hand-maintained EndpointSlices for three containers,
+	// new SANs for the azurite and authstub certs, and keeping all of that in
+	// step as containers come and go -- a sizeable change to a suite that is
+	// currently stable, to remove a class of failure that is no longer biting now
+	// that authstub stays up and the host-side dials are pinned to 127.0.0.1.
+	// Worth doing the next time this path causes trouble; the recipe above is the
+	// hard part and it is already proven.
+
 	// testVaultName is the SecretSync spec.vault.name this suite uses. It
 	// has nothing to do with lowkeyVaultAlias: KVSYNK8S_KEYVAULT_TEST_ENDPOINT
 	// (below) makes the operator's real vaultURL() construction irrelevant
@@ -415,39 +456,99 @@ func deleteSecretSync(namespace, name string) {
 	}
 }
 
-// drainSecretSyncs removes every SecretSync in the namespace while the operator
+// drainSecretSyncs removes every SecretSync in the cluster while the operator
 // is still running, and guarantees none is left holding a finalizer.
 //
 // Every SecretSync carries kvsynk8s.io/secretsync-finalizer, which only the
-// running operator ever clears. `make undeploy` deletes the operator Deployment
-// and the namespace in one go, so if a single SecretSync survives into that
-// step with its finalizer still set, nothing is left that can clear it: the
-// namespace sticks in Terminating and kubectl blocks until the test binary is
-// killed. That is a 30 minute hang with no failure message, not a test failure.
+// running operator ever clears. Teardown removes the operator Deployment, the
+// CRD and the namespace, so if a single SecretSync survives into that step with
+// its finalizer still set, nothing is left that can clear it: the namespace
+// sticks in Terminating and kubectl blocks until the test binary is killed.
+// That is a 30 minute hang with no failure message, not a test failure. The
+// suite hit exactly this once the emulator scenarios stopped being skipped.
 //
-// This was invisible for as long as these scenarios were skipped, because
-// nothing else in the suite creates a finalized object.
-func drainSecretSyncs(namespace string) {
-	cmd := exec.Command("kubectl", "-n", namespace, "delete", "secretsync", "--all",
-		"--ignore-not-found", "--timeout=90s")
-	if _, err := utils.Run(cmd); err != nil {
-		_, _ = fmt.Fprintf(GinkgoWriter, "bulk SecretSync delete did not complete: %v\n", err)
+// Deliberately cluster-wide and callable at any point: it is invoked both from
+// the T032 AfterAll (early, while the operator is definitely healthy) and from
+// the outer AfterAll immediately before `make undeploy` (the backstop that
+// covers any spec, present or future, wherever it put its objects). It is
+// idempotent, so running it twice costs one no-op kubectl call.
+func drainSecretSyncs() {
+	// Nothing to do if the CRD is not installed -- kubectl would error rather
+	// than return an empty list.
+	if _, err := utils.Run(exec.Command("kubectl", "get", "crd", "secretsyncs.kvsynk8s.io")); err != nil {
+		return
+	}
+
+	out, err := utils.Run(exec.Command("kubectl", "get", "secretsync", "--all-namespaces",
+		"-o", `jsonpath={range .items[*]}{.metadata.namespace} {.metadata.name}{"\n"}{end}`))
+	if err != nil {
+		_, _ = fmt.Fprintf(GinkgoWriter, "could not list SecretSyncs to drain: %v\n", err)
+		return
+	}
+
+	type ref struct{ ns, name string }
+	var refs []ref
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if f := strings.Fields(line); len(f) == 2 {
+			refs = append(refs, ref{f[0], f[1]})
+		}
+	}
+	if len(refs) == 0 {
+		return
+	}
+
+	for _, r := range refs {
+		cmd := exec.Command("kubectl", "-n", r.ns, "delete", "secretsync", r.name,
+			"--ignore-not-found", "--timeout=60s")
+		if _, err := utils.Run(cmd); err != nil {
+			_, _ = fmt.Fprintf(GinkgoWriter, "deleting SecretSync %s/%s did not complete: %v\n", r.ns, r.name, err)
+		}
 	}
 
 	// Belt and braces. Anything still standing gets its finalizer stripped, so
-	// teardown degrades to a logged warning instead of a deadlock.
-	out, err := utils.Run(exec.Command("kubectl", "-n", namespace, "get", "secretsync",
-		"-o", "jsonpath={.items[*].metadata.name}"))
+	// teardown degrades to a logged warning instead of a deadlock. Safe here:
+	// the managed Secret is owned by the SecretSync and garbage collected, and
+	// the cluster is thrown away at the end of the run either way.
+	out, err = utils.Run(exec.Command("kubectl", "get", "secretsync", "--all-namespaces",
+		"-o", `jsonpath={range .items[*]}{.metadata.namespace} {.metadata.name}{"\n"}{end}`))
 	if err != nil {
 		return
 	}
-	for _, name := range strings.Fields(out) {
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		f := strings.Fields(line)
+		if len(f) != 2 {
+			continue
+		}
 		_, _ = fmt.Fprintf(GinkgoWriter,
-			"SecretSync %s/%s survived deletion; clearing its finalizer so teardown cannot deadlock\n",
-			namespace, name)
-		_, _ = utils.Run(exec.Command("kubectl", "-n", namespace, "patch", "secretsync", name,
+			"SecretSync %s/%s survived deletion; clearing its finalizer so teardown cannot deadlock\n", f[0], f[1])
+		_, _ = utils.Run(exec.Command("kubectl", "-n", f[0], "patch", "secretsync", f[1],
 			"--type=merge", "-p", `{"metadata":{"finalizers":null}}`))
+		forciblyFinalized = append(forciblyFinalized, f[0]+"/"+f[1])
 	}
+}
+
+// forciblyFinalized records every SecretSync whose finalizer this suite had to
+// strip by hand. It should always be empty.
+//
+// Stripping keeps teardown from deadlocking, but on its own it would downgrade
+// a real operator defect -- the controller failing to finalize a SecretSync --
+// from an obvious 30 minute hang into one warning line under a green suite.
+// That is a worse failure mode than the one being fixed, so the outer AfterAll
+// fails the run if this is not empty: teardown still completes, and the defect
+// is still reported.
+var forciblyFinalized []string
+
+// failIfFinalizersWereForced fails the suite if drainSecretSyncs had to strip
+// any finalizer. Call it LAST in teardown, so cleanup finishes first.
+func failIfFinalizersWereForced() {
+	if len(forciblyFinalized) == 0 {
+		return
+	}
+	Fail(fmt.Sprintf(
+		"the operator did not clear the finalizer on %d SecretSync(s): %s.\n"+
+			"They were force-finalized so teardown could finish, but this means reconcileDelete "+
+			"did not complete for them -- treat it as an operator bug, not a test-cleanup detail.",
+		len(forciblyFinalized), strings.Join(forciblyFinalized, ", ")))
 }
 
 // expectContainerRunning fails immediately, with the container's own logs in
@@ -769,7 +870,7 @@ func registerSecretSyncEmulatorTests() {
 			// Must happen first, and while the operator is still running: see
 			// drainSecretSyncs for what deadlocks otherwise.
 			By("draining SecretSync objects while the operator can still finalize them")
-			drainSecretSyncs(namespace)
+			drainSecretSyncs()
 
 			By("removing the emulator containers")
 			removeContainer(azuriteContainerName)
