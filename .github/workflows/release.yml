@@ -1,11 +1,31 @@
 name: Release
 
 on:
+  # A tag pushed by hand still works exactly as before.
+  # v[0-9]* rather than v*, so a stray tag like "version-1.0" does not start a
+  # release that then dies at `helm package` on an unparseable version.
   push:
     tags:
-      - "v*"
+      - "v[0-9]*"
+  # Or release from the Actions tab without touching git locally. The tag is
+  # created by the release job at the end of this same run, so there is no
+  # second workflow to trigger — which matters, because a tag pushed with
+  # GITHUB_TOKEN would not start one anyway.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, no leading v. Use 0.1.0, or 0.2.0-rc1 for a prerelease.'
+        required: true
+        type: string
 
 permissions: {}
+
+# One release at a time, repo-wide. Two overlapping runs would both call
+# `imagetools create --tag latest` and the winner would be whichever finished
+# last, not whichever is newer.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 env:
   IMAGE: ghcr.io/tabman83/kvsynk8s
@@ -15,6 +35,60 @@ env:
   HELM_VERSION: v3.21.4
 
 jobs:
+  prepare:
+    name: Work out what is being released
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+    steps:
+      - name: Resolve the version from the tag or the dispatch input
+        id: resolve
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="$INPUT_VERSION"
+          else
+            VERSION="${REF_NAME#v}"
+          fi
+
+          # No leading v, and no build metadata: OCI tags cannot contain "+",
+          # and silently rewriting it would put a version in the registry that
+          # does not match the one in Chart.yaml.
+          if ! printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::'$VERSION' is not a version I can release. Expected X.Y.Z or X.Y.Z-suffix, with no leading v and no + build metadata." >&2
+            exit 1
+          fi
+
+          # A semver prerelease suffix means: do not move :latest, and mark the
+          # GitHub Release as a prerelease.
+          case "$VERSION" in
+            *-*) PRERELEASE=true ;;
+            *)   PRERELEASE=false ;;
+          esac
+
+          {
+            echo "version=$VERSION"
+            echo "tag=v$VERSION"
+            echo "prerelease=$PRERELEASE"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Releasing \`v$VERSION\`"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| chart / app version | \`$VERSION\` |"
+            echo "| image tag | \`v$VERSION\` |"
+            echo "| prerelease | \`$PRERELEASE\` |"
+            echo "| moves :latest | \`$([ "$PRERELEASE" = false ] && echo yes || echo no)\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   test:
     permissions:
       contents: read
@@ -168,10 +242,13 @@ jobs:
 
   build-and-push:
     name: Build and push multi-arch image
-    needs: [test, lint, test-integration, test-e2e, helm]
+    needs: [prepare, test, lint, test-integration, test-e2e, helm]
     permissions:
       contents: read
       packages: write
+      # For the build provenance attestation below.
+      id-token: write
+      attestations: write
     runs-on: ubuntu-latest
     steps:
       - name: Clone the code
@@ -192,13 +269,36 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push the release image (multi-arch, via make docker-buildx)
-        run: make docker-buildx IMG=${{ env.IMAGE }}:${{ github.ref_name }}
+        run: make docker-buildx IMG=${{ env.IMAGE }}:${{ needs.prepare.outputs.tag }}
 
+      - name: Resolve the digest that was actually pushed
+        id: image
+        env:
+          REF: ${{ env.IMAGE }}:${{ needs.prepare.outputs.tag }}
+        run: |
+          DIGEST="$(docker buildx imagetools inspect "$REF" --format '{{.Manifest.Digest}}')"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "$REF@$DIGEST"
+
+      # Signed, verifiable statement of which workflow and which commit built
+      # this image. Consumers can check it with:
+      #   gh attestation verify oci://ghcr.io/tabman83/kvsynk8s:vX.Y.Z --repo tabman83/kvsynk8s
+      - name: Attest the image build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
+
+      # Only a stable release owns :latest. A prerelease that moved it would be
+      # handed to everyone running `docker pull ...:latest` or installing the
+      # install.yaml from the previous release.
       - name: Tag the same manifest list as latest
-        run: docker buildx imagetools create --tag ${{ env.IMAGE }}:latest ${{ env.IMAGE }}:${{ github.ref_name }}
+        if: needs.prepare.outputs.prerelease == 'false'
+        run: docker buildx imagetools create --tag ${{ env.IMAGE }}:latest ${{ env.IMAGE }}:${{ needs.prepare.outputs.tag }}
 
       - name: Render the install manifest
-        run: make build-installer IMG=${{ env.IMAGE }}:${{ github.ref_name }}
+        run: make build-installer IMG=${{ env.IMAGE }}:${{ needs.prepare.outputs.tag }}
 
       - name: Upload install.yaml
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -213,10 +313,12 @@ jobs:
 
   publish-chart:
     name: Package and publish the Helm chart
-    needs: build-and-push
+    needs: [prepare, build-and-push]
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     runs-on: ubuntu-latest
     steps:
       - name: Clone the code
@@ -236,9 +338,8 @@ jobs:
       # asserts that, because a mismatch here breaks every default install.
       - name: Package the chart at the release version
         env:
-          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          VERSION="${TAG#v}"
           helm package charts/kvsynk8s --version "$VERSION" --app-version "$VERSION"
           test -f "kvsynk8s-${VERSION}.tgz"
 
@@ -251,11 +352,22 @@ jobs:
       # OCI tags are mutable, so re-running the workflow on the same tag
       # republishes the same version cleanly instead of needing cleanup.
       - name: Push the chart to ghcr.io
+        id: push
         env:
-          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          VERSION="${TAG#v}"
-          helm push "kvsynk8s-${VERSION}.tgz" oci://ghcr.io/tabman83/charts
+          # helm prints "Digest: sha256:..." on success; keep it for the attestation.
+          helm push "kvsynk8s-${VERSION}.tgz" oci://ghcr.io/tabman83/charts 2>&1 | tee /tmp/push.log
+          DIGEST="$(grep -oE 'sha256:[0-9a-f]{64}' /tmp/push.log | head -1)"
+          test -n "$DIGEST" || { echo "::error::could not read the pushed chart digest" >&2; exit 1; }
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Attest the chart build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/tabman83/charts/kvsynk8s
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
 
       - name: Upload the chart archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -267,7 +379,7 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: [build-and-push, publish-chart]
+    needs: [prepare, build-and-push, publish-chart]
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -284,9 +396,16 @@ jobs:
           name: chart-package
           path: dist
 
+      # On a workflow_dispatch run the tag does not exist yet: this step creates
+      # it, pointing at the commit that was actually built. Doing it here rather
+      # than up front means a failed release leaves no dangling tag behind.
+      # On a tag-push run the tag already exists and this just reuses it.
       - name: Create release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ needs.prepare.outputs.prerelease }}
           files: |
             dist/install.yaml
             dist/kvsynk8s-*.tgz

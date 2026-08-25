@@ -170,8 +170,14 @@ kubectl get secretsyncs -A                 # expected: NotFound (the CRD took th
 
 ## 7. Release publishing (US3, FR-014) — after merge, on a real tag
 
+Either push a tag, or run the workflow from the Actions tab and let it create
+the tag (the version goes in without a leading `v`):
+
 ```bash
 git tag vX.Y.Z && git push origin vX.Y.Z
+# or:
+gh workflow run Release -f version=X.Y.Z
+
 # after the workflow completes:
 helm install kvsynk8s oci://ghcr.io/tabman83/charts/kvsynk8s --version X.Y.Z \
   --namespace kvsynk8s --create-namespace --dry-run

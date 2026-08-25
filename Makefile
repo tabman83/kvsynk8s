@@ -168,7 +168,13 @@ docker-buildx: ## Build and push docker image for the manager for cross-platform
 	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' Dockerfile > Dockerfile.cross
 	- $(CONTAINER_TOOL) buildx create --name kvsynk8s-builder
 	$(CONTAINER_TOOL) buildx use kvsynk8s-builder
-	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${IMG} -f Dockerfile.cross .
+	# Deliberately NOT prefixed with "-": the kubebuilder scaffold ignored the
+	# exit code here, so a failed build let the release carry on and only fell
+	# over later, tagging :latest, with a confusing "manifest unknown". A build
+	# that fails has to fail here. The cost is that the two cleanup lines below
+	# are skipped on failure, which matters only locally (leftover builder and
+	# Dockerfile.cross); CI runners are thrown away.
+	$(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${IMG} -f Dockerfile.cross .
 	- $(CONTAINER_TOOL) buildx rm kvsynk8s-builder
 	rm Dockerfile.cross
 
