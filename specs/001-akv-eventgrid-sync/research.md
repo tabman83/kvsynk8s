@@ -66,6 +66,66 @@ All Technical Context unknowns resolved. Sources: Microsoft Learn (Key Vault Eve
 
      **The credential problem and how it was solved.** `cmd/main.go` always builds its Azure clients via `azidentity.NewDefaultAzureCredential` — there is no flag to swap in a different credential type, by design (constitution V: only the real, production credential path is ever exercised). That chain cannot obtain a token from anywhere reachable in a kind cluster with no real Azure AD tenant, confirmed by running it standalone in this environment: every sub-credential fails in ~3s with no viable fallback. Two standard, unmodified azidentity/MSAL behaviors unblock it without touching that code path: `AZURE_AUTHORITY_HOST` redirects `EnvironmentCredential`'s token requests to any HTTPS endpoint, and `AZURE_TENANT_ID=adfs` makes MSAL treat that authority as an ADFS deployment and skip the hardcoded call to real Azure AD's instance-discovery endpoint that would otherwise reject an unrecognized host. `test/e2e/testdata/authstub` is a small stand-in ADFS token endpoint built for this (see its package doc for the full explanation and the interactive verification it's based on). Neither emulator validates the resulting token's signature — Lowkey Vault does not check bearer tokens at all, and Azurite's `--oauth basic` mode (source-verified: `QueueTokenAuthenticator.js`) only checks claim shape/expiry/issuer-prefix/audience, never a real signature — so authstub's fabricated, unsigned token satisfies both. The other piece: `internal/azure/keyvault.go`'s `KVSYNK8S_KEYVAULT_TEST_ENDPOINT` env var override lets the suite point the real `SecretReader` at Lowkey Vault's non-`*.vault.azure.net` address; unset (the case for every real deployment), `clientFor`'s behavior is unchanged from before this override existed.
 
-     **Current status: proven manually, not yet green automated.** With the above wired up, a manual, step-by-step reproduction of the exact same containers/deployment/patches this suite drives (`test/e2e/secretsync_test.go`) demonstrated the complete loop against the real deployed operator binary: SecretSync → Secret with the correct value; a vault rotation plus an injected `SecretNewVersionCreated` queue message propagating in well under a second (SC-001's <60s bound, by a wide margin); an in-cluster-deleted managed Secret recreated automatically (US3 drift); SecretSync deletion removing the managed Secret; a pre-existing unmanaged Secret correctly left untouched with `TargetConflict`; and operator logs/status/events scanned clean of a planted sentinel value (SC-004). The automated `make test-e2e` run of that same suite, however, hits a not-yet-root-caused failure: the last-started emulator container (`authstub`) becomes unreachable from pods over the cluster's own DNS specifically when the whole suite runs end to end via Go/ginkgo — reproduced consistently across a dozen full-suite runs — while the identical docker/kubectl command sequence, run by hand against the very same kind cluster and Docker network (including reusing the exact cluster a failed automated run left behind), always succeeds. Investigated and ruled out as the cause: the alias's exact name (tried bare, and two different dotted suffixes — one of which, `.local`, turned out to be a real, separate bug: kind nodes resolve `.local` names via mDNS, not ordinary DNS, so that specific choice failed deterministically for an unrelated reason, now avoided); patching the Deployment's env and volumes as one atomic change instead of two (to remove an intermediate half-configured rollout); the operator's CPU limit (removed for the patched instance, in case of throttling); security-context/PodSecurity parity with the operator pod (reproduced with matching `readOnlyRootFilesystem`/seccomp/restricted-PSA settings — still succeeded standalone); an explicit in-cluster pre-flight reachability check before pointing the operator at the emulators; and recreating the `authstub` container up to three times when that pre-flight check fails. None changed the outcome. Given that, the emulator-backed Context is gated behind `KVSYNK8S_E2E_EMULATORS=1` (unset by default) so this unresolved flake cannot silently turn the previously-green `make test-e2e` red; the code, and the credential mechanism above, are believed correct and are left in place, opt-in, for whoever continues this investigation next (a good next step neither this environment nor this task's time budget could offer: a packet capture or CoreDNS-log inspection from inside the kind node during an actual automated failure, to see the query that a manual reproduction never has the chance to send the same way).
-  Layers 1 and 2 run in CI (GitHub Actions) on every PR, per constitution IV; layer 3's existing (pre-T032) scenarios do too. The new emulator-backed scenarios do not yet run in CI, for the reason above.
+     **Status: resolved, and running in CI.** The suite is green and un-gated:
+     `make test-e2e` runs 8 of 8 specs with nothing skipped.
+
+     **The failure, and why it was misdiagnosed for so long.** For a long time
+     this Context was opt-in behind `KVSYNK8S_E2E_EMULATORS=1`, because under
+     `make test-e2e` the authstub container appeared "unreachable from pods over
+     the cluster's own DNS", while the identical docker/kubectl sequence run by
+     hand always worked. Alias naming, atomic deployment patching, resource
+     limits, security-context parity, an in-cluster pre-flight check and
+     recreating the container three times were all investigated and none of them
+     changed anything — correctly, because none of them was the cause.
+
+     **Nothing about DNS was wrong.** authstub was dying on startup. It is the
+     only emulator container that both bind-mounts the shared cert directory and
+     runs as a non-root uid (`gcr.io/distroless/static:nonroot`, `USER
+     65532:65532`). `os.MkdirTemp` creates that directory `0700` and the private
+     key was written `0600`, both owned by the host user, so uid 65532 could
+     neither traverse the directory nor read the key; `ListenAndServeTLS`
+     returned a permission error straight into `log.Fatal` and the container
+     exited within milliseconds. Azurite hid this by running as root (its image
+     sets no `USER`, so DAC never applies) and Lowkey Vault by mounting no certs
+     at all. `docker run -d` exits 0 whether or not the process inside survives,
+     so the suite went on to curl a container that was already gone: `curl` exit
+     6 (could not resolve) and then exit 7 (resolved, nothing listening), which
+     reads exactly like a network fault. `authstub/main.go` compounded it by
+     logging "authstub listening on :9911" *before* calling
+     `ListenAndServeTLS`, so `docker logs` showed a container that looked
+     healthy and had already exited.
+
+     **Why it was never reproducible by hand.** `AfterAll` deletes `certDir`, so
+     any manual retry had to create its own certs — `mkdir` under the default
+     umask 022 gives `0755` and `openssl` writes `0644`, i.e. world-readable.
+     The bug could only ever occur under the suite. That is why "works by hand"
+     kept pointing the investigation at the environment, and why the DNS theory
+     was unfalsifiable rather than merely unproven.
+
+     **The fix.** Make the cert directory and key readable by the container's
+     uid (`0755`/`0644` — throwaway per-run self-signed material, in a temp dir,
+     never a credential for anything), and assert after every `docker run -d`
+     that the container is actually running, failing immediately with its own
+     logs. That second part is the one that matters: it makes this class of bug
+     impossible to misdiagnose again. The three-times recreate loop was deleted
+     — it was a workaround for the wrong cause and simply repeated the same
+     failure three times.
+
+     **Two further defects surfaced only once these scenarios actually ran.**
+     `go test` defaults to a 10 minute timeout and `make test-e2e` set none, so
+     the un-gated suite died at 600s during teardown (now `E2E_TIMEOUT ?= 30m`).
+     And teardown deadlocked: every SecretSync carries a finalizer only the
+     running operator clears, while `make undeploy` deletes the operator and the
+     namespace together, so a single survivor left the namespace stuck
+     `Terminating` and `kubectl` blocked — a 30 minute hang with no failure
+     message. SecretSyncs are now drained while the operator is still alive, and
+     any survivor has its finalizer stripped so teardown degrades to a logged
+     warning instead of a hang.
+
+     **Still true from the original investigation**, and worth keeping: kind
+     nodes resolve `.local` names via mDNS (RFC 6762), not ordinary DNS, so an
+     alias ending in `.local` fails deterministically. That is why the alias is
+     `authstub.e2e`.
+
+  All three layers run in CI (GitHub Actions) on every PR, per constitution IV, including the emulator-backed sync-loop scenarios.
 - **Alternatives considered**: mocking frameworks (unnecessary — Go interfaces + fakes are idiomatic and simpler); e2e against real Azure in CI (rejected: needs cloud credentials and a live vault in CI, flaky and slow; the emulator gap is covered by the manual quickstart run); k3s/k3d instead of kind (viable, but kubebuilder scaffolds kind-based e2e out of the box).
