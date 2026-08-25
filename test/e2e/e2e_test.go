@@ -89,13 +89,21 @@ var _ = Describe("Manager", Ordered, func() {
 		By("draining SecretSync objects so no finalizer can deadlock teardown")
 		drainSecretSyncs()
 
+		// These are bounded by DELETE_TIMEOUT in the Makefile, which is only
+		// worth anything if the resulting error is actually reported. Both used
+		// to be discarded, so a teardown that timed out looked identical to one
+		// that succeeded.
 		By("undeploying the controller-manager")
 		cmd = exec.Command("make", "undeploy")
-		_, _ = utils.Run(cmd)
+		if _, err := utils.Run(cmd); err != nil {
+			_, _ = fmt.Fprintf(GinkgoWriter, "make undeploy did not complete: %v\n", err)
+		}
 
 		By("uninstalling CRDs")
 		cmd = exec.Command("make", "uninstall")
-		_, _ = utils.Run(cmd)
+		if _, err := utils.Run(cmd); err != nil {
+			_, _ = fmt.Fprintf(GinkgoWriter, "make uninstall did not complete: %v\n", err)
+		}
 
 		// --timeout, for the same reason the Makefile's teardown deletes have
 		// one: namespace deletion blocks on every finalizer inside it, so

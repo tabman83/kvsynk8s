@@ -82,6 +82,14 @@ KIND_CLUSTER ?= kvsynk8s-test-e2e
 # needed. It is a timeout, not a target: a healthy run is well under it, and if
 # a run ever gets near it something is genuinely stuck.
 E2E_TIMEOUT ?= 30m
+# Ginkgo gets a shorter deadline than `go test` on purpose. Whichever fires
+# first wins, and they behave very differently: go test's timeout panics and
+# kills the process, so AfterAll/AfterSuite/DeferCleanup never run -- no
+# teardown, no drain, and config/manager/kustomization.yaml left rewritten.
+# Ginkgo's own timeout unwinds gracefully and runs all of that. Since the case
+# where a timeout fires is exactly the case where cleanup matters most, Ginkgo
+# must be the one to notice.
+E2E_GINKGO_TIMEOUT ?= 25m
 
 .PHONY: setup-test-e2e
 setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
@@ -100,7 +108,7 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 .PHONY: test-e2e
 test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
 	@set +e; \
-	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v -timeout $(E2E_TIMEOUT); \
+	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v -timeout $(E2E_TIMEOUT) -ginkgo.timeout $(E2E_GINKGO_TIMEOUT); \
 	result=$$?; \
 	set -e; \
 	$(MAKE) cleanup-test-e2e; \
