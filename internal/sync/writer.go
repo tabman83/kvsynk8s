@@ -114,6 +114,17 @@ func (w *SecretWriter) CreateOrUpdate(
 
 	populateManagedSecret(existing, owner, dataKey, value, version)
 	if err := controllerutil.SetControllerReference(owner, existing, w.Client.Scheme()); err != nil {
+		var alreadyOwned *controllerutil.AlreadyOwnedError
+		if errors.As(err, &alreadyOwned) {
+			// The Secret carries the managed-by label but its controller
+			// ownerReference points at a DIFFERENT owner (typically another
+			// SecretSync). Classify it as a target conflict (FR-012) rather
+			// than returning an unclassified error: the latter would make the
+			// reconciler retry forever with backoff, while ErrTargetConflict
+			// lands the CR in the normal TargetConflict/Failing state. The
+			// early return also means the conflicting Secret is never updated.
+			return fmt.Errorf("kvsynk8s: secret %s/%s: %w", namespace, name, ErrTargetConflict)
+		}
 		return fmt.Errorf("kvsynk8s: set owner reference on secret %s/%s: %w", namespace, name, err)
 	}
 	if err := w.Client.Update(ctx, existing); err != nil {
@@ -176,8 +187,28 @@ func populateManagedSecret(secret *corev1.Secret, owner *kvsynk8sv1alpha1.Secret
 	secret.Annotations[AnnotationSecret] = owner.Spec.Vault.Secret
 	secret.Annotations[AnnotationVersion] = version
 
-	if secret.Data == nil {
-		secret.Data = make(map[string][]byte, 1)
+	// The managed Secret carries exactly one data key: the resolved dataKey.
+	// Data is replaced wholesale (rather than setting one key into whatever
+	// map is already there) so a stale key left behind by an earlier
+	// spec.target.dataKey, or an extra key added by an in-cluster edit, is
+	// removed by the same write that stores the current value (US3 drift
+	// repair, FR-007).
+	secret.Data = map[string][]byte{dataKey: []byte(value)}
+}
+
+// managedSecretDataMatches reports whether secret's data is already exactly
+// the shape populateManagedSecret would produce for (dataKey, value): one
+// key, the right key, the right value. The engine uses it to decide whether
+// an existing managed Secret still needs a write even when its version
+// annotation is current (a changed spec.target.dataKey, or in-cluster drift
+// on the data). It lives here, next to populateManagedSecret, so the
+// definition of the desired data shape stays in the one file allowed to
+// handle secret values (constitution I); nothing here logs or returns the
+// value.
+func managedSecretDataMatches(secret *corev1.Secret, dataKey, value string) bool {
+	if len(secret.Data) != 1 {
+		return false
 	}
-	secret.Data[dataKey] = []byte(value)
+	got, ok := secret.Data[dataKey]
+	return ok && string(got) == value
 }

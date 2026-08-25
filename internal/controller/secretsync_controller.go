@@ -17,9 +17,11 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -232,11 +234,13 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	// Captured before Sync runs: Sync mutates `existing` in place on its
 	// write path (it is the same *corev1.Secret returned as `desired`), so
-	// this is the only chance to see the pre-sync annotation for the
-	// idempotency comparison below.
+	// this is the only chance to see the pre-sync annotation and data for
+	// the idempotency comparison below.
 	var priorVersion string
+	var priorData map[string][]byte
 	if existing != nil {
 		priorVersion = existing.Annotations[sync.AnnotationVersion]
+		priorData = existing.DeepCopy().Data
 	}
 
 	engine := sync.Engine{Reader: r.Reader}
@@ -262,11 +266,17 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 
 		// Idempotency (FR-005, data-model.md): only write when the Secret is
-		// new or the synced version actually changed. Without this check an
-		// Update would fire on every reconcile even when nothing changed,
-		// which — combined with Owns(&corev1.Secret{}) below — would retrigger
-		// a reconcile for its own no-op write and loop forever.
-		if existing == nil || priorVersion != status.SyncedVersion {
+		// new, the synced version changed, or the Secret's pre-sync data does
+		// not match what the engine computed — a changed spec.target.dataKey,
+		// or in-cluster drift on the managed Secret's data (US3 AS-2, FR-007),
+		// both of which leave the version annotation intact. Without this
+		// check an Update would fire on every reconcile even when nothing
+		// changed, which — combined with Owns(&corev1.Secret{}) below — would
+		// retrigger a reconcile for its own no-op write and loop forever;
+		// comparing against the pre-sync snapshot keeps the no-op case
+		// write-free while still repairing real differences.
+		if existing == nil || priorVersion != status.SyncedVersion ||
+			!maps.EqualFunc(priorData, desired.Data, bytes.Equal) {
 			// The actual Kubernetes write goes exclusively through
 			// SecretWriter (constitution I: one value-carrying code path),
 			// not r.Create/r.Update directly. value/version are read back off

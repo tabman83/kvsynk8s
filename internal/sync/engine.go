@@ -118,11 +118,18 @@ func (e *Engine) Sync(
 		return status, existing, nil
 	}
 
-	// Idempotency (FR-005): skip the write when the target already reflects
-	// this exact version. The decision is made on the version annotation
-	// alone, never by comparing values (which would mean handling the value
-	// somewhere other than the write path itself).
-	if managed && existing.Annotations[AnnotationVersion] == version {
+	// Idempotency (FR-005): skip the write only when the target already
+	// reflects this exact version AND its data is exactly the desired shape.
+	// The version annotation alone is not enough: a spec edit (e.g. a changed
+	// target.dataKey) or an in-cluster edit of the managed Secret's data
+	// leaves the annotation intact while the data no longer matches, and both
+	// must be repaired on the next reconcile (US3 drift repair, FR-007). The
+	// value was already fetched above, so this comparison costs no extra
+	// vault call; the comparison itself lives in writer.go
+	// (managedSecretDataMatches), next to populateManagedSecret, so the
+	// definition of the desired data shape stays in one place.
+	if managed && existing.Annotations[AnnotationVersion] == version &&
+		managedSecretDataMatches(existing, dataKey, value) {
 		status.State = kvsynk8sv1alpha1.SecretSyncStateInSync
 		status.SyncedVersion = version
 		status.LastSyncTime = metav1.Now()
