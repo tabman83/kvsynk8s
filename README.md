@@ -358,6 +358,75 @@ namespace/name, and Key Vault version — never by value. If you're
 troubleshooting by reading logs, that is expected and is not something to
 work around.
 
+## Releasing
+
+There are two kinds of release.
+
+### Stable releases (manual, on purpose)
+
+You decide the version and start the release yourself:
+
+```bash
+gh workflow run Release -f version=0.2.0
+```
+
+No `v` in front of the number, the workflow adds it. It creates the tag itself
+at the end, pointing at the commit it built. Pushing a tag by hand still works
+too:
+
+```bash
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+A stable release is the only thing that moves the `:latest` image tag.
+
+Pick the number by hand. There is no version file to edit anywhere:
+
+| Bump | When |
+|---|---|
+| patch | bug fixes only, no new configuration |
+| minor | new values, new behaviour, nothing existing breaks |
+| major | anything that breaks existing users — most importantly a `SecretSync` CRD schema change that makes objects already in clusters invalid |
+
+The CRD is a published API. People have `SecretSync` objects live in their
+clusters, and `helm upgrade` applies the new schema to them, so a breaking
+schema change is a major bump even if the Go code barely changed.
+
+You can also cut a release candidate. Use a version with a suffix, like
+`0.2.0-rc1`. It publishes everything, but leaves `:latest` alone and shows as a
+prerelease.
+
+### Dev builds (automatic, every merge)
+
+Every merge to `master` publishes a dev build on its own. Nothing to run.
+
+A dev build goes to the container registry and stops there. There is no git
+tag and no GitHub Release for it, so the releases page only ever shows real
+releases. The image and the chart are published normally, so you install one
+exactly like any other version:
+
+```bash
+helm install kvsynk8s oci://ghcr.io/tabman83/charts/kvsynk8s \
+  --version 0.1.1-dev.42 --namespace kvsynk8s --create-namespace
+```
+
+The version is the next patch plus the run number, so `0.1.1-dev.42` comes
+after `v0.1.0`. It sorts below the real `0.1.1`, so it can never look newer
+than the release it is heading towards. Dev builds never move `:latest`.
+
+To find the version to install, look at the Actions run for the merge. The
+version is printed in the run summary. Or list what has been published:
+
+```bash
+gh api /users/tabman83/packages/container/charts%2Fkvsynk8s/versions \
+  --jq '.[].metadata.container.tags[]' | head
+```
+
+If you want the `install.yaml` of a dev build instead of the chart, download it
+from the Artifacts section of that same Actions run.
+
+They are dev builds. Do not run them in production.
+
 ## Development
 
 See [CLAUDE.md](CLAUDE.md) for the build/lint/test commands and the

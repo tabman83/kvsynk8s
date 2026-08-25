@@ -5,6 +5,10 @@ on:
   # v[0-9]* rather than v*, so a stray tag like "version-1.0" does not start a
   # release that then dies at `helm package` on an unparseable version.
   push:
+    # Every merge to master publishes a dev prerelease. It never touches
+    # :latest and never becomes "Latest release" on the repo page.
+    branches:
+      - master
     tags:
       - "v[0-9]*"
   # Or release from the Actions tab without touching git locally. The tag is
@@ -24,8 +28,12 @@ permissions: {}
 # `imagetools create --tag latest` and the winner would be whichever finished
 # last, not whichever is newer.
 concurrency:
-  group: release
-  cancel-in-progress: false
+  # Stable releases serialise, so two of them can never race on :latest.
+  # Dev builds get their own group and supersede each other: if three merges
+  # land together only the newest dev build is worth having, and none of them
+  # touch :latest, so cancelling an older one costs nothing.
+  group: release-${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')) && 'dev' || 'stable' }}
+  cancel-in-progress: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/') }}
 
 env:
   IMAGE: ghcr.io/tabman83/kvsynk8s
@@ -44,17 +52,49 @@ jobs:
       version: ${{ steps.resolve.outputs.version }}
       tag: ${{ steps.resolve.outputs.tag }}
       prerelease: ${{ steps.resolve.outputs.prerelease }}
+      channel: ${{ steps.resolve.outputs.channel }}
     steps:
-      - name: Resolve the version from the tag or the dispatch input
+      # Full history so the dev build can find the last stable tag.
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Resolve the version
         id: resolve
         env:
           INPUT_VERSION: ${{ inputs.version }}
           REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
           if [ -n "$INPUT_VERSION" ]; then
+            # Run from the Actions tab: a stable release, version typed by hand.
             VERSION="$INPUT_VERSION"
-          else
+            CHANNEL=stable
+          elif [ "$REF_TYPE" = "tag" ]; then
+            # Tag pushed by hand: a stable release.
             VERSION="${REF_NAME#v}"
+            CHANNEL=stable
+          else
+            # Merge to master: a dev prerelease of the NEXT patch, so it sorts
+            # below the release it is heading towards:
+            #   0.1.1-dev.42 < 0.1.1-dev.43 < 0.1.1 < 0.1.2-dev.44
+            LAST="$(git tag -l 'v[0-9]*' --sort=-v:refname | grep -v -- '-' | head -1)"
+            if [ -n "$LAST" ]; then
+              BASE_V="${LAST#v}"
+              MAJOR="${BASE_V%%.*}"
+              REST="${BASE_V#*.}"
+              MINOR="${REST%%.*}"
+              PATCH="${REST#*.}"
+              BASE="${MAJOR}.${MINOR}.$((PATCH + 1))"
+            else
+              # Nothing released yet.
+              BASE="0.1.0"
+            fi
+            VERSION="${BASE}-dev.${RUN_NUMBER}"
+            CHANNEL=dev
           fi
 
           # No leading v, and no build metadata: OCI tags cannot contain "+",
@@ -66,7 +106,8 @@ jobs:
           fi
 
           # A semver prerelease suffix means: do not move :latest, and mark the
-          # GitHub Release as a prerelease.
+          # GitHub Release as a prerelease. Every dev build has one by
+          # construction, so dev builds can never take over :latest.
           case "$VERSION" in
             *-*) PRERELEASE=true ;;
             *)   PRERELEASE=false ;;
@@ -76,10 +117,11 @@ jobs:
             echo "version=$VERSION"
             echo "tag=v$VERSION"
             echo "prerelease=$PRERELEASE"
+            echo "channel=$CHANNEL"
           } >> "$GITHUB_OUTPUT"
 
           {
-            echo "### Releasing \`v$VERSION\`"
+            echo "### Releasing \`v$VERSION\` ($CHANNEL)"
             echo ""
             echo "| | |"
             echo "|---|---|"
@@ -377,8 +419,14 @@ jobs:
           if-no-files-found: error
           overwrite: true
 
+  # Stable releases only. A dev build is published to the registry and stops
+  # there: no git tag, no GitHub Release. Otherwise every merge would add an
+  # entry and the releases page would be mostly noise. The dev image and chart
+  # are still fully installable by version, and install.yaml is still rendered
+  # and kept as a workflow artifact on the run.
   release:
     name: Create GitHub Release
+    if: needs.prepare.outputs.channel == 'stable'
     needs: [prepare, build-and-push, publish-chart]
     permissions:
       contents: write

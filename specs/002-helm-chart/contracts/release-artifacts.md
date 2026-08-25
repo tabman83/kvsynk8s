@@ -26,6 +26,16 @@ For every tag `vX.Y.Z`, a successful release run MUST produce all of:
 - `Chart.yaml` in git stays at the `0.0.0` placeholder; versions are applied
   by `helm package --version --app-version` in the pipeline only.
 
+## Dev builds
+
+A merge to `master` publishes artifacts #1 and #3 only — the image and the OCI
+chart, at `<next patch>-dev.<run number>` — and stops. No git tag, no GitHub
+Release, so #2 and #4 do not exist for a dev build (`install.yaml` is still
+rendered and kept as a workflow artifact on the run). They are installable by
+exact version and never move `:latest`.
+
+Everything below concerns stable releases.
+
 ## Stable releases versus prereleases
 
 A version with a semver prerelease suffix (`0.2.0-rc1`) is released in full —

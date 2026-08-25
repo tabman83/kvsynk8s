@@ -127,12 +127,43 @@ multi-arch image to GHCR, publishes the chart to
 `oci://ghcr.io/tabman83/charts/kvsynk8s`, and attaches both the rendered
 install manifest and `kvsynk8s-X.Y.Z.tgz` to a GitHub Release.
 
-A release starts either from a `v[0-9]*` tag push or from
-`gh workflow run Release -f version=X.Y.Z` (the version has no leading `v`; the
-run creates the tag itself at the end). A version with a semver prerelease
-suffix still publishes everything but does **not** move the `:latest` image tag
-and marks the GitHub Release as a prerelease. The whole workflow is serialised
-by `concurrency: release` so two releases cannot race on `:latest`.
+## Cutting a release
+
+**The version lives only in a git tag. There is no version file — never edit
+`Chart.yaml`'s `version`/`appVersion`, they stay at the `0.0.0` dev placeholder
+on purpose (research.md R4) and the pipeline overrides them at package time.**
+
+A release starts one of three ways:
+
+| Trigger | Result |
+|---|---|
+| `gh workflow run Release -f version=X.Y.Z` | stable release: image, chart, tag, GitHub Release |
+| push a `v[0-9]*` tag | same, tag already exists |
+| merge to `master` | dev build: image and chart only, no tag, no GitHub Release |
+
+**Choosing the number for a stable release is a human decision — make it
+deliberately, and say which bump you picked and why when you propose one:**
+
+- **patch** — bug fixes only, no configuration change.
+- **minor** — new values, new behaviour, nothing existing breaks.
+- **major** — anything that breaks existing users. The `SecretSync` CRD is a
+  published API: users have live objects, and `helm upgrade` applies the new
+  schema to them. A removed field, a tightened `pattern`, a new required field
+  — all major, even when the Go diff is small. Check
+  `api/v1alpha1/secretsync_types.go` against the previous release before
+  picking anything less.
+
+Dev builds need no decision: a merge to `master` publishes
+`<next patch>-dev.<run number>` (so `0.1.1-dev.42` after `v0.1.0`), derived
+from the newest stable tag. They are pushed to GHCR and nothing else — no git
+tag, no GitHub Release — so they are installable by version but never clutter
+the releases page or get mistaken for a release. They never move `:latest`.
+`install.yaml` is still rendered for them and kept as a workflow artifact on
+the run.
+
+Only a stable release moves `:latest`. Stable releases are serialised by the
+`release-stable` concurrency group so two cannot race on it; dev builds use
+`release-dev` and supersede each other.
 
 Once a branch is pushed and its PR is open, watch its checks
 (`gh pr checks <PR#> --watch`) and fix forward on any failure — see the "PR
