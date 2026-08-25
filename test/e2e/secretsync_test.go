@@ -133,32 +133,43 @@ const (
 	// Why Docker network aliases at all, rather than a headless Service with
 	// hand-written Endpoints pointing at the container IPs?
 	//
-	// A Service would be better in principle: CoreDNS would answer
-	// authoritatively out of cluster.local, so these names would never be
-	// forwarded to the public internet, never be cached as non-cluster names
-	// for 30s, and never depend on Docker's embedded resolver. That was
-	// seriously considered.
+	// A Service would be better: CoreDNS would answer authoritatively out of
+	// cluster.local, so these names would never be forwarded to the public
+	// internet, never be cached as non-cluster names for 30s, and never depend
+	// on Docker's embedded resolver. Several past failures in this suite came
+	// from that path.
 	//
-	// It does not work for Lowkey Vault, which picks WHICH vault to serve from
-	// the hostname it is addressed by. Its startup log shows the set it
-	// auto-registers, verified by running the pinned image:
+	// It is NOT blocked. An earlier version of this comment claimed Lowkey Vault
+	// could only ever serve the hostnames it auto-registers, so a cluster DNS
+	// name could not address it. That was wrong, and it was wrong because it was
+	// inferred from the startup log alone. The pinned image takes
+	// LOWKEY_VAULT_ALIASES, reachable through its entrypoint
+	// (sh -c "java ${JAVA_OPTS} -jar /lowkey-vault.jar ${LOWKEY_ARGS}"), so one
+	// extra -e on the docker run below is enough:
 	//
-	//     Creating vault for URI: https://127.0.0.1:8443
-	//     Creating vault for URI: https://localhost:8443
-	//     Creating vault for URI: https://default.lowkey-vault:8443
-	//     Creating vault for URI: https://default.lowkey-vault.local:8443
-	//     Creating vault for URI: https://primary.localhost:8443
-	//     Creating vault for URI: https://secondary.localhost:8443
+	//   -e LOWKEY_ARGS=--LOWKEY_VAULT_ALIASES=default.lowkey-vault=lowkey-vault.default.svc.cluster.local:8443
 	//
-	// A Kubernetes Service name cannot contain a dot, so cluster DNS can never
-	// serve "default.lowkey-vault". The nearest reachable name would be
-	// lowkey-vault.default.svc.cluster.local, which Lowkey Vault has no vault
-	// registered for. Moving only azurite and authstub to Services would leave
-	// two addressing schemes in one suite for no real gain, now that the
-	// failure that motivated the idea (authstub dying on startup, so its alias
-	// kept vanishing) is fixed and the host-side IPv6 ambiguity is pinned to
-	// 127.0.0.1. Revisit only if Lowkey Vault gains a way to register an
-	// arbitrary vault hostname.
+	// Verified end to end against docker.io/nagyesta/lowkey-vault:7.3.74: it logs
+	// "Updating aliases of: https://default.lowkey-vault:8443 , adding:
+	// https://lowkey-vault.default.svc.cluster.local:8443", then serves that name
+	// with FULL TLS verification against its own shipped certificate, whose SAN
+	// list already includes DNS:*.default.svc.cluster.local. A secret written via
+	// the alias reads back with the same version id via the original host, so it
+	// is one vault with two authorities. An un-aliased host on the same wildcard
+	// cert returns "Unable to find active vault", so the resolution is real.
+	//
+	// The alias is an AUTHORITY, port included: the value above works and the
+	// same name on another port 404s. A headless Service would therefore have to
+	// expose 8443.
+	//
+	// So this is a deferred choice, not an impossibility. Not done here because
+	// it means Services plus hand-maintained EndpointSlices for three containers,
+	// new SANs for the azurite and authstub certs, and keeping all of that in
+	// step as containers come and go -- a sizeable change to a suite that is
+	// currently stable, to remove a class of failure that is no longer biting now
+	// that authstub stays up and the host-side dials are pinned to 127.0.0.1.
+	// Worth doing the next time this path causes trouble; the recipe above is the
+	// hard part and it is already proven.
 
 	// testVaultName is the SecretSync spec.vault.name this suite uses. It
 	// has nothing to do with lowkeyVaultAlias: KVSYNK8S_KEYVAULT_TEST_ENDPOINT
