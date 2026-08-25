@@ -39,7 +39,7 @@ Needs Helm 3.8 or newer (that is where OCI support went GA).
 
 ```bash
 helm install kvsynk8s oci://ghcr.io/tabman83/charts/kvsynk8s \
-  --version X.Y.Z \
+  --version 0.1.0 \
   --namespace kvsynk8s --create-namespace \
   --set azure.clientID=<managed-identity-client-id> \
   --set operator.queueURL=https://<storage>.queue.core.windows.net/<queue>
@@ -86,7 +86,8 @@ manifest install fails on the existing objects. Remove the manifest install
 first:
 
 ```bash
-kubectl delete -f https://github.com/tabman83/kvsynk8s/releases/download/vX.Y.Z/install.yaml
+# use whichever version you installed
+kubectl delete -f https://github.com/tabman83/kvsynk8s/releases/download/v0.1.0/install.yaml
 ```
 
 That deletes the CRD too, and with it every SecretSync object. If you want to
@@ -131,10 +132,10 @@ to run, leaving orphaned Secrets behind. If you really want everything gone,
 delete the SecretSync objects first, wait for them to disappear, then
 uninstall.
 
-### Option B — release manifest (once a release exists)
+### Option B — release manifest
 
 ```bash
-kubectl apply -f https://github.com/tabman83/kvsynk8s/releases/download/vX.Y.Z/install.yaml
+kubectl apply -f https://github.com/tabman83/kvsynk8s/releases/download/v0.1.0/install.yaml
 ```
 
 This is the file `.github/workflows/release.yml` builds and attaches to each
