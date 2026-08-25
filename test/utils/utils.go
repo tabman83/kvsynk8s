@@ -62,7 +62,12 @@ func Run(cmd *exec.Cmd) (string, error) {
 // UninstallCertManager uninstalls the cert manager
 func UninstallCertManager() {
 	url := fmt.Sprintf(certmanagerURLTmpl, certmanagerVersion)
-	cmd := exec.Command("kubectl", "delete", "-f", url)
+	// --timeout so this cannot block teardown indefinitely. It runs in
+	// AfterSuite, ahead of the DeferCleanup that restores
+	// config/manager/kustomization.yaml, so an unbounded wait here would take
+	// that restore down with it. --ignore-not-found for the case where
+	// cert-manager is already gone.
+	cmd := exec.Command("kubectl", "delete", "-f", url, "--ignore-not-found", "--timeout=120s")
 	if _, err := Run(cmd); err != nil {
 		warnError(err)
 	}
