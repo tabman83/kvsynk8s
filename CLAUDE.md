@@ -14,10 +14,13 @@ A working kubebuilder operator. All of Phases 1-8 in
 - T038 (the real-AKS validation run, which needs a live subscription and is
   done by hand, not by an agent).
 
-Feature `002-helm-chart` is complete and merged: the chart lives at
-`charts/kvsynk8s/` and is a second first-class install method. Its only open
-task is T024's follow-up, the parts of the release contract a dev build cannot
-exercise.
+Feature `002-helm-chart` is complete and merged, with no open tasks: the chart
+lives at `charts/kvsynk8s/` and is a second first-class install method. T024's
+follow-up — the part of the release contract a dev build cannot exercise — was
+confirmed on `v0.1.0`, which carries both `install.yaml` and
+`kvsynk8s-0.1.0.tgz` as release assets.
+
+So T038 is the only outstanding item in the whole repo.
 
 **The project has shipped.** `v0.1.0` is released, and both install methods are
 live and verified working anonymously:
