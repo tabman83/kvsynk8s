@@ -512,7 +512,32 @@ func drainSecretSyncs() {
 			"SecretSync %s/%s survived deletion; clearing its finalizer so teardown cannot deadlock\n", f[0], f[1])
 		_, _ = utils.Run(exec.Command("kubectl", "-n", f[0], "patch", "secretsync", f[1],
 			"--type=merge", "-p", `{"metadata":{"finalizers":null}}`))
+		forciblyFinalized = append(forciblyFinalized, f[0]+"/"+f[1])
 	}
+}
+
+// forciblyFinalized records every SecretSync whose finalizer this suite had to
+// strip by hand. It should always be empty.
+//
+// Stripping keeps teardown from deadlocking, but on its own it would downgrade
+// a real operator defect -- the controller failing to finalize a SecretSync --
+// from an obvious 30 minute hang into one warning line under a green suite.
+// That is a worse failure mode than the one being fixed, so the outer AfterAll
+// fails the run if this is not empty: teardown still completes, and the defect
+// is still reported.
+var forciblyFinalized []string
+
+// failIfFinalizersWereForced fails the suite if drainSecretSyncs had to strip
+// any finalizer. Call it LAST in teardown, so cleanup finishes first.
+func failIfFinalizersWereForced() {
+	if len(forciblyFinalized) == 0 {
+		return
+	}
+	Fail(fmt.Sprintf(
+		"the operator did not clear the finalizer on %d SecretSync(s): %s.\n"+
+			"They were force-finalized so teardown could finish, but this means reconcileDelete "+
+			"did not complete for them -- treat it as an operator bug, not a test-cleanup detail.",
+		len(forciblyFinalized), strings.Join(forciblyFinalized, ", ")))
 }
 
 // expectContainerRunning fails immediately, with the container's own logs in

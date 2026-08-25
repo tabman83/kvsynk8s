@@ -97,9 +97,17 @@ var _ = Describe("Manager", Ordered, func() {
 		cmd = exec.Command("make", "uninstall")
 		_, _ = utils.Run(cmd)
 
+		// --timeout, for the same reason the Makefile's teardown deletes have
+		// one: namespace deletion blocks on every finalizer inside it, so
+		// without a bound this is just where the 30 minute hang moves to.
 		By("removing manager namespace")
-		cmd = exec.Command("kubectl", "delete", "ns", namespace)
-		_, _ = utils.Run(cmd)
+		cmd = exec.Command("kubectl", "delete", "ns", namespace, "--ignore-not-found", "--timeout=120s")
+		if _, err := utils.Run(cmd); err != nil {
+			_, _ = fmt.Fprintf(GinkgoWriter, "deleting namespace %s did not complete: %v\n", namespace, err)
+		}
+
+		// Last, so the cleanup above always runs first.
+		failIfFinalizersWereForced()
 	})
 
 	// After each test, check for failures and collect logs, events,
