@@ -376,8 +376,78 @@ spec:
 }
 
 func deleteSecretSync(namespace, name string) {
-	cmd := exec.Command("kubectl", "delete", "secretsync", name, "-n", namespace, "--ignore-not-found")
-	_, _ = utils.Run(cmd)
+	// --timeout bounds the wait for the operator to clear the finalizer. The
+	// result is reported rather than silently dropped: a SecretSync that does
+	// not finish deleting here is what deadlocks teardown later (see
+	// drainSecretSyncs), so it needs to be visible in the log.
+	cmd := exec.Command("kubectl", "delete", "secretsync", name, "-n", namespace,
+		"--ignore-not-found", "--timeout=60s")
+	if _, err := utils.Run(cmd); err != nil {
+		_, _ = fmt.Fprintf(GinkgoWriter, "deleting SecretSync %s/%s did not complete: %v\n", namespace, name, err)
+	}
+}
+
+// drainSecretSyncs removes every SecretSync in the namespace while the operator
+// is still running, and guarantees none is left holding a finalizer.
+//
+// Every SecretSync carries kvsynk8s.io/secretsync-finalizer, which only the
+// running operator ever clears. `make undeploy` deletes the operator Deployment
+// and the namespace in one go, so if a single SecretSync survives into that
+// step with its finalizer still set, nothing is left that can clear it: the
+// namespace sticks in Terminating and kubectl blocks until the test binary is
+// killed. That is a 30 minute hang with no failure message, not a test failure.
+//
+// This was invisible for as long as these scenarios were skipped, because
+// nothing else in the suite creates a finalized object.
+func drainSecretSyncs(namespace string) {
+	cmd := exec.Command("kubectl", "-n", namespace, "delete", "secretsync", "--all",
+		"--ignore-not-found", "--timeout=90s")
+	if _, err := utils.Run(cmd); err != nil {
+		_, _ = fmt.Fprintf(GinkgoWriter, "bulk SecretSync delete did not complete: %v\n", err)
+	}
+
+	// Belt and braces. Anything still standing gets its finalizer stripped, so
+	// teardown degrades to a logged warning instead of a deadlock.
+	out, err := utils.Run(exec.Command("kubectl", "-n", namespace, "get", "secretsync",
+		"-o", "jsonpath={.items[*].metadata.name}"))
+	if err != nil {
+		return
+	}
+	for _, name := range strings.Fields(out) {
+		_, _ = fmt.Fprintf(GinkgoWriter,
+			"SecretSync %s/%s survived deletion; clearing its finalizer so teardown cannot deadlock\n",
+			namespace, name)
+		_, _ = utils.Run(exec.Command("kubectl", "-n", namespace, "patch", "secretsync", name,
+			"--type=merge", "-p", `{"metadata":{"finalizers":null}}`))
+	}
+}
+
+// expectContainerRunning fails immediately, with the container's own logs in
+// the message, if a container is not running a moment after `docker run -d`
+// returned success.
+//
+// `docker run -d` only reports that the container was CREATED. If the process
+// inside exits straight away -- a missing file, an unreadable mount, a bad
+// flag -- docker still exits 0 and the test carries on against a container
+// that is already dead. That is exactly how an unreadable TLS key inside
+// authstub spent a dozen runs looking like a cluster-DNS fault: the name
+// briefly failed to resolve (curl exit 6) and then resolved to a container
+// with nothing listening (curl exit 7), which reads like a network problem
+// unless you happen to check whether the container is still alive.
+//
+// Anything that starts a container in this suite must go through here.
+func expectContainerRunning(name string) {
+	GinkgoHelper()
+	cmd := exec.Command("docker", "inspect", "--format", "{{.State.Running}} {{.State.ExitCode}}", name)
+	out, err := utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred(), "could not inspect container %s", name)
+	if strings.HasPrefix(strings.TrimSpace(out), "true") {
+		return
+	}
+	logsOut, _ := utils.Run(exec.Command("docker", "logs", "--tail", "50", name))
+	Fail(fmt.Sprintf(
+		"container %s is not running (docker inspect gave %q) -- it exited instead of serving.\n"+
+			"Last 50 log lines:\n%s", name, strings.TrimSpace(out), logsOut))
 }
 
 // netcheckPodName is a throwaway pod (default namespace: unlike kvsynk8s it
@@ -470,26 +540,14 @@ func registerSecretSyncEmulatorTests() {
 		)
 
 		BeforeAll(func() {
-			// Opt-in, not on by default: this Context depends on the
-			// authstub container being reachable from inside the cluster
-			// moments after it starts, over the kind network's own DNS.
-			// That has been observed, during development, to fail
-			// consistently when this whole suite runs end to end (`make
-			// test-e2e`) -- not merely occasionally -- while the identical
-			// docker/kubectl sequence run by hand against the very same
-			// kind cluster and Docker network always succeeds; root cause
-			// not yet found despite extensive investigation (alias naming,
-			// atomic deployment patching, resource limits, security-context
-			// parity with the operator pod, an in-cluster pre-flight check,
-			// and recreating the container up to three times all failed to
-			// change the outcome). Gated behind an explicit opt-in so this
-			// unresolved flake cannot silently turn the existing, otherwise
-			// green `make test-e2e` red; set KVSYNK8S_E2E_EMULATORS=1 to run
-			// it while continuing that investigation.
-			if os.Getenv("KVSYNK8S_E2E_EMULATORS") != "1" {
-				Skip("set KVSYNK8S_E2E_EMULATORS=1 to run the emulator-backed SecretSync sync loop " +
-					"(see this BeforeAll's comment for why it is opt-in)")
-			}
+			// Runs by default. This Context was opt-in behind
+			// KVSYNK8S_E2E_EMULATORS=1 for a long time because it failed
+			// consistently under `make test-e2e` while the same commands run by
+			// hand always worked, and the cause was not found. It has been
+			// found: authstub was dying on startup, unable to read its TLS
+			// keypair as a non-root uid, and the suite reported that as the
+			// container being unreachable over cluster DNS. See the certDir and
+			// expectContainerRunning comments. Nothing about DNS was wrong.
 
 			network := dockerNetwork()
 
@@ -497,10 +555,24 @@ func registerSecretSyncEmulatorTests() {
 			var err error
 			certDir, err = os.MkdirTemp("", "kvsynk8s-e2e-certs-*")
 			Expect(err).NotTo(HaveOccurred())
+			// This directory is bind-mounted into the emulator containers, and
+			// authstub runs as the distroless nonroot uid (65532) rather than
+			// root. os.MkdirTemp creates the directory 0700 and a private key
+			// would normally be written 0600 -- both owned by the host user, so
+			// uid 65532 can neither traverse the directory nor read the key, and
+			// authstub dies on startup. azurite hides this because it runs as
+			// root, and Lowkey Vault hides it because it mounts no certs at all.
+			//
+			// So: world-readable on purpose. This is a throwaway self-signed
+			// keypair, generated per run into a temp dir, used only by two
+			// emulators inside this suite, and thrown away with the directory. It
+			// is not a credential for anything. Do not copy this pattern outside
+			// test/e2e.
+			Expect(os.Chmod(certDir, 0o755)).To(Succeed())
 			certPEM, keyPEM, err := generateSelfSignedCert([]string{azuriteAlias, authstubAlias, "localhost", "127.0.0.1"})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(os.WriteFile(filepath.Join(certDir, "cert.pem"), certPEM, 0o644)).To(Succeed())
-			Expect(os.WriteFile(filepath.Join(certDir, "key.pem"), keyPEM, 0o600)).To(Succeed())
+			Expect(os.WriteFile(filepath.Join(certDir, "key.pem"), keyPEM, 0o644)).To(Succeed())
 
 			By("building the authstub image (a throwaway Entra ID token-endpoint stub, see its package doc)")
 			projectDir, err := utils.GetProjectDir()
@@ -522,6 +594,7 @@ func registerSecretSyncEmulatorTests() {
 				"--skipApiVersionCheck", "--silent")
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
+			expectContainerRunning(azuriteContainerName)
 
 			By("starting lowkey vault")
 			removeContainer(lowkeyContainerName)
@@ -531,48 +604,31 @@ func registerSecretSyncEmulatorTests() {
 				lowkeyVaultImage)
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
+			expectContainerRunning(lowkeyContainerName)
 
 			By("starting the auth stub")
-			// Recreated up to 3 times if it doesn't come up reachable from
-			// inside the cluster: a from-scratch cluster-DNS cold start for
-			// this specific container was observed intermittently during
-			// development (getent hosts on the alias failed outright, while
-			// azurite's and lowkeyVaultAlias's own aliases -- started the
-			// same way, on the same network, moments earlier -- always
-			// resolved fine), and was not reliably reproducible by hand
-			// afterwards, so recreating is a pragmatic response to a
-			// not-fully-root-caused cold start rather than a proven fix for
-			// a known cause.
+			// This container used to be recreated up to 3 times, on the theory
+			// that it hit an intermittent cluster-DNS cold start. It did not.
+			// It was dying on startup every single time, because it is the only
+			// container here that both bind-mounts certDir and runs as a
+			// non-root uid, and the directory and key were not readable by that
+			// uid (see the certDir comment above). Docker still exited 0, so the
+			// suite went on to spend 90 seconds curling a dead container and
+			// reporting it as a network fault. Recreating it three times just
+			// repeated the same failure three times.
+			//
+			// With the permissions fixed and expectContainerRunning below, one
+			// start is enough, and if it ever does fail to boot again the error
+			// says so immediately and quotes the container's own log.
 			ensureNetcheckPod()
-			authstubTarget := fmt.Sprintf("https://%s:9911/adfs/.well-known/openid-configuration", authstubAlias)
-			authstubUp := false
-			for attempt := 1; attempt <= 3 && !authstubUp; attempt++ {
-				removeContainer(authstubContainerName)
-				cmd = exec.Command("docker", "run", "-d", "--name", authstubContainerName,
-					"--network", network, "--network-alias", authstubAlias,
-					"-v", certDir+":/certs",
-					authstubImageTag)
-				_, err = utils.Run(cmd)
-				Expect(err).NotTo(HaveOccurred())
-
-				checkErr := func() (lastErr error) {
-					deadline := time.Now().Add(30 * time.Second)
-					for time.Now().Before(deadline) {
-						if lastErr = curlReachable(authstubTarget); lastErr == nil {
-							return nil
-						}
-						time.Sleep(2 * time.Second)
-					}
-					return lastErr
-				}()
-				if checkErr == nil {
-					authstubUp = true
-					continue
-				}
-				_, _ = fmt.Fprintf(GinkgoWriter,
-					"authstub not reachable from inside the cluster on attempt %d/3: %v\n", attempt, checkErr)
-			}
-			Expect(authstubUp).To(BeTrue(), "authstub never became reachable from inside the cluster after 3 attempts")
+			removeContainer(authstubContainerName)
+			cmd = exec.Command("docker", "run", "-d", "--name", authstubContainerName,
+				"--network", network, "--network-alias", authstubAlias,
+				"-v", certDir+":/certs",
+				authstubImageTag)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			expectContainerRunning(authstubContainerName)
 
 			By("waiting for the emulators to accept connections")
 			azuritePort, err = hostPortOf(azuriteContainerName, "10001")
@@ -682,6 +738,11 @@ func registerSecretSyncEmulatorTests() {
 		})
 
 		AfterAll(func() {
+			// Must happen first, and while the operator is still running: see
+			// drainSecretSyncs for what deadlocks otherwise.
+			By("draining SecretSync objects while the operator can still finalize them")
+			drainSecretSyncs(namespace)
+
 			By("removing the emulator containers")
 			removeContainer(azuriteContainerName)
 			removeContainer(lowkeyContainerName)

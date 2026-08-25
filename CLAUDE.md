@@ -11,14 +11,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A working kubebuilder operator. All of Phases 1-8 in
 `specs/001-akv-eventgrid-sync/tasks.md` are implemented except:
 
-- T032 (partial) — the E2E suite in `test/e2e/secretsync_test.go` that
-  exercises the actual sync loop (create, SC-001 queue propagation, drift
-  repair, deletion, TargetConflict, log redaction) is written and was proven
-  correct by hand against Azurite/Lowkey Vault, but its `Context` is gated
-  behind `KVSYNK8S_E2E_EMULATORS=1` (unset by default, and not set in CI)
-  because of an unresolved DNS-reachability flake — see research.md R10.
 - T038 (the real-AKS validation run, which needs a live subscription and is
   done by hand, not by an agent).
+
+T032 is done: the E2E suite in `test/e2e/secretsync_test.go` exercises the
+actual sync loop (create, SC-001 queue propagation, drift repair, deletion,
+TargetConflict, log redaction) against Azurite/Lowkey Vault, and it runs by
+default — `make test-e2e` is 8 of 8 specs, nothing skipped. It was opt-in for a
+long time behind `KVSYNK8S_E2E_EMULATORS=1` because of what looked like a
+cluster-DNS flake around the authstub container. That diagnosis was wrong;
+the cause and the fix are in research.md R10. That env var no longer exists —
+if you see it referenced anywhere, the reference is stale.
 
 ## Architecture
 
@@ -91,8 +94,10 @@ make build              # go build -o bin/manager cmd/main.go (also regenerates 
 make test               # unit tests + envtest (real API server), all packages except test/e2e
 make lint                # golangci-lint run
 make test-integration    # azqueue against Azurite + azsecrets against Lowkey Vault, via testcontainers-go. Needs Docker.
-make test-e2e            # scaffold checks against a kind cluster (spins the cluster up and tears it down);
-                         # the SecretSync sync-loop Context is skipped unless KVSYNK8S_E2E_EMULATORS=1 (see T032 above)
+make test-e2e            # full e2e against a kind cluster (spins the cluster up and tears it down):
+                         # scaffold checks plus the SecretSync sync loop against Azurite/Lowkey
+                         # Vault/authstub containers. Nothing is skipped. Needs Docker; ~4 min.
+                         # Override the go test timeout with E2E_TIMEOUT (default 30m).
 make helm-sync           # regenerate the two machine-managed regions of the chart (runs `manifests` first)
 make helm-verify         # helm lint (defaults + ci/nondefault-values.yaml) + the kustomize equivalence check
 ```

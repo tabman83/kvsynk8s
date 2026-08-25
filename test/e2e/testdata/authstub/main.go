@@ -124,6 +124,19 @@ func main() {
 		Handler:   mux,
 		TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12},
 	}
+	// Read the keypair here rather than letting ListenAndServeTLS do it, so a
+	// permission or path problem is reported as exactly that, before anything
+	// claims to be serving. The old order logged "authstub listening on :9911"
+	// and only then failed inside ListenAndServeTLS, so `docker logs` showed a
+	// container that looked healthy and had in fact already exited -- which is
+	// how an unreadable key spent a dozen e2e runs being investigated as a
+	// cluster-DNS fault.
+	cert, err := tls.LoadX509KeyPair(*certFile, *keyFile)
+	if err != nil {
+		log.Fatalf("authstub: cannot load keypair (cert=%s key=%s): %v", *certFile, *keyFile, err)
+	}
+	srv.TLSConfig.Certificates = []tls.Certificate{cert}
+
 	log.Printf("authstub listening on %s", *addr)
-	log.Fatal(srv.ListenAndServeTLS(*certFile, *keyFile))
+	log.Fatal(srv.ListenAndServeTLS("", ""))
 }

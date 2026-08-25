@@ -75,6 +75,14 @@ test-integration: ## Run integration tests against real Azurite/Lowkey Vault con
 # - CERT_MANAGER_INSTALL_SKIP=true
 KIND_CLUSTER ?= kvsynk8s-test-e2e
 
+# `go test` defaults to a 10 minute timeout, which the e2e suite now exceeds:
+# it builds two images, stands up three emulator containers and runs the full
+# sync loop against a real cluster. Before the emulator scenarios were un-gated
+# the suite skipped most of that and fit inside the default, so this was never
+# needed. It is a timeout, not a target: a healthy run is well under it, and if
+# a run ever gets near it something is genuinely stuck.
+E2E_TIMEOUT ?= 30m
+
 .PHONY: setup-test-e2e
 setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 	@command -v $(KIND) >/dev/null 2>&1 || { \
@@ -92,7 +100,7 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 .PHONY: test-e2e
 test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
 	@set +e; \
-	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v; \
+	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v -timeout $(E2E_TIMEOUT); \
 	result=$$?; \
 	set -e; \
 	$(MAKE) cleanup-test-e2e; \
