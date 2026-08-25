@@ -224,15 +224,43 @@ func removeContainer(name string) {
 
 // hostPortOf returns the host port Docker published containerPort/tcp to
 // for the named container.
+// hostPortOf returns the host port a container's port is published on, always
+// picking the IPv4 binding.
+//
+// Docker publishes `-p 0:PORT` on both 0.0.0.0 and :: where the host is dual
+// stack, so the bindings list can hold two entries and blindly taking index 0
+// can hand back the IPv6 one. Callers connect to 127.0.0.1 for the same reason:
+// on a host where "localhost" resolves to ::1 first (GitHub Actions runners do,
+// this developer machine does not) dialling "localhost:<port>" reaches Docker
+// over IPv6 and gets "connection reset by peer" the moment TLS starts. Using an
+// explicit IPv4 literal on both sides removes the whole question.
 func hostPortOf(name, containerPort string) (string, error) {
 	cmd := exec.Command("docker", "inspect",
-		"-f", fmt.Sprintf(`{{ (index (index .NetworkSettings.Ports "%s/tcp") 0).HostPort }}`, containerPort),
+		"-f", fmt.Sprintf(`{{ range (index .NetworkSettings.Ports "%s/tcp") }}{{ .HostIp }} {{ .HostPort }}{{ "\n" }}{{ end }}`, containerPort),
 		name)
 	out, err := utils.Run(cmd)
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(out), nil
+	var fallback string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+		hostIP, hostPort := fields[0], fields[1]
+		if ip := net.ParseIP(hostIP); ip != nil && ip.To4() != nil {
+			return hostPort, nil
+		}
+		if fallback == "" {
+			fallback = hostPort
+		}
+	}
+	if fallback != "" {
+		return fallback, nil
+	}
+	return "", fmt.Errorf("no published host port for %s/tcp on container %s (docker inspect gave %q)",
+		containerPort, name, strings.TrimSpace(out))
 }
 
 // newLowkeyVaultHTTPClient returns an http.Client for this suite's own
@@ -635,15 +663,15 @@ func registerSecretSyncEmulatorTests() {
 			Expect(err).NotTo(HaveOccurred())
 			lowkeyPort, err = hostPortOf(lowkeyContainerName, "8443")
 			Expect(err).NotTo(HaveOccurred())
-			lowkeyHTTPClient = newLowkeyVaultHTTPClient("localhost:" + lowkeyPort)
+			lowkeyHTTPClient = newLowkeyVaultHTTPClient("127.0.0.1:" + lowkeyPort)
 			Eventually(func() error {
-				_, err := fetchPeerCertPEM("localhost:" + azuritePort)
+				_, err := fetchPeerCertPEM("127.0.0.1:" + azuritePort)
 				return err
 			}, 30*time.Second, time.Second).Should(Succeed())
 			var lowkeyCertPEM []byte
 			Eventually(func() error {
 				var err error
-				lowkeyCertPEM, err = fetchPeerCertPEM("localhost:" + lowkeyPort)
+				lowkeyCertPEM, err = fetchPeerCertPEM("127.0.0.1:" + lowkeyPort)
 				return err
 			}, 30*time.Second, time.Second).Should(Succeed())
 
@@ -662,7 +690,7 @@ func registerSecretSyncEmulatorTests() {
 			waitForInClusterReachability()
 
 			By("creating the notification queue in azurite")
-			queueClient, err = newAzuriteQueueClient("localhost:" + azuritePort)
+			queueClient, err = newAzuriteQueueClient("127.0.0.1:" + azuritePort)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(os.Setenv("SSL_CERT_FILE", filepath.Join(certDir, "cert.pem"))).To(Succeed())
 			_, err = queueClient.Create(context.Background(), nil)
