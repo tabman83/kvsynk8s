@@ -1,7 +1,8 @@
 # Contract: Release Artifacts
 
 **Feature**: `002-helm-chart` | Producer: `.github/workflows/release.yml` on
-`v*` tag push | Consumers: `helm install` users, GitHub Release page visitors
+a `v[0-9]*` tag push **or** a `workflow_dispatch` run with a `version` input |
+Consumers: `helm install` users, GitHub Release page visitors
 (FR-014, SC-003)
 
 For every tag `vX.Y.Z`, a successful release run MUST produce all of:
@@ -24,6 +25,32 @@ For every tag `vX.Y.Z`, a successful release run MUST produce all of:
   notices, so `.github/workflows/helm.yml` asserts the rendered tag explicitly.
 - `Chart.yaml` in git stays at the `0.0.0` placeholder; versions are applied
   by `helm package --version --app-version` in the pipeline only.
+
+## Stable releases versus prereleases
+
+A version with a semver prerelease suffix (`0.2.0-rc1`) is released in full —
+image, chart, OCI package, Release assets — but with two differences:
+
+| | stable `X.Y.Z` | prerelease `X.Y.Z-suffix` |
+|---|---|---|
+| `:latest` image tag | moved to this release | **not moved** |
+| GitHub Release | normal | marked as a prerelease |
+
+Both matter: `:latest` is what `docker pull` and the previous release's
+`install.yaml` resolve to, so a prerelease that moved it would hand a release
+candidate to everyone. The GitHub Release flag keeps a prerelease from showing
+as "Latest release" on the repo page.
+
+## Provenance
+
+The image and the OCI chart each carry a signed build provenance attestation
+(`actions/attest-build-provenance`, pushed to the registry as a referrer),
+naming the workflow and commit that produced them. Verify with:
+
+```bash
+gh attestation verify oci://ghcr.io/tabman83/kvsynk8s:vX.Y.Z --repo tabman83/kvsynk8s
+gh attestation verify oci://ghcr.io/tabman83/charts/kvsynk8s:X.Y.Z --repo tabman83/kvsynk8s
+```
 
 ## Ordering and failure behavior
 

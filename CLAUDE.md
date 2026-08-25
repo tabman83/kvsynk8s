@@ -122,10 +122,17 @@ CI runs `make test`, `make lint`, and `make test-integration` on every PR
 (`.github/workflows/test.yml`, `lint.yml`, `test-integration.yml`); `helm.yml`
 lints and renders the chart, fails on `make helm-sync` drift, and runs the
 equivalence check; `test-e2e` runs there too (`test-e2e.yml`) and additionally
-on `v*` tag pushes as part of `release.yml`, which then builds and pushes the
+on release runs as part of `release.yml`, which then builds and pushes the
 multi-arch image to GHCR, publishes the chart to
 `oci://ghcr.io/tabman83/charts/kvsynk8s`, and attaches both the rendered
 install manifest and `kvsynk8s-X.Y.Z.tgz` to a GitHub Release.
+
+A release starts either from a `v[0-9]*` tag push or from
+`gh workflow run Release -f version=X.Y.Z` (the version has no leading `v`; the
+run creates the tag itself at the end). A version with a semver prerelease
+suffix still publishes everything but does **not** move the `:latest` image tag
+and marks the GitHub Release as a prerelease. The whole workflow is serialised
+by `concurrency: release` so two releases cannot race on `:latest`.
 
 Once a branch is pushed and its PR is open, watch its checks
 (`gh pr checks <PR#> --watch`) and fix forward on any failure — see the "PR
