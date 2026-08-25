@@ -358,6 +358,62 @@ namespace/name, and Key Vault version — never by value. If you're
 troubleshooting by reading logs, that is expected and is not something to
 work around.
 
+## Releasing
+
+There are two kinds of release.
+
+### Stable releases (manual, on purpose)
+
+You decide the version and start the release yourself:
+
+```bash
+gh workflow run Release -f version=0.2.0
+```
+
+No `v` in front of the number, the workflow adds it. It creates the tag itself
+at the end, pointing at the commit it built. Pushing a tag by hand still works
+too:
+
+```bash
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+A stable release is the only thing that moves the `:latest` image tag.
+
+Pick the number by hand. There is no version file to edit anywhere:
+
+| Bump | When |
+|---|---|
+| patch | bug fixes only, no new configuration |
+| minor | new values, new behaviour, nothing existing breaks |
+| major | anything that breaks existing users — most importantly a `SecretSync` CRD schema change that makes objects already in clusters invalid |
+
+The CRD is a published API. People have `SecretSync` objects live in their
+clusters, and `helm upgrade` applies the new schema to them, so a breaking
+schema change is a major bump even if the Go code barely changed.
+
+You can also cut a release candidate. Use a version with a suffix, like
+`0.2.0-rc1`. It publishes everything, but leaves `:latest` alone and shows as a
+prerelease.
+
+### Dev builds (automatic, every merge)
+
+Every merge to `master` publishes a dev prerelease on its own. Nothing to run.
+
+The version is the next patch plus the run number, so `0.1.1-dev.42` comes
+after `v0.1.0`. It sorts below the real `0.1.1`, so it can never look newer
+than the release it is heading towards. Dev builds never move `:latest` and are
+always marked as prereleases.
+
+Use one if you want something that is not released yet:
+
+```bash
+helm install kvsynk8s oci://ghcr.io/tabman83/charts/kvsynk8s \
+  --version 0.1.1-dev.42 --namespace kvsynk8s --create-namespace
+```
+
+They are dev builds. Do not run them in production.
+
 ## Development
 
 See [CLAUDE.md](CLAUDE.md) for the build/lint/test commands and the
