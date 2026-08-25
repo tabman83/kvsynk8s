@@ -81,6 +81,14 @@ var _ = Describe("Manager", Ordered, func() {
 		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
 		_, _ = utils.Run(cmd)
 
+		// Backstop. The T032 AfterAll already drains, but this covers any spec
+		// that ever leaves a SecretSync behind: undeploy removes the operator,
+		// the CRD and the namespace together, so a single object still holding
+		// kvsynk8s.io/secretsync-finalizer leaves nothing that can clear it and
+		// kubectl blocks indefinitely. Must run before undeploy, not after.
+		By("draining SecretSync objects so no finalizer can deadlock teardown")
+		drainSecretSyncs()
+
 		By("undeploying the controller-manager")
 		cmd = exec.Command("make", "undeploy")
 		_, _ = utils.Run(cmd)
