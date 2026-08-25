@@ -99,8 +99,8 @@ against `SecretSync` objects, and enqueues a reconcile request → the
 reconciler re-reads the **latest** value from Key Vault (never trusting the
 event's own version — latest always wins) and writes it through
 `SecretWriter`. If the queue is unconfigured, misconfigured, or the event is
-simply lost, the periodic reconcile (default every hour, `RequeueAfter` on the
-controller) reaches the same end state on its own; the queue path only buys
+simply lost, the periodic reconcile (default every 4 hours, `RequeueAfter` on
+the controller) reaches the same end state on its own; the queue path only buys
 speed, never correctness.
 
 ## Build, lint, test
@@ -119,7 +119,9 @@ make test-e2e            # full e2e against a kind cluster (spins the cluster up
                          # timeout panics and skips all cleanup), DELETE_TIMEOUT
                          # (120s, bounds the teardown deletes).
 make helm-sync           # regenerate the two machine-managed regions of the chart (runs `manifests` first)
-make helm-verify         # helm lint (defaults + ci/nondefault-values.yaml) + the kustomize equivalence check
+make helm-verify         # runs helm-sync first (regenerates the machine-managed regions), then
+                         # helm lint (defaults + ci/nondefault-values.yaml), hack/check-values.sh
+                         # (the values contract), and the kustomize equivalence check
 ```
 
 The chart checks need `helm` >= 3.8 and `python3` with PyYAML (used by
