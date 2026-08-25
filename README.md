@@ -49,11 +49,8 @@ The chart version is always the release version, and the image tag defaults to
 it, so you never have to line up two versions by hand. You still need the
 Azure setup below.
 
-If that install fails with `unauthorized`, the GHCR package is still private.
-GitHub publishes new packages as private by default, so after the first
-release that ships a chart the maintainer has to set
-`ghcr.io/tabman83/charts/kvsynk8s` to Public once in its GitHub package
-settings. Nothing in the pipeline can do it.
+No credentials and no `helm repo add` needed: the packages are public, linked
+to this repository.
 
 Values you can set (the full list is in `charts/kvsynk8s/values.yaml`, each one
 with a comment):

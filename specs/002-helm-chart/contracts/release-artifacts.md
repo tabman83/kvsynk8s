@@ -72,26 +72,24 @@ gh attestation verify oci://ghcr.io/tabman83/charts/kvsynk8s:X.Y.Z --repo tabman
 - Re-running the workflow on the same tag republishes #1–#4 idempotently
   (OCI tags are mutable; `action-gh-release` replaces existing assets).
 
-## One-time manual step: GHCR package visibility
+## Package visibility
 
-**Check the visibility of `ghcr.io/tabman83/charts/kvsynk8s` after the first
-release.** GitHub's rules here are not clear-cut: a package published by a
-workflow can inherit the repository's visibility, but a newly published
-package scoped to a personal account defaults to private, and `helm push`
-sends no `org.opencontainers.image.source` label to link the package to this
-repository the way the image build does. Which of the two applies will only be
-known when the first tag is pushed. If the package lands private, the
-documented anonymous install fails with a 401 until it is set to Public:
+**No manual step is needed.** Settled empirically on 2026-08-25 by the first
+dev build (`0.1.0-dev.1`): both `ghcr.io/tabman83/kvsynk8s` and
+`ghcr.io/tabman83/charts/kvsynk8s` were created by the release workflow and
+came out **public**. An anonymous `helm install --dry-run`, with an empty
+registry config and no credentials, pulled the chart.
 
-```bash
-helm install kvsynk8s oci://ghcr.io/tabman83/charts/kvsynk8s --version X.Y.Z
-# Error: ... unauthorized
-```
+This project originally planned for the opposite, because GitHub's docs say a
+newly published package scoped to a personal account defaults to private. What
+actually happens is that a package published by a workflow using `GITHUB_TOKEN`
+and linked to a public repository — the link comes from the
+`org.opencontainers.image.source` label on the image and the matching
+annotation in `Chart.yaml` — inherits the repository's public visibility.
 
-The fix is a one-time step per package: package page on GitHub → Package
-settings → Change visibility → Public. Later releases keep whatever visibility
-the package has. If it is needed, it is the one place SC-003's "zero manual
-publishing steps" does not hold, and only for the first release.
+If some future package does come out private, the fix is one click in its
+package settings (there is no REST API for it), but SC-003's "zero manual
+publishing steps" holds as written.
 
 ## Credentials
 

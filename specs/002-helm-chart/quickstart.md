@@ -187,11 +187,16 @@ gh release view vX.Y.Z --json assets -q '.assets[].name'
 Expected: the OCI pull succeeds with app version `X.Y.Z`; release assets list
 both `install.yaml` and `kvsynk8s-X.Y.Z.tgz`.
 
-**Check the package visibility on the first release.** A new GHCR package can
-land private (GitHub's default for a package scoped to a personal account),
-and `helm push` sends nothing that links it to this repository, so it may not
-inherit the repo's visibility the way the image does. If the `helm install`
-above fails with `unauthorized`, set `ghcr.io/tabman83/charts/kvsynk8s` to
-Public in its GitHub package settings — a one-time step. Check the same for
-`ghcr.io/tabman83/kvsynk8s`, or the pod will not pull either. See
-[contracts/release-artifacts.md](contracts/release-artifacts.md).
+**Package visibility: no manual step needed.** Settled empirically on
+2026-08-25 by the first dev build (`0.1.0-dev.1`). Both
+`ghcr.io/tabman83/kvsynk8s` and `ghcr.io/tabman83/charts/kvsynk8s` were created
+by the workflow and came out **public**, so an anonymous
+`helm install --version 0.1.0-dev.1 --dry-run` pulled the chart with no
+credentials at all.
+
+GitHub's docs say a newly published package scoped to a personal account
+defaults to private, which is what this project originally planned for. In
+practice a package published by a workflow with `GITHUB_TOKEN` and linked to a
+public repository (via `org.opencontainers.image.source`) inherits the
+repository's public visibility. If a future package ever does come out private,
+the fix is still one click in its package settings, but do not expect it.

@@ -385,7 +385,19 @@ jobs:
           helm package charts/kvsynk8s --version "$VERSION" --app-version "$VERSION"
           test -f "kvsynk8s-${VERSION}.tgz"
 
-      - name: Log in to GitHub Container Registry
+      # Two logins on purpose, because they write to different places.
+      # `helm registry login` writes Helm's own registry config, which is what
+      # `helm push` reads. The attestation step below is not helm: it resolves
+      # registry credentials the Docker way, from ~/.docker/config.json, and
+      # fails with "No credentials found for registry ghcr.io" without this.
+      - name: Log in to GitHub Container Registry (for the attestation)
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to GitHub Container Registry (for helm push)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_ACTOR: ${{ github.actor }}
