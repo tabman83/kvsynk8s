@@ -137,9 +137,9 @@ A release starts one of three ways:
 
 | Trigger | Result |
 |---|---|
-| `gh workflow run Release -f version=X.Y.Z` | stable release, tag created by the run |
-| push a `v[0-9]*` tag | stable release |
-| merge to `master` | dev prerelease, version derived automatically |
+| `gh workflow run Release -f version=X.Y.Z` | stable release: image, chart, tag, GitHub Release |
+| push a `v[0-9]*` tag | same, tag already exists |
+| merge to `master` | dev build: image and chart only, no tag, no GitHub Release |
 
 **Choosing the number for a stable release is a human decision — make it
 deliberately, and say which bump you picked and why when you propose one:**
@@ -155,8 +155,11 @@ deliberately, and say which bump you picked and why when you propose one:**
 
 Dev builds need no decision: a merge to `master` publishes
 `<next patch>-dev.<run number>` (so `0.1.1-dev.42` after `v0.1.0`), derived
-from the newest stable tag. They never move `:latest` and are always marked as
-prereleases, so they cannot be mistaken for a release.
+from the newest stable tag. They are pushed to GHCR and nothing else — no git
+tag, no GitHub Release — so they are installable by version but never clutter
+the releases page or get mistaken for a release. They never move `:latest`.
+`install.yaml` is still rendered for them and kept as a workflow artifact on
+the run.
 
 Only a stable release moves `:latest`. Stable releases are serialised by the
 `release-stable` concurrency group so two cannot race on it; dev builds use

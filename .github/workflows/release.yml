@@ -419,8 +419,14 @@ jobs:
           if-no-files-found: error
           overwrite: true
 
+  # Stable releases only. A dev build is published to the registry and stops
+  # there: no git tag, no GitHub Release. Otherwise every merge would add an
+  # entry and the releases page would be mostly noise. The dev image and chart
+  # are still fully installable by version, and install.yaml is still rendered
+  # and kept as a workflow artifact on the run.
   release:
     name: Create GitHub Release
+    if: needs.prepare.outputs.channel == 'stable'
     needs: [prepare, build-and-push, publish-chart]
     permissions:
       contents: write

@@ -398,19 +398,32 @@ prerelease.
 
 ### Dev builds (automatic, every merge)
 
-Every merge to `master` publishes a dev prerelease on its own. Nothing to run.
+Every merge to `master` publishes a dev build on its own. Nothing to run.
 
-The version is the next patch plus the run number, so `0.1.1-dev.42` comes
-after `v0.1.0`. It sorts below the real `0.1.1`, so it can never look newer
-than the release it is heading towards. Dev builds never move `:latest` and are
-always marked as prereleases.
-
-Use one if you want something that is not released yet:
+A dev build goes to the container registry and stops there. There is no git
+tag and no GitHub Release for it, so the releases page only ever shows real
+releases. The image and the chart are published normally, so you install one
+exactly like any other version:
 
 ```bash
 helm install kvsynk8s oci://ghcr.io/tabman83/charts/kvsynk8s \
   --version 0.1.1-dev.42 --namespace kvsynk8s --create-namespace
 ```
+
+The version is the next patch plus the run number, so `0.1.1-dev.42` comes
+after `v0.1.0`. It sorts below the real `0.1.1`, so it can never look newer
+than the release it is heading towards. Dev builds never move `:latest`.
+
+To find the version to install, look at the Actions run for the merge. The
+version is printed in the run summary. Or list what has been published:
+
+```bash
+gh api /users/tabman83/packages/container/charts%2Fkvsynk8s/versions \
+  --jq '.[].metadata.container.tags[]' | head
+```
+
+If you want the `install.yaml` of a dev build instead of the chart, download it
+from the Artifacts section of that same Actions run.
 
 They are dev builds. Do not run them in production.
 
