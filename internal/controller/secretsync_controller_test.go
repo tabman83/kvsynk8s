@@ -151,6 +151,33 @@ func (f *flakyThenOKReader) GetLatest(_ context.Context, _, _ string) (string, s
 
 var _ azure.SecretReader = (*flakyThenOKReader)(nil)
 
+// deadlineCapturingReader wraps another azure.SecretReader and records the
+// deadline (if any) of the context each GetLatest call receives. Used to
+// assert that Reconcile runs its vault reads under the per-reconcile timeout
+// without actually having to wait that timeout out.
+type deadlineCapturingReader struct {
+	inner azure.SecretReader
+
+	mu          sync.Mutex
+	deadline    time.Time
+	hadDeadline bool
+}
+
+func (d *deadlineCapturingReader) GetLatest(ctx context.Context, vaultName, secretName string) (string, string, error) {
+	d.mu.Lock()
+	d.deadline, d.hadDeadline = ctx.Deadline()
+	d.mu.Unlock()
+	return d.inner.GetLatest(ctx, vaultName, secretName)
+}
+
+func (d *deadlineCapturingReader) captured() (time.Time, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.deadline, d.hadDeadline
+}
+
+var _ azure.SecretReader = (*deadlineCapturingReader)(nil)
+
 // startManagerFor spins up a full manager (cache + registered controller, no
 // metrics/health/webhook endpoints) around a fresh SecretSyncReconciler using
 // reader and interval, and starts it in the background. Returning cancel lets
@@ -176,6 +203,10 @@ func startManagerFor(reader azure.SecretReader, interval time.Duration) context.
 		Metrics:                metricsserver.Options{BindAddress: "0"},
 		HealthProbeBindAddress: "0",
 		LeaderElection:         false,
+		// The same label-filtered Secret cache production runs with
+		// (cmd/main.go), so these specs exercise the real configuration —
+		// including unmanaged Secrets being invisible to cached reads.
+		Cache: ManagedSecretCacheOptions(),
 		Controller: config.Controller{
 			SkipNameValidation: &skipNameValidation,
 		},
@@ -402,6 +433,117 @@ var _ = Describe("SecretSync Controller", func() {
 			var secret corev1.Secret
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: targetName, Namespace: namespace}, &secret)).To(Succeed())
 			Expect(string(secret.Data[dataKey])).To(Equal(valueA))
+		})
+	})
+
+	// The manager's Secret cache is label-filtered to managed Secrets only
+	// (ManagedSecretCacheOptions, mirrored from cmd/main.go), so an unmanaged
+	// Secret squatting on the target name is invisible to the reconciler's
+	// cached Get. FR-012 must hold regardless: the writer's uncached Create
+	// hits AlreadyExists, maps it to ErrTargetConflict, and the SecretSync
+	// still ends Failing/TargetConflict with the unmanaged Secret untouched.
+	// This needs a running manager — a manually-built reconciler on the
+	// direct (uncached) k8sClient would still see the unmanaged Secret and
+	// take the old engine-side conflict path instead.
+	Context("when an unmanaged Secret already occupies the target name", func() {
+		It("reports TargetConflict through the filtered cache and leaves the unmanaged Secret untouched", func() {
+			ctx := context.Background()
+
+			name := "ss-unmanaged-conflict-" + shortUID()
+			vaultSecret := "unmanaged-conflict-secret-" + shortUID()
+			targetName := "target-unmanaged-" + shortUID()
+			targetKey := types.NamespacedName{Name: targetName, Namespace: namespace}
+			const preExistingValue = "SENTINEL-fake-value-pre-existing-unmanaged-not-real"
+
+			// A pre-existing Secret with no managed-by label: the filtered
+			// cache never sees it.
+			unmanaged := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: targetName, Namespace: namespace},
+				StringData: map[string]string{fakeDataKey: preExistingValue},
+			}
+			Expect(k8sClient.Create(ctx, unmanaged)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), unmanaged)
+			})
+
+			mgrReader := newFakeSecretReader()
+			mgrReader.set(fakeVaultName, vaultSecret, "SENTINEL-fake-value-unmanaged-conflict-not-real", "v1")
+
+			ss := newTestSecretSync(namespace, name, fakeVaultName, vaultSecret, targetName, fakeDataKey)
+			Expect(k8sClient.Create(ctx, ss)).To(Succeed())
+
+			// A long interval: the first reconcile alone must detect the
+			// conflict; nothing here depends on periodic retries.
+			cancel := startManagerFor(mgrReader, time.Hour)
+			DeferCleanup(cancel)
+
+			ssKey := types.NamespacedName{Name: name, Namespace: namespace}
+			Eventually(func() (string, error) {
+				var updated kvsynk8sv1alpha1.SecretSync
+				if err := k8sClient.Get(ctx, ssKey, &updated); err != nil {
+					return "", err
+				}
+				if updated.Status.State != kvsynk8sv1alpha1.SecretSyncStateFailing {
+					return string(updated.Status.State), nil
+				}
+				return updated.Status.Reason, nil
+			}, 5*time.Second, 50*time.Millisecond).Should(Equal(reasonTargetConflict))
+
+			// The unmanaged Secret must be byte-for-byte untouched: no data
+			// overwrite, no adopted label, no owner reference.
+			var after corev1.Secret
+			Expect(k8sClient.Get(ctx, targetKey, &after)).To(Succeed())
+			Expect(string(after.Data[fakeDataKey])).To(Equal(preExistingValue))
+			Expect(after.Labels).NotTo(HaveKey(managedByLabelKey))
+			Expect(after.OwnerReferences).To(BeEmpty())
+
+			// Deleting the losing SecretSync while the manager still runs must
+			// clear its finalizer without deleting the unmanaged Secret.
+			Expect(k8sClient.Delete(ctx, ss)).To(Succeed())
+			Eventually(func() bool {
+				err := k8sClient.Get(ctx, ssKey, &kvsynk8sv1alpha1.SecretSync{})
+				return apierrors.IsNotFound(err)
+			}, 5*time.Second, 50*time.Millisecond).Should(BeTrue())
+			Expect(k8sClient.Get(ctx, targetKey, &after)).To(Succeed())
+			Expect(string(after.Data[fakeDataKey])).To(Equal(preExistingValue))
+		})
+	})
+
+	// Every reconcile runs under reconcileTimeout so a hung Key Vault call
+	// cannot pin a worker forever (FR-008). Asserted by capturing the
+	// context's deadline at the vault-read call site rather than by actually
+	// hanging for a minute.
+	Context("per-reconcile timeout", func() {
+		It("passes the vault read a context whose deadline is at most reconcileTimeout away", func() {
+			ctx := context.Background()
+
+			name := "ss-deadline-" + shortUID()
+			vaultSecret := "deadline-secret-" + shortUID()
+			targetName := "target-deadline-" + shortUID()
+
+			reader.set(fakeVaultName, vaultSecret, "SENTINEL-fake-value-deadline-not-real", "v1")
+			capture := &deadlineCapturingReader{inner: reader}
+
+			ss := newTestSecretSync(namespace, name, fakeVaultName, vaultSecret, targetName, fakeDataKey)
+			Expect(k8sClient.Create(ctx, ss)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), ss)
+			})
+
+			r := reconcilerFor(capture)
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: namespace}}
+
+			start := time.Now()
+			_, err := r.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			deadline, hadDeadline := capture.captured()
+			Expect(hadDeadline).To(BeTrue(), "Reconcile must bound its work with a deadline even when the incoming context has none")
+			// One second of slack: Reconcile stamps the deadline a hair after
+			// `start` was taken, so an exact <= start+reconcileTimeout bound
+			// would flake on scheduling jitter.
+			Expect(deadline).To(BeTemporally("<=", start.Add(reconcileTimeout+time.Second)),
+				"the deadline must be no further than reconcileTimeout from the start of the reconcile")
 		})
 	})
 

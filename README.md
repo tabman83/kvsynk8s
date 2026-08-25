@@ -323,7 +323,9 @@ exists), all read in `cmd/main.go`:
 | `--enable-http2` | — | `false` | HTTP/2 is disabled by default on the metrics/webhook servers (mitigates the HTTP/2 Rapid Reset class of CVEs); set this to re-enable it. |
 
 `--zap-*` flags (log level, encoding, stacktrace level, …) are also available,
-from controller-runtime's standard zap flag set.
+from controller-runtime's standard zap flag set. Logging defaults to zap's
+production configuration (JSON, info level); pass `--zap-devel` for the
+development configuration (console encoding, debug level).
 
 ## Troubleshooting
 
