@@ -97,7 +97,11 @@ make test-integration    # azqueue against Azurite + azsecrets against Lowkey Va
 make test-e2e            # full e2e against a kind cluster (spins the cluster up and tears it down):
                          # scaffold checks plus the SecretSync sync loop against Azurite/Lowkey
                          # Vault/authstub containers. Nothing is skipped. Needs Docker; ~4 min.
-                         # Override the go test timeout with E2E_TIMEOUT (default 30m).
+                         # Timeouts, all overridable: E2E_TIMEOUT (go test, 30m),
+                         # E2E_GINKGO_TIMEOUT (25m — deliberately lower, so Ginkgo
+                         # hits its deadline first and still runs teardown; go test's
+                         # timeout panics and skips all cleanup), DELETE_TIMEOUT
+                         # (120s, bounds the teardown deletes).
 make helm-sync           # regenerate the two machine-managed regions of the chart (runs `manifests` first)
 make helm-verify         # helm lint (defaults + ci/nondefault-values.yaml) + the kustomize equivalence check
 ```
