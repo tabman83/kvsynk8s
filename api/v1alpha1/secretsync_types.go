@@ -55,9 +55,14 @@ type TargetSpec struct {
 	// dataKey is the key under .data to store the value in. Defaults to the
 	// vault secret name when empty. This default is applied by the
 	// controller at reconcile time, not by the CRD schema.
+	// The XValidation rule mirrors apimachinery's IsConfigMapKey: "." , ".."
+	// and any ".."-prefixed key are rejected by the API server on the Secret
+	// write, so accepting them here would only produce a SecretSync whose
+	// Secret can never be created. Reject them at admission instead.
 	// +optional
 	// +kubebuilder:validation:MaxLength=253
 	// +kubebuilder:validation:Pattern=`^[-._a-zA-Z0-9]+$`
+	// +kubebuilder:validation:XValidation:rule="self != '.' && !self.startsWith('..')",message="dataKey must not be '.' or start with '..' (not a valid Secret data key)"
 	DataKey string `json:"dataKey,omitempty"`
 }
 
