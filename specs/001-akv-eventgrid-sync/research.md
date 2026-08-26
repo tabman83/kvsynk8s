@@ -48,7 +48,7 @@ All Technical Context unknowns resolved. Sources: Microsoft Learn (Key Vault Eve
 
 ## R8. Reconciliation strategy
 
-- **Decision**: two triggers into one idempotent sync-engine path: (a) queue events mapped to matching declarations and injected into the reconcile queue via `source.Channel`, (b) controller-runtime timed requeue (`RequeueAfter`) of every `SecretSync` at the configured interval (default 1 h, clarification #3). The engine always reads the *latest* secret from Key Vault and writes only on change ("latest wins", FR-005).
+- **Decision**: two triggers into one idempotent sync-engine path: (a) queue events mapped to matching declarations and injected into the reconcile queue via `source.Channel`, (b) controller-runtime timed requeue (`RequeueAfter`) of every `SecretSync` at the configured interval (default 4 h — clarification #3 originally said 1 h; amended to 4h in PR #15). The engine always reads the *latest* secret from Key Vault and writes only on change ("latest wins", FR-005).
 - **Rationale**: single code path means event handling and reconciliation cannot diverge; latest-wins makes duplicates and out-of-order events harmless.
 - **Alternatives considered**: version-targeted fetches from event payloads (rejected: enables rollback on stale events, violates FR-005).
 

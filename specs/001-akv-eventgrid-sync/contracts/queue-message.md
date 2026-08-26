@@ -45,6 +45,11 @@ event subscription on the Key Vault (system topic, Event Grid schema).
    and all other types ⇒ delete without action (v1 scope, clarification #4).
 3. Match `(data.VaultName, data.ObjectName)` against all `SecretSync` specs
    (vault name compared case-insensitively). No match ⇒ delete, done.
+   If the `SecretSync` list itself fails (cache error), the message is left
+   on the queue — not deleted — so the visibility timeout redelivers it on a
+   later poll instead of the event being lost (`listener.go`,
+   `matchingSecretSyncs` error path). Poison handling (rule 6) still bounds
+   how often a message can come back this way.
 4. On match: trigger the sync engine per matching declaration. The engine
    fetches the **latest** secret from Key Vault — `data.Version` is used for
    logging/correlation only, never as the fetch target (latest-wins; stale or

@@ -14,7 +14,7 @@
 
 - Q: How should Azure Key Vault change notifications be delivered to the component running inside the cluster? → A: Pull — Event Grid routes events to an Azure queue and the component reads from that queue; no inbound network exposure needed.
 - Q: Who is allowed to create sync declarations — can any namespace declare a sync for any secret the component can read? → A: Any namespace; the cluster is a single trust boundary for v1. Scope is limited by the component's vault permissions and by Kubernetes RBAC on who may create declarations.
-- Q: What should the default interval be for the periodic fallback reconciliation against Key Vault? → A: 1 hour (configurable); notifications are the primary path, reconciliation is a low-load safety net.
+- Q: What should the default interval be for the periodic fallback reconciliation against Key Vault? → A: 1 hour (configurable); notifications are the primary path, reconciliation is a low-load safety net. [amended 2026-08-25: default changed to 4h in PR #15]
 - Q: Should the component do anything with "secret near expiry" / "secret expired" events in v1? → A: No — ignore them; only "new version created" events trigger action. Expiry awareness is future work.
 
 ## User Scenarios & Testing *(mandatory)*
@@ -103,7 +103,7 @@ An operator responsible for the cluster can tell, at any moment and per declarat
 - **FR-004**: On receiving a change notification, the system MUST fetch the secret value from Key Vault; the notification itself MUST be treated only as a trigger, never as a source of the value.
 - **FR-005**: Notification processing MUST be idempotent: duplicate or out-of-order deliveries MUST converge to the latest Key Vault value and never roll a secret back to an older version.
 - **FR-006**: The system MUST act only on messages read from the configured queue that parse as valid Key Vault change notifications for a declared vault; malformed messages and notifications for secrets no declaration references MUST be discarded without error. Access to the queue MUST use the same short-lived platform credentials as the rest of the system.
-- **FR-007**: The system MUST periodically reconcile every declaration against Key Vault as a fallback, so that missed notifications, deletions in Key Vault, and drift introduced by direct edits to the Kubernetes Secret are all corrected without manual intervention. The reconciliation interval MUST be configurable, with a default of 1 hour.
+- **FR-007**: The system MUST periodically reconcile every declaration against Key Vault as a fallback, so that missed notifications, deletions in Key Vault, and drift introduced by direct edits to the Kubernetes Secret are all corrected without manual intervention. The reconciliation interval MUST be configurable, with a default of 4 hours. [amended 2026-08-25: default changed from 1h to 4h in PR #15]
 - **FR-008**: Transient failures (network errors, Key Vault throttling, expired tokens) MUST be retried with backoff; a persistent failure of one secret MUST NOT block or delay the sync of other secrets.
 - **FR-009**: Each declaration MUST expose an observable status — in sync, pending, or failing — including the time of the last successful sync and, on failure, a human-readable reason.
 - **FR-010**: Secret values MUST never appear in logs, status fields, events, metrics, error messages, or any output other than the managed Kubernetes Secret itself. References to secrets in such outputs MUST use vault name, secret name, and version only.
