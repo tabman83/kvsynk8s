@@ -241,7 +241,7 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	dataKey := resolveDataKey(&ss)
 
 	if !ss.DeletionTimestamp.IsZero() {
-		return r.reconcileDelete(ctx, &ss, targetKey)
+		return ctrl.Result{}, r.reconcileDelete(ctx, &ss, targetKey)
 	}
 
 	// data-model.md: "(created) -> Pending" is a distinct, observable state
@@ -400,9 +400,9 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 // never be silently adopted or overwritten" applies equally to deletion).
 func (r *SecretSyncReconciler) reconcileDelete(
 	ctx context.Context, ss *kvsynk8sv1alpha1.SecretSync, targetKey types.NamespacedName,
-) (ctrl.Result, error) {
+) error {
 	if !controllerutil.ContainsFinalizer(ss, finalizerName) {
-		return ctrl.Result{}, nil
+		return nil
 	}
 
 	// Through the filtered cache (ManagedSecretCacheOptions) an unmanaged
@@ -414,22 +414,22 @@ func (r *SecretSyncReconciler) reconcileDelete(
 	case err == nil:
 		if ownedBy(&secret, ss) {
 			if err := r.Delete(ctx, &secret); err != nil && !apierrors.IsNotFound(err) {
-				return ctrl.Result{}, fmt.Errorf("kvsynk8s: delete managed secret %s: %w", targetKey, err)
+				return fmt.Errorf("kvsynk8s: delete managed secret %s: %w", targetKey, err)
 			}
 		}
 		// Else: a Secret exists at this name but this SecretSync never owned
 		// it (conflict loser, or refused pre-existing unmanaged Secret) —
 		// leave it untouched.
 	case !apierrors.IsNotFound(err):
-		return ctrl.Result{}, fmt.Errorf("kvsynk8s: get secret %s: %w", targetKey, err)
+		return fmt.Errorf("kvsynk8s: get secret %s: %w", targetKey, err)
 	}
 
 	controllerutil.RemoveFinalizer(ss, finalizerName)
 	if err := r.Update(ctx, ss); err != nil {
-		return ctrl.Result{}, fmt.Errorf("kvsynk8s: remove finalizer from %s/%s: %w", ss.Namespace, ss.Name, err)
+		return fmt.Errorf("kvsynk8s: remove finalizer from %s/%s: %w", ss.Namespace, ss.Name, err)
 	}
 
-	return ctrl.Result{}, nil
+	return nil
 }
 
 // ownedBy reports whether secret carries a controller OwnerReference back to
