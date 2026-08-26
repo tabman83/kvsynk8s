@@ -352,6 +352,26 @@ vault value on its own — you lose the near-realtime property, not
 correctness. Check `status.lastSyncTime` per `SecretSync` to see whether
 reconciliation is still happening on schedule.
 
+**Queue health metrics.** When a queue URL is configured, the operator
+exposes two gauges on the standard metrics endpoint (enable it with
+`--metrics-bind-address`, it is off by default):
+
+| Metric | Meaning |
+|---|---|
+| `kvsynk8s_queue_last_successful_receive_timestamp_seconds` | Unix time of the last successful queue receive (empty receives count). If this stops moving, the operator cannot reach the queue. |
+| `kvsynk8s_queue_consecutive_receive_failures` | Failed receive calls in a row since the last success. 0 while healthy; a growing value means the queue path is down (network, auth, queue URL). |
+
+These never affect `/healthz` or `/readyz`: a broken queue path degrades
+propagation speed, not correctness, so the operator keeps running and
+periodic reconciliation keeps converging secrets. Without a queue URL the
+metrics do not exist at all.
+
+One honest limit: the gauges cover the queue-receive path only. A broken or
+deleted Event Grid subscription still produces successful empty receives, so
+both metrics look healthy while no events ever arrive. If rotations only
+propagate at the reconcile interval despite healthy receive metrics, check
+the Event Grid subscription configuration (previous paragraph).
+
 **No secret value ever appears in logs, status, or events, by design.**
 Every message references a `SecretSync` only by vault name, secret name,
 namespace/name, and Key Vault version — never by value. If you're

@@ -6,6 +6,7 @@ package events
 import (
 	"context"
 	"strings"
+	"sync"
 	"time"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -75,6 +76,19 @@ type Listener struct {
 	// Default to DefaultBusyPollInterval/DefaultIdlePollInterval.
 	BusyPollInterval time.Duration
 	IdlePollInterval time.Duration
+
+	// healthMu guards the queue-receive health state below, which pollOnce
+	// maintains and mirrors into the Prometheus gauges in metrics.go (spec
+	// US3 acceptance scenario 3: a degraded notification path must be
+	// visible to an operator). Health state only -- it never gates
+	// /healthz or /readyz, and it never changes poll behavior.
+	healthMu sync.Mutex
+	// consecutiveReceiveFailures counts failed Receive calls since the last
+	// successful one (0 while healthy).
+	consecutiveReceiveFailures int64
+	// lastSuccessfulReceive is when the last successful Receive returned
+	// (zero until the first success after startup).
+	lastSuccessfulReceive time.Time
 }
 
 var (
@@ -87,6 +101,7 @@ var (
 // returned pointer before Start runs (tests use this to shrink the poll
 // intervals).
 func NewListener(queue azure.QueueSource, cli client.Client, events chan event.GenericEvent) *Listener {
+	registerQueueMetrics()
 	return &Listener{
 		Queue:            queue,
 		Client:           cli,
@@ -108,7 +123,9 @@ func (l *Listener) NeedLeaderElection() bool { return false }
 // delay (research R6) until ctx is cancelled. Receive errors are logged and
 // treated like an idle poll (backoff, keep running) rather than stopping the
 // manager -- a transient queue outage must not crash the operator or block
-// the periodic-reconciliation safety net (constitution II).
+// the periodic-reconciliation safety net (constitution II). Each poll also
+// updates the queue health gauges (metrics.go), which is the only way queue
+// degradation is surfaced: never via /healthz or /readyz.
 func (l *Listener) Start(ctx context.Context) error {
 	l.applyDefaults()
 	log := logf.FromContext(ctx).WithName("events-listener")
@@ -142,6 +159,7 @@ func (l *Listener) Start(ctx context.Context) error {
 // sensibly; NewListener already sets all of these, but Start defends against
 // a Listener assembled by hand.
 func (l *Listener) applyDefaults() {
+	registerQueueMetrics()
 	if l.BatchSize == 0 {
 		l.BatchSize = DefaultBatchSize
 	}
@@ -164,8 +182,10 @@ func (l *Listener) applyDefaults() {
 func (l *Listener) pollOnce(ctx context.Context) (int, error) {
 	msgs, err := l.Queue.Receive(ctx, l.BatchSize)
 	if err != nil {
+		l.recordReceiveFailure()
 		return 0, err
 	}
+	l.recordReceiveSuccess(time.Now())
 	for _, m := range msgs {
 		l.handleMessage(ctx, m)
 	}
