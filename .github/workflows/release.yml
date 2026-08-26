@@ -105,6 +105,22 @@ jobs:
             exit 1
           fi
 
+          # A dispatch of a version that is already released would silently
+          # rebuild it from the current HEAD and overwrite the published
+          # artifacts. If the tag already exists it must point at the commit
+          # being built: the same commit is a deliberate re-run and is fine
+          # (the workflow converges on re-runs by design, see publish-chart
+          # and the install.yaml upload), any other commit is refused.
+          if [ -n "$INPUT_VERSION" ]; then
+            if TAG_COMMIT="$(git rev-parse -q --verify "refs/tags/v$VERSION^{commit}")"; then
+              if [ "$TAG_COMMIT" != "$GITHUB_SHA" ]; then
+                echo "::error::tag v$VERSION already exists and points at $TAG_COMMIT, not at $GITHUB_SHA. Refusing to rebuild a released version from a different commit. Pick a new version, or delete the tag first if you really mean to replace the release." >&2
+                exit 1
+              fi
+              echo "Tag v$VERSION already exists and points at this commit; treating this as a re-run of the same release."
+            fi
+          fi
+
           # A semver prerelease suffix means: do not move :latest, and mark the
           # GitHub Release as a prerelease. Every dev build has one by
           # construction, so dev builds can never take over :latest.
@@ -211,9 +227,13 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install the latest version of kind
+      - name: Install kind
+        # Pinned like HELM_VERSION above. v0.32.0 is the latest stable kind
+        # release; bump here and in test-e2e.yml together.
+        env:
+          KIND_VERSION: v0.32.0
         run: |
-          curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-$(go env GOARCH)
+          curl -Lo ./kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-$(go env GOARCH)"
           chmod +x ./kind
           sudo mv ./kind /usr/local/bin/kind
 
@@ -236,7 +256,8 @@ jobs:
       fail-fast: false
       matrix:
         helm:
-          - v3.21.4   # latest 3.x — the floor the chart documents
+          - v3.8.2    # the >= 3.8 floor the chart documents
+          - v3.21.4   # latest 3.x
           - v4.2.4    # latest 4.x
     steps:
       - name: Clone the code

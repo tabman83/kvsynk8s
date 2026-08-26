@@ -11,15 +11,17 @@ jobs:
     permissions:
       contents: read
     # The chart says it supports Helm >= 3.8, and Helm 4 is what most people
-    # will actually have. Both lines get the full check suite so neither can
-    # break without CI saying so.
+    # will actually have. The documented floor, the latest 3.x and the latest
+    # 4.x all get the full check suite so none of them can break without CI
+    # saying so. Mirrored by the helm job in release.yml — bump both together.
     name: Run on Ubuntu (helm ${{ matrix.helm }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         helm:
-          - v3.21.4   # latest 3.x — the floor the chart documents
+          - v3.8.2    # the >= 3.8 floor the chart documents
+          - v3.21.4   # latest 3.x
           - v4.2.4    # latest 4.x
     steps:
       - name: Clone the code
