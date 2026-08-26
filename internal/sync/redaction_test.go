@@ -29,6 +29,7 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -340,79 +341,123 @@ func TestRedaction_Writer_CreateOrUpdate_TargetConflict_NoValueInError(t *testin
 	}
 }
 
-// TestWriterSource_NeverLogsValueParameter is a static check (T028): it
-// parses writer.go's own source into an AST and inspects every call whose
-// selector is Info or Error (the .Info(/.Error(/.V(n).Info() log call
-// shapes used in this file) for an argument that references the local
-// identifier `value` -- the parameter CreateOrUpdate/create take that holds
-// the secret value. A future PR that adds, say,
-// `log.Info("wrote secret", "value", value)` to writer.go will fail this
-// test the moment it's added, which is the point.
+// TestValueCarryingSources_NeverLogValueIdentifiers is a static check (T028):
+// it parses each value-carrying source file into an AST and inspects every
+// call whose selector is Info, Error, or WithValues (the
+// .Info(/.Error(/.V(n).Info()/.WithValues() log call shapes used in these
+// files) for an argument that references one of that file's value-carrying
+// local identifiers -- the ones that hold, or contain, the plaintext secret
+// value. A future PR that adds, say, `log.Info("wrote secret", "value",
+// value)` to writer.go, or `log.WithValues("data", desired.Data)` to the
+// controller, will fail this test the moment it's added, which is the point.
 //
-// This is AST-based rather than a line-by-line string scan specifically so
-// it cannot be defeated by ordinary Go formatting: a call whose arguments
-// are wrapped across multiple lines (gofmt does this once a call has enough
-// key/value pairs, or an editor auto-wraps a long line) is parsed as the
-// same single *ast.CallExpr regardless of how its tokens are laid out on
-// screen, so every argument is still inspected.
-func TestWriterSource_NeverLogsValueParameter(t *testing.T) {
-	src, err := readSourceFile(t, "writer.go")
-	if err != nil {
-		t.Fatalf("read writer.go: %v", err)
+// Covered files: writer.go (the only code path allowed to place a value into
+// a Kubernetes object) and internal/controller/secretsync_controller.go
+// (which materializes the plaintext value -- `value :=
+// string(desired.Data[dataKey])` -- right next to live log calls).
+//
+// Honest scope: this is AST-based rather than a line-by-line string scan, so
+// a call whose arguments are wrapped across multiple lines (gofmt does this
+// once a call has enough key/value pairs) is still parsed as one
+// *ast.CallExpr and every argument is inspected. It is NOT a proof of
+// non-leakage: it only inspects Info/Error/WithValues selector calls for the
+// listed identifiers, so a value copied into a differently-named variable
+// first, or smuggled through a helper such as fmt.Sprintf into an error that
+// is logged later, would not be caught here. The runtime log-capture tests
+// in this file and in the controller package are the complementary check for
+// those shapes.
+func TestValueCarryingSources_NeverLogValueIdentifiers(t *testing.T) {
+	logSelectors := map[string]bool{"Info": true, "Error": true, "WithValues": true}
+
+	cases := []struct {
+		path string
+		// valueIdents are the identifiers in that file that hold or contain
+		// a plaintext secret value and must therefore never reach a log call.
+		valueIdents map[string]bool
+	}{
+		{
+			path:        "writer.go",
+			valueIdents: map[string]bool{"value": true, "existing": true, "secret": true},
+		},
+		{
+			path: filepath.Join("..", "controller", "secretsync_controller.go"),
+			// `value` and `desired` hold the plaintext directly; `existing`,
+			// `fetched`, and `priorData` hold the target Secret's data. The
+			// loop variable `secret` in deleteStaleManagedSecrets is
+			// deliberately not listed: its identifier legitimately reaches a
+			// log call today (namespace/name fields only), and an
+			// identifier-level check cannot tell secret.Name from
+			// secret.Data -- the controller's runtime log-capture spec is
+			// what covers that file's actual output.
+			valueIdents: map[string]bool{
+				"value": true, "desired": true, "existing": true, "fetched": true, "priorData": true,
+			},
+		},
 	}
 
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "writer.go", src, 0)
-	if err != nil {
-		t.Fatalf("parse writer.go: %v", err)
-	}
-
-	logCall := false
-	ast.Inspect(file, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		sel, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok || (sel.Sel.Name != "Info" && sel.Sel.Name != "Error") {
-			return true
-		}
-		logCall = true
-		for _, arg := range call.Args {
-			if referencesValueIdent(arg) {
-				pos := fset.Position(call.Pos())
-				t.Fatalf("writer.go:%d: %s(...) call has an argument that references the `value` identifier", pos.Line, sel.Sel.Name)
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			src, err := readSourceFile(t, tc.path)
+			if err != nil {
+				t.Fatalf("read %s: %v", tc.path, err)
 			}
-		}
-		return true
-	})
-	if !logCall {
-		t.Skip("writer.go currently has no log calls at all; this check has nothing to verify yet but stays in place for when T028 adds one")
+
+			fset := token.NewFileSet()
+			file, err := parser.ParseFile(fset, tc.path, src, 0)
+			if err != nil {
+				t.Fatalf("parse %s: %v", tc.path, err)
+			}
+
+			logCall := false
+			ast.Inspect(file, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				sel, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok || !logSelectors[sel.Sel.Name] {
+					return true
+				}
+				logCall = true
+				for _, arg := range call.Args {
+					if ident, found := referencesIdent(arg, tc.valueIdents); found {
+						pos := fset.Position(call.Pos())
+						t.Fatalf("%s:%d: %s(...) call has an argument that references the value-carrying identifier %q",
+							tc.path, pos.Line, sel.Sel.Name, ident)
+					}
+				}
+				return true
+			})
+			if !logCall {
+				t.Fatalf("%s: no Info/Error/WithValues calls found at all -- if logging moved elsewhere, this check must follow it", tc.path)
+			}
+		})
 	}
 }
 
-// referencesValueIdent reports whether expr is, or contains as a
-// sub-expression anywhere within it, an *ast.Ident named "value". Walking
-// the whole sub-expression (rather than only checking whether expr itself is
-// a bare identifier) means it also catches `value` wrapped in a conversion,
-// a call, or any other expression built from it. Matching on the parsed
-// identifier name -- not a substring of the source text -- means it doesn't
-// false-positive on unrelated identifiers that merely contain the same
-// letters, like "dataValue" or "valueFoo".
-func referencesValueIdent(expr ast.Expr) bool {
-	found := false
+// referencesIdent reports whether expr is, or contains as a sub-expression
+// anywhere within it, an *ast.Ident whose name is in idents, returning the
+// first such name. Walking the whole sub-expression (rather than only
+// checking whether expr itself is a bare identifier) means it also catches an
+// identifier wrapped in a conversion, a call, or any other expression built
+// from it. Matching on the parsed identifier name -- not a substring of the
+// source text -- means it doesn't false-positive on unrelated identifiers
+// that merely contain the same letters, like "dataValue" or "valueFoo".
+func referencesIdent(expr ast.Expr, idents map[string]bool) (string, bool) {
+	var found string
 	ast.Inspect(expr, func(n ast.Node) bool {
-		if ident, ok := n.(*ast.Ident); ok && ident.Name == "value" {
-			found = true
+		if ident, ok := n.(*ast.Ident); ok && idents[ident.Name] && found == "" {
+			found = ident.Name
 		}
 		return true
 	})
-	return found
+	return found, found != ""
 }
 
-// readSourceFile reads a source file from this package's own directory
-// (tests run with the package directory as their working directory, so a
-// bare relative name is enough).
+// readSourceFile reads a source file by a path relative to this package's
+// own directory (tests run with the package directory as their working
+// directory, so a bare relative name -- or a ../sibling-package path -- is
+// enough).
 func readSourceFile(t *testing.T, name string) (string, error) {
 	t.Helper()
 	b, err := os.ReadFile(name)
