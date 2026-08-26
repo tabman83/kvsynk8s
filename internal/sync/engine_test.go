@@ -326,6 +326,9 @@ func TestSync_RewritesWhenDataKeyChanges_RemovesStaleKey(t *testing.T) {
 // the vault value.
 func TestSync_RewritesWhenManagedSecretDataDrifted(t *testing.T) {
 	owner := newOwner("my-sync", "default", "my-vault", "my-app-password")
+	// A stale prior status.syncedVersion must not survive a successful sync:
+	// the carried-forward value is overwritten with the version just synced.
+	owner.Status.SyncedVersion = "v2"
 
 	const vaultValue = "the-real-vault-value"
 	existing := existingSyncedSecret(owner, "v3", "tampered-in-cluster-value")
@@ -415,6 +418,11 @@ func TestSync_ReaderNotFound_FailingSecretNotFound_NoValueAnywhere(t *testing.T)
 	if status.Reason != ReasonSecretNotFound {
 		t.Errorf("status.Reason = %q, want %q", status.Reason, ReasonSecretNotFound)
 	}
+	// This CR never synced: there is no version to carry forward, so the
+	// carried-forward SyncedVersion must simply stay empty.
+	if status.SyncedVersion != "" {
+		t.Errorf("status.SyncedVersion = %q, want empty (never synced)", status.SyncedVersion)
+	}
 
 	// No secret existed before, and none should be fabricated on failure.
 	if secret != nil {
@@ -468,6 +476,7 @@ func existingSyncedSecret(owner *kvsynk8sv1alpha1.SecretSync, version, value str
 
 func TestSync_ReaderReportsDeleted_FailingSourceDeleted_ExistingSecretUntouched(t *testing.T) {
 	owner := newOwner("my-sync", "default", "my-vault", "my-app-password")
+	owner.Status.SyncedVersion = "v2"
 	const lastKnownGood = "SENTINEL-last-known-good-value-not-real"
 	existing := existingSyncedSecret(owner, "v2", lastKnownGood)
 
@@ -484,6 +493,11 @@ func TestSync_ReaderReportsDeleted_FailingSourceDeleted_ExistingSecretUntouched(
 	}
 	if status.Reason != ReasonSourceDeleted {
 		t.Errorf("status.Reason = %q, want %q", status.Reason, ReasonSourceDeleted)
+	}
+	// FR-013: the managed Secret keeps its last value, so the version the
+	// status reports must keep saying which one that is, not go blank.
+	if status.SyncedVersion != "v2" {
+		t.Errorf("status.SyncedVersion = %q, want %q carried forward on SourceDeleted", status.SyncedVersion, "v2")
 	}
 
 	if secret != existing {
@@ -506,8 +520,40 @@ func TestSync_ReaderReportsDeleted_FailingSourceDeleted_ExistingSecretUntouched(
 	}
 }
 
+// A transient reader failure is the flap case: the vault secret is fine, the
+// read just failed this cycle. The prior synced version must survive in the
+// status instead of blinking blank until the next successful reconcile.
+func TestSync_ReaderTransientError_SyncedVersionCarriedForward(t *testing.T) {
+	owner := newOwner("my-sync", "default", "my-vault", "my-app-password")
+	owner.Status.SyncedVersion = "v7"
+	const lastKnownGood = "SENTINEL-last-known-good-value-transient-not-real"
+	existing := existingSyncedSecret(owner, "v7", lastKnownGood)
+
+	transientErr := fmt.Errorf("vault %q secret %q: %w", owner.Spec.Vault.Name, owner.Spec.Vault.Secret, azure.ErrTransient)
+	reader := &fakeSecretReader{err: transientErr}
+	e := &Engine{Reader: reader}
+
+	status, secret, err := e.Sync(context.Background(), owner, existing)
+	if err != nil {
+		t.Fatalf("Sync() error = %v, want nil (expected failures are reported via status)", err)
+	}
+	if status.State != kvsynk8sv1alpha1.SecretSyncStateFailing {
+		t.Errorf("status.State = %q, want %q", status.State, kvsynk8sv1alpha1.SecretSyncStateFailing)
+	}
+	if status.Reason != ReasonTransientError {
+		t.Errorf("status.Reason = %q, want %q", status.Reason, ReasonTransientError)
+	}
+	if status.SyncedVersion != "v7" {
+		t.Errorf("status.SyncedVersion = %q, want %q carried forward on TransientError", status.SyncedVersion, "v7")
+	}
+	if secret != existing {
+		t.Fatalf("Sync() must return the SAME existing Secret pointer on TransientError")
+	}
+}
+
 func TestSync_ReaderReportsDisabled_FailingSourceDisabled_ExistingSecretUntouched(t *testing.T) {
 	owner := newOwner("my-sync", "default", "my-vault", "my-app-password")
+	owner.Status.SyncedVersion = "v5"
 	const lastKnownGood = "SENTINEL-last-known-good-value-disabled-not-real"
 	existing := existingSyncedSecret(owner, "v5", lastKnownGood)
 
@@ -524,6 +570,11 @@ func TestSync_ReaderReportsDisabled_FailingSourceDisabled_ExistingSecretUntouche
 	}
 	if status.Reason != ReasonSourceDisabled {
 		t.Errorf("status.Reason = %q, want %q", status.Reason, ReasonSourceDisabled)
+	}
+	// FR-013, same as SourceDeleted: the Secret still holds v5's value, the
+	// status must keep reporting v5.
+	if status.SyncedVersion != "v5" {
+		t.Errorf("status.SyncedVersion = %q, want %q carried forward on SourceDisabled", status.SyncedVersion, "v5")
 	}
 
 	if secret != existing {

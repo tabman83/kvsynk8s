@@ -94,10 +94,15 @@ func (e *Engine) Sync(
 
 	status := kvsynk8sv1alpha1.SecretSyncStatus{
 		ObservedGeneration: owner.Generation,
-		// Carry the previous last-known-good sync time forward; it only
-		// advances below, on an actual successful sync/verify, never on a
-		// failure.
-		LastSyncTime: owner.Status.LastSyncTime,
+		// Carry the previous last-known-good sync time and synced version
+		// forward; they only advance below, on an actual successful
+		// sync/verify, never on a failure. This matters for the failure
+		// returns: under FR-013 the managed Secret keeps its last value, so
+		// the version it reflects is unchanged and status.syncedVersion (the
+		// kubectl Version printcolumn) must keep saying so instead of going
+		// blank. A CR that never synced simply carries the empty string.
+		LastSyncTime:  owner.Status.LastSyncTime,
+		SyncedVersion: owner.Status.SyncedVersion,
 	}
 
 	// FR-012, first-writer-wins: never touch a pre-existing Secret this
