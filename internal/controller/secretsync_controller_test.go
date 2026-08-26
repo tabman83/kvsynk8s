@@ -376,6 +376,78 @@ var _ = Describe("SecretSync Controller", func() {
 		})
 	})
 
+	Context("when spec.target.secretName is renamed", func() {
+		It("creates the Secret at the new name and deletes the old one, leaving other SecretSyncs' Secrets alone", func() {
+			ctx := context.Background()
+
+			name := "ss-rename-" + shortUID()
+			vaultSecret := "rename-secret-" + shortUID()
+			oldTarget := "target-rename-old-" + shortUID()
+			newTarget := "target-rename-new-" + shortUID()
+			const fakeValue = "SENTINEL-fake-value-rename-test-not-real"
+
+			reader.set(fakeVaultName, vaultSecret, fakeValue, "v1")
+
+			ss := newTestSecretSync(namespace, name, fakeVaultName, vaultSecret, oldTarget, fakeDataKey)
+			Expect(k8sClient.Create(ctx, ss)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), ss)
+			})
+
+			// A second, unrelated SecretSync in the same namespace, synced to
+			// its own target: the rename sweep below must never touch its
+			// Secret even though it carries the same managed-by label.
+			otherName := "ss-rename-other-" + shortUID()
+			otherVaultSecret := "rename-other-secret-" + shortUID()
+			otherTarget := "target-rename-other-" + shortUID()
+			const otherValue = "SENTINEL-fake-value-rename-other-not-real"
+			reader.set(fakeVaultName, otherVaultSecret, otherValue, "v1")
+
+			ssOther := newTestSecretSync(namespace, otherName, fakeVaultName, otherVaultSecret, otherTarget, fakeDataKey)
+			Expect(k8sClient.Create(ctx, ssOther)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), ssOther)
+			})
+
+			r := reconcilerFor(reader)
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: namespace}}
+
+			// First reconcile of each: both Secrets exist at their targets.
+			_, err := r.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: otherName, Namespace: namespace}})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: oldTarget, Namespace: namespace}, &corev1.Secret{})).To(Succeed())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: otherTarget, Namespace: namespace}, &corev1.Secret{})).To(Succeed())
+
+			// Rename the target on the first SecretSync.
+			var latest kvsynk8sv1alpha1.SecretSync
+			Expect(k8sClient.Get(ctx, req.NamespacedName, &latest)).To(Succeed())
+			latest.Spec.Target.SecretName = newTarget
+			Expect(k8sClient.Update(ctx, &latest)).To(Succeed())
+
+			_, err = r.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			// The new target exists, carries the value, and is owned by ss.
+			var renamed corev1.Secret
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: newTarget, Namespace: namespace}, &renamed)).To(Succeed())
+			Expect(string(renamed.Data[fakeDataKey])).To(Equal(fakeValue))
+			Expect(renamed.OwnerReferences).To(ContainElement(HaveField("Name", name)))
+
+			// The old target is gone: the rename must not orphan it.
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: oldTarget, Namespace: namespace}, &corev1.Secret{})
+			Expect(apierrors.IsNotFound(err)).To(BeTrue(),
+				"the Secret at the previous target name should be deleted after the rename syncs")
+
+			// The unrelated SecretSync's Secret is untouched.
+			var otherSecret corev1.Secret
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: otherTarget, Namespace: namespace}, &otherSecret)).To(Succeed())
+			Expect(string(otherSecret.Data[fakeDataKey])).To(Equal(otherValue))
+		})
+	})
+
 	Context("when two SecretSyncs target the same Secret name in the same namespace", func() {
 		It("keeps the first InSync and fails the later one with TargetConflict", func() {
 			ctx := context.Background()

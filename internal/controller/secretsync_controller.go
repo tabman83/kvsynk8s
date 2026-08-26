@@ -386,6 +386,21 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	log.V(1).Info("reconciled SecretSync",
 		"vault", ss.Spec.Vault.Name, "secret", ss.Spec.Vault.Secret, "state", status.State)
 
+	// Garbage-collect the previous target after a spec.target.secretName
+	// rename: without this, the Secret written under the old name would stay
+	// in the namespace (labelled managed-by=kvsynk8s, carrying the last synced
+	// value) until the CR itself was deleted. Runs only when this reconcile
+	// ended InSync — i.e. the current target verifiably holds the value — so a
+	// failed or conflicted sync can never trigger a deletion. Placed after the
+	// status update so a GC failure (returned for backoff retry) never blocks
+	// the status from reflecting the sync outcome; the sweep itself is
+	// idempotent and re-runs on the retry.
+	if status.State == kvsynk8sv1alpha1.SecretSyncStateInSync {
+		if err := r.deleteStaleManagedSecrets(ctx, &ss, targetName); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
 	if status.State == kvsynk8sv1alpha1.SecretSyncStateFailing && status.Reason == sync.ReasonTransientError {
 		// Constitution II / FR-008: transient failures (network, throttling,
 		// auth token expiry) are retried with exponential backoff via
@@ -439,6 +454,46 @@ func (r *SecretSyncReconciler) reconcileDelete(
 		return fmt.Errorf("kvsynk8s: remove finalizer from %s/%s: %w", ss.Namespace, ss.Name, err)
 	}
 
+	return nil
+}
+
+// deleteStaleManagedSecrets deletes every Secret in ss's namespace that this
+// SecretSync previously managed under a different target name — the orphan a
+// spec.target.secretName rename leaves behind. Candidates are found by the
+// managed-by label, but a candidate is only ever deleted when it carries a
+// controller OwnerReference whose UID matches ss (ownedBy): a Secret owned by
+// a different SecretSync, or not owned by any, is never touched, no matter
+// what it is named or labelled. Callers gate this on the current target's
+// sync having succeeded, so a failed sync never deletes anything.
+//
+// Logging is identifier-only (namespace/name), never values (constitution I).
+func (r *SecretSyncReconciler) deleteStaleManagedSecrets(
+	ctx context.Context, ss *kvsynk8sv1alpha1.SecretSync, currentTargetName string,
+) error {
+	var list corev1.SecretList
+	if err := r.List(ctx, &list,
+		client.InNamespace(ss.Namespace),
+		client.MatchingLabels{sync.LabelManagedBy: sync.LabelManagedByValue},
+	); err != nil {
+		return fmt.Errorf("kvsynk8s: list managed secrets in namespace %s: %w", ss.Namespace, err)
+	}
+
+	log := logf.FromContext(ctx)
+	for i := range list.Items {
+		secret := &list.Items[i]
+		if secret.Name == currentTargetName {
+			continue
+		}
+		if !ownedBy(secret, ss) {
+			continue
+		}
+		if err := r.Delete(ctx, secret); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("kvsynk8s: delete stale managed secret %s/%s: %w", secret.Namespace, secret.Name, err)
+		}
+		log.Info("deleted stale managed secret left behind by a target rename",
+			"namespace", secret.Namespace, "name", secret.Name,
+			"currentTarget", currentTargetName)
+	}
 	return nil
 }
 
