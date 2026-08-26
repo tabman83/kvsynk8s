@@ -17,7 +17,7 @@ basic problem, but the two differ on two points:
 - **Notification model.** akv2k8s polls Key Vault on an interval. kvsynk8s
   reacts to Key Vault's own change notifications (Event Grid →
   Storage Queue), so a rotation reaches the cluster in under a minute instead
-  of waiting for the next poll. A periodic reconciliation (default every hour)
+  of waiting for the next poll. A periodic reconciliation (default every 4 hours)
   still runs underneath as a safety net for missed notifications, vault-side
   deletions, and in-cluster drift — so the cluster never depends on
   notifications alone to stay correct.
@@ -323,7 +323,9 @@ exists), all read in `cmd/main.go`:
 | `--enable-http2` | — | `false` | HTTP/2 is disabled by default on the metrics/webhook servers (mitigates the HTTP/2 Rapid Reset class of CVEs); set this to re-enable it. |
 
 `--zap-*` flags (log level, encoding, stacktrace level, …) are also available,
-from controller-runtime's standard zap flag set.
+from controller-runtime's standard zap flag set. Logging defaults to zap's
+production configuration (JSON, info level); pass `--zap-devel` for the
+development configuration (console encoding, debug level).
 
 ## Troubleshooting
 

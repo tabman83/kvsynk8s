@@ -17,7 +17,7 @@ net. References: [data-model.md](data-model.md), [contracts/](contracts/).
 
 ```bash
 RG=<resource-group> VAULT=<vault-name> SA=<storage-account> QUEUE=kvsynk8s-events
-AKS=<cluster-name> NS=kvsynk8s SA_K8S=kvsynk8s-operator
+AKS=<cluster-name> NS=kvsynk8s SA_K8S=kvsynk8s-controller-manager
 
 # Queue that receives Key Vault events
 az storage queue create --name $QUEUE --account-name $SA --auth-mode login
@@ -95,7 +95,7 @@ az storage message clear --queue-name $QUEUE --account-name $SA --auth-mode logi
 kubectl -n kvsynk8s scale deploy/kvsynk8s-operator --replicas=1
 # startup reconciliation converges without any event:
 kubectl -n demo get secret demo-password -o jsonpath='{.data.demo-password}' | base64 -d
-# expect: third-value (within startup reconciliation; worst case one interval, default 1 h)
+# expect: third-value (within startup reconciliation; worst case one interval, default 4 h)
 ```
 
 ### V4 — drift repair (User Story 3, scenario 2)
@@ -149,5 +149,6 @@ the last two):
   Secret update <60 s, drift repair, cleanup.
 
 CI runs all three on every PR. The manual validation V1–V7 above remains the
-only check of real Event Grid delivery and workload identity. Exact commands
-land in CLAUDE.md when the code exists.
+only check of real Event Grid delivery and workload identity. The exact
+commands, including how to run a single test, are in CLAUDE.md's
+"Build, lint, test" section.

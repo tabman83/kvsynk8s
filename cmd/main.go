@@ -135,8 +135,11 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	// Production zap defaults (JSON encoding, info level, sampled): debug
+	// logs and dev-style stacktraces are opt-in via --zap-devel, not the
+	// baked-in default of a released operator.
 	opts := zap.Options{
-		Development: true,
+		Development: false,
 	}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -237,6 +240,12 @@ func main() {
 		Metrics:                metricsServerOptions,
 		WebhookServer:          webhookServer,
 		HealthProbeBindAddress: probeAddr,
+		// Owns(&corev1.Secret{}) starts a cluster-wide Secret informer; left
+		// unfiltered it would cache every Secret in the cluster, values
+		// included. Restrict it to kvsynk8s-managed Secrets only — see
+		// controller.ManagedSecretCacheOptions for the conflict-detection
+		// consequences this has.
+		Cache: controller.ManagedSecretCacheOptions(),
 		// Leader election is intentionally always off: this operator runs a
 		// single replica and defers leader election until a real HA need
 		// appears (plan.md Scale/Scope; constitution III, Simplicity First).

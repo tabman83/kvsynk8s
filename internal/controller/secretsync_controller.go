@@ -17,18 +17,23 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -59,6 +64,56 @@ const finalizerName = "kvsynk8s.io/secretsync-finalizer"
 // vault-side deletions, and in-cluster drift (plan.md, data-model.md). It
 // mirrors cmd/main.go's own default.
 const defaultReconcileInterval = 4 * time.Hour
+
+// maxConcurrentReconciles is how many SecretSync reconciles may run in
+// parallel (FR-008: one secret's persistent failure must not delay others).
+// The default used to be 1, which meant a single slow reconcile — e.g. a
+// Key Vault call waiting out its retry budget — delayed every other
+// SecretSync behind it in the workqueue. Two workers keep the operator's
+// API-server and Key Vault footprint small while removing the single-file
+// bottleneck; controller-runtime already guarantees the same object is never
+// reconciled by two workers at once.
+const maxConcurrentReconciles = 2
+
+// reconcileTimeout bounds one Reconcile call. It exists so a hung Key Vault
+// or API-server call cannot stall a worker forever — with a finite worker
+// pool (maxConcurrentReconciles), a reconcile that never returns would
+// permanently shrink it. One minute comfortably exceeds the Azure SDK's
+// default retry budget (3 retries with sub-second exponential backoff) plus
+// the handful of Kubernetes API calls a reconcile makes; a reconcile that is
+// still running after a minute is hung, not slow. On expiry the in-flight
+// call fails, Reconcile returns an error, and the rate-limited workqueue
+// retries with backoff as for any other transient failure.
+const reconcileTimeout = time.Minute
+
+// ManagedSecretCacheOptions returns the cache configuration the manager must
+// be built with: the corev1.Secret informer behind Owns(&corev1.Secret{}) is
+// restricted, with a label selector, to Secrets carrying
+// app.kubernetes.io/managed-by=kvsynk8s — the label SecretWriter puts on
+// every Secret it creates. Without this the manager caches every Secret in
+// the cluster (values included), which is both a memory and an exposure
+// concern for an operator that only ever needs its own.
+//
+// Deliberate consequence: unmanaged Secrets are invisible to every cached
+// Get/List in this package. The reconciler's pre-write Get of the target
+// therefore reports NotFound for an unmanaged conflicting Secret, and
+// first-writer-wins (FR-012) is enforced by SecretWriter instead: its
+// uncached Create fails with AlreadyExists, which it maps to
+// ErrTargetConflict, and Reconcile turns that into the same
+// Failing/TargetConflict status as before. The envtest suite builds its
+// managers with these same options so tests exercise this exact
+// configuration.
+func ManagedSecretCacheOptions() cache.Options {
+	return cache.Options{
+		ByObject: map[client.Object]cache.ByObject{
+			&corev1.Secret{}: {
+				Label: labels.SelectorFromSet(labels.Set{
+					sync.LabelManagedBy: sync.LabelManagedByValue,
+				}),
+			},
+		},
+	}
+}
 
 // SecretSyncReconciler reconciles a SecretSync object
 type SecretSyncReconciler struct {
@@ -167,6 +222,12 @@ func (r *SecretSyncReconciler) recordSyncOutcome(ss *kvsynk8sv1alpha1.SecretSync
 // reconcile still requeues after reconcileInterval() so a since-resolved
 // cause is retried without needing an external trigger.
 func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	// Per-reconcile deadline (FR-008): a hung upstream call fails the
+	// reconcile after reconcileTimeout instead of occupying one of the
+	// maxConcurrentReconciles workers forever.
+	ctx, cancelTimeout := context.WithTimeout(ctx, reconcileTimeout)
+	defer cancelTimeout()
+
 	log := logf.FromContext(ctx)
 
 	var ss kvsynk8sv1alpha1.SecretSync
@@ -182,7 +243,7 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	dataKey := resolveDataKey(&ss)
 
 	if !ss.DeletionTimestamp.IsZero() {
-		return r.reconcileDelete(ctx, &ss, targetKey)
+		return ctrl.Result{}, r.reconcileDelete(ctx, &ss, targetKey)
 	}
 
 	// data-model.md: "(created) -> Pending" is a distinct, observable state
@@ -220,6 +281,11 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{RequeueAfter: r.reconcileInterval()}, nil
 	}
 
+	// In production this Get reads through the manager's cache, which
+	// ManagedSecretCacheOptions restricts to kvsynk8s-managed Secrets: an
+	// unmanaged Secret squatting on the target name comes back NotFound here
+	// and is instead detected by SecretWriter's Create (AlreadyExists ->
+	// ErrTargetConflict) below.
 	var existing *corev1.Secret
 	fetched := &corev1.Secret{}
 	if err := r.Get(ctx, targetKey, fetched); err != nil {
@@ -232,11 +298,13 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	// Captured before Sync runs: Sync mutates `existing` in place on its
 	// write path (it is the same *corev1.Secret returned as `desired`), so
-	// this is the only chance to see the pre-sync annotation for the
-	// idempotency comparison below.
+	// this is the only chance to see the pre-sync annotation and data for
+	// the idempotency comparison below.
 	var priorVersion string
+	var priorData map[string][]byte
 	if existing != nil {
 		priorVersion = existing.Annotations[sync.AnnotationVersion]
+		priorData = existing.DeepCopy().Data
 	}
 
 	engine := sync.Engine{Reader: r.Reader}
@@ -249,11 +317,13 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		// Finalizer is only added once we know this SecretSync is not going
 		// to be defeated by an ownership check (the CR-vs-CR conflict check
 		// above, or engine.Sync's own pre-existing-unmanaged-Secret check,
-		// have both already passed at this point) — a declaration that never
-		// reaches here never acquires delete power over a target it does not
-		// own. reconcileDelete additionally verifies ownership before
-		// deleting, as a second line of defense for the narrow TOCTOU race
-		// where the write below still turns out to conflict.
+		// have both already passed at this point). With the filtered cache
+		// (ManagedSecretCacheOptions) an unmanaged conflicting Secret is not
+		// visible to engine.Sync, so a losing declaration can still reach
+		// here and acquire the finalizer before the write below fails with
+		// ErrTargetConflict — which is why reconcileDelete independently
+		// verifies ownership before deleting anything: a finalizer is never
+		// treated as proof of ownership.
 		if !controllerutil.ContainsFinalizer(&ss, finalizerName) {
 			controllerutil.AddFinalizer(&ss, finalizerName)
 			if err := r.Update(ctx, &ss); err != nil {
@@ -262,11 +332,17 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 
 		// Idempotency (FR-005, data-model.md): only write when the Secret is
-		// new or the synced version actually changed. Without this check an
-		// Update would fire on every reconcile even when nothing changed,
-		// which — combined with Owns(&corev1.Secret{}) below — would retrigger
-		// a reconcile for its own no-op write and loop forever.
-		if existing == nil || priorVersion != status.SyncedVersion {
+		// new, the synced version changed, or the Secret's pre-sync data does
+		// not match what the engine computed — a changed spec.target.dataKey,
+		// or in-cluster drift on the managed Secret's data (US3 AS-2, FR-007),
+		// both of which leave the version annotation intact. Without this
+		// check an Update would fire on every reconcile even when nothing
+		// changed, which — combined with Owns(&corev1.Secret{}) below — would
+		// retrigger a reconcile for its own no-op write and loop forever;
+		// comparing against the pre-sync snapshot keeps the no-op case
+		// write-free while still repairing real differences.
+		if existing == nil || priorVersion != status.SyncedVersion ||
+			!maps.EqualFunc(priorData, desired.Data, bytes.Equal) {
 			// The actual Kubernetes write goes exclusively through
 			// SecretWriter (constitution I: one value-carrying code path),
 			// not r.Create/r.Update directly. value/version are read back off
@@ -279,12 +355,14 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 				if !errors.Is(writeErr, sync.ErrTargetConflict) {
 					return ctrl.Result{}, fmt.Errorf("kvsynk8s: write secret %s: %w", targetKey, writeErr)
 				}
-				// Another actor created a Secret at this name between our
-				// existence check earlier in this reconcile and the write
-				// just above (TOCTOU): classify it exactly like any other
-				// pre-existing unmanaged Secret instead of a generic error,
-				// so the CR's status reflects TargetConflict rather than
-				// going stale for this cycle.
+				// An unmanaged Secret occupies the target name. With the
+				// filtered cache (ManagedSecretCacheOptions) this is the
+				// normal detection path for that case — the cached Get above
+				// cannot see unmanaged Secrets — and it also covers the
+				// TOCTOU race where another actor created the Secret between
+				// that Get and the write just above. Either way the CR's
+				// status reflects TargetConflict rather than going stale for
+				// this cycle.
 				status = kvsynk8sv1alpha1.SecretSyncStatus{
 					State:  kvsynk8sv1alpha1.SecretSyncStateFailing,
 					Reason: sync.ReasonTargetConflict,
@@ -347,32 +425,36 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 // never be silently adopted or overwritten" applies equally to deletion).
 func (r *SecretSyncReconciler) reconcileDelete(
 	ctx context.Context, ss *kvsynk8sv1alpha1.SecretSync, targetKey types.NamespacedName,
-) (ctrl.Result, error) {
+) error {
 	if !controllerutil.ContainsFinalizer(ss, finalizerName) {
-		return ctrl.Result{}, nil
+		return nil
 	}
 
+	// Through the filtered cache (ManagedSecretCacheOptions) an unmanaged
+	// Secret at the target name comes back NotFound here, which lands in the
+	// default branch below: nothing is deleted, exactly as the ownedBy check
+	// would have decided when it could still see the object.
 	var secret corev1.Secret
 	switch err := r.Get(ctx, targetKey, &secret); {
 	case err == nil:
 		if ownedBy(&secret, ss) {
 			if err := r.Delete(ctx, &secret); err != nil && !apierrors.IsNotFound(err) {
-				return ctrl.Result{}, fmt.Errorf("kvsynk8s: delete managed secret %s: %w", targetKey, err)
+				return fmt.Errorf("kvsynk8s: delete managed secret %s: %w", targetKey, err)
 			}
 		}
 		// Else: a Secret exists at this name but this SecretSync never owned
 		// it (conflict loser, or refused pre-existing unmanaged Secret) —
 		// leave it untouched.
 	case !apierrors.IsNotFound(err):
-		return ctrl.Result{}, fmt.Errorf("kvsynk8s: get secret %s: %w", targetKey, err)
+		return fmt.Errorf("kvsynk8s: get secret %s: %w", targetKey, err)
 	}
 
 	controllerutil.RemoveFinalizer(ss, finalizerName)
 	if err := r.Update(ctx, ss); err != nil {
-		return ctrl.Result{}, fmt.Errorf("kvsynk8s: remove finalizer from %s/%s: %w", ss.Namespace, ss.Name, err)
+		return fmt.Errorf("kvsynk8s: remove finalizer from %s/%s: %w", ss.Namespace, ss.Name, err)
 	}
 
-	return ctrl.Result{}, nil
+	return nil
 }
 
 // deleteStaleManagedSecrets deletes every Secret in ss's namespace that this
@@ -531,6 +613,12 @@ func (r *SecretSyncReconciler) SetupWithManager(mgr ctrl.Manager, syncEvents <-c
 	bldr := ctrl.NewControllerManagedBy(mgr).
 		For(&kvsynk8sv1alpha1.SecretSync{}).
 		Owns(&corev1.Secret{}).
+		// FR-008: more than one worker, so one SecretSync stuck in a slow
+		// reconcile (e.g. a Key Vault call working through its retry budget)
+		// cannot delay every other declaration behind it in the queue. Each
+		// reconcile is additionally bounded by reconcileTimeout (see
+		// Reconcile) so a hung call cannot pin a worker forever.
+		WithOptions(ctrlcontroller.Options{MaxConcurrentReconciles: maxConcurrentReconciles}).
 		Named("secretsync")
 
 	if syncEvents != nil {

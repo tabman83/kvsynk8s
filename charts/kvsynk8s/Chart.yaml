@@ -23,8 +23,9 @@ maintainers:
 
 # helm push copies these into the OCI manifest. image.source links the
 # published package to this repository, so it shows up on the repo page and
-# inherits the repository's access permissions. Linking only: a newly
-# published GHCR package is private until it is made public once in its
-# package settings.
+# inherits the repository's public visibility. This is what makes the package
+# come out public on first publish — no manual step in the package settings
+# is needed. Verified on the first dev build; see
+# specs/002-helm-chart/contracts/release-artifacts.md, "Package visibility".
 annotations:
   org.opencontainers.image.source: https://github.com/tabman83/kvsynk8s

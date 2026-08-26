@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -127,6 +128,85 @@ func responseErrorWithBody(statusCode int, body string) *azcore.ResponseError {
 		Body:       io.NopCloser(bytes.NewBufferString(body)),
 	}
 	return &azcore.ResponseError{StatusCode: statusCode, RawResponse: resp}
+}
+
+// responseErrorWithRequest is responseErrorWithBody plus the originating
+// request attached, so respErr.Error() renders the full request URL exactly
+// as the real SDK pipeline does. Used by the poison-name tests below: the
+// URL contains the secret's name, and classification must never read it.
+func responseErrorWithRequest(t *testing.T, statusCode int, body, rawURL string) *azcore.ResponseError {
+	t.Helper()
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		t.Fatalf("parse test url %q: %v", rawURL, err)
+	}
+	respErr := responseErrorWithBody(statusCode, body)
+	respErr.RawResponse.Request = &http.Request{Method: http.MethodGet, URL: u}
+	return respErr
+}
+
+// TestClassifyGetSecretError_DisabledSecretInnerErrorCode locks in the
+// authoritative real-Key-Vault marker for a disabled secret: HTTP 403 with
+// error.innererror.code == "SecretDisabled" in the JSON body. The outer
+// message here deliberately avoids the "not allowed on a disabled" phrase so
+// this test proves the inner code alone is enough.
+func TestClassifyGetSecretError_DisabledSecretInnerErrorCode(t *testing.T) {
+	body := `{"error":{"code":"Forbidden","message":"Access denied.","innererror":{"code":"SecretDisabled"}}}`
+	respErr := responseErrorWithBody(http.StatusForbidden, body)
+
+	got := classifyGetSecretError("my-vault", "my-secret", respErr)
+
+	if !errors.Is(got, ErrSecretDisabled) {
+		t.Fatalf("classifyGetSecretError() = %v, want wrapped %v", got, ErrSecretDisabled)
+	}
+}
+
+// TestClassifyGetSecretError_SecretNameContainingDisabled_NotMisclassified is
+// the regression test for the poison-name bug: classification used to search
+// respErr.Error() -- which includes the full request URL -- for the word
+// "disabled", so a secret literally named "feature-disabled-flag" turned a
+// plain 404 into a bogus SourceDisabled and a plain 403 lost AccessDenied.
+// The 404 body below also echoes the name inside the error *message* (real
+// Key Vault does that too), so this additionally proves the message check is
+// a whole-phrase match, not a bare substring "disabled".
+func TestClassifyGetSecretError_SecretNameContainingDisabled_NotMisclassified(t *testing.T) {
+	const poisonName = "feature-disabled-flag"
+	poisonURL := "https://my-vault.vault.azure.net/secrets/" + poisonName + "?api-version=7.4"
+
+	tests := []struct {
+		name       string
+		statusCode int
+		body       string
+		wantErr    error
+	}{
+		{
+			name:       "plain 404 for a poison-named secret is not found, not disabled",
+			statusCode: http.StatusNotFound,
+			body:       `{"error":{"code":"SecretNotFound","message":"A secret with (name/id) feature-disabled-flag was not found in this key vault."}}`,
+			wantErr:    ErrSecretNotFound,
+		},
+		{
+			name:       "plain 403 for a poison-named secret is access denied, not disabled",
+			statusCode: http.StatusForbidden,
+			body:       `{"error":{"code":"Forbidden","message":"The user, group or application does not have secrets get permission on key vault."}}`,
+			wantErr:    ErrAccessDenied,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			respErr := responseErrorWithRequest(t, tt.statusCode, tt.body, poisonURL)
+
+			got := classifyGetSecretError("my-vault", poisonName, respErr)
+
+			if !errors.Is(got, tt.wantErr) {
+				t.Fatalf("classifyGetSecretError() = %v, want wrapped %v", got, tt.wantErr)
+			}
+			if errors.Is(got, ErrSecretDisabled) {
+				t.Fatalf("classifyGetSecretError() = %v: poison-named secret misclassified as disabled", got)
+			}
+		})
+	}
 }
 
 func TestSecretIsDisabled(t *testing.T) {
