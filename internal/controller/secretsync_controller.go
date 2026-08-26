@@ -202,7 +202,13 @@ func (r *SecretSyncReconciler) recordSyncOutcome(ss *kvsynk8sv1alpha1.SecretSync
 // +kubebuilder:rbac:groups=kvsynk8s.io,resources=secretsyncs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=kvsynk8s.io,resources=secretsyncs/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;delete
-// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+//
+// events.k8s.io, not the core ("") group: the Recorder above comes from
+// mgr.GetEventRecorder, which writes through the events.k8s.io/v1 API, and
+// RBAC authorizes per API group — a core-group events grant does not cover
+// it, so with the old marker every Eventf got 403 Forbidden in a real
+// install (the broadcaster only logs the failure, nothing surfaces it).
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
 // Reconcile drives one SecretSync towards the state data-model.md describes:
 // on deletion, the managed Secret is removed before the finalizer is

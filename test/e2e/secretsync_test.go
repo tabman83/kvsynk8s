@@ -424,6 +424,27 @@ func waitForSecretDataValue(namespace, name, key, want string, timeout time.Dura
 	return time.Since(start)
 }
 
+// waitForSyncedEvent polls until at least one "Synced" Event recorded on the
+// named SecretSync is visible, or fails the spec after timeout. This is a
+// positive assertion on the whole event pipeline: the controller records
+// through the events.k8s.io/v1 API, and kind enforces RBAC, so this fails if
+// the ClusterRole grants the wrong API group (the bug where the grant was on
+// the core group and every Eventf got 403, which the broadcaster only logs).
+// Events written via events.k8s.io/v1 are served by the core v1 events API
+// too (shared storage), so the core field selectors below see them.
+func waitForSyncedEvent(namespace, name string, timeout time.Duration) {
+	Eventually(func(g Gomega) {
+		cmd := exec.Command("kubectl", "get", "events", "-n", namespace,
+			"--field-selector",
+			fmt.Sprintf("involvedObject.kind=SecretSync,involvedObject.name=%s,reason=Synced", name),
+			"-o", "jsonpath={.items[*].reason}")
+		out, err := utils.Run(cmd)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(out).To(ContainSubstring("Synced"),
+			"no Synced event recorded on SecretSync %s/%s", namespace, name)
+	}, timeout, time.Second).Should(Succeed())
+}
+
 // applySecretSync applies a minimal SecretSync manifest via kubectl,
 // matching how quickstart.md and every other declarative resource in this
 // suite is managed.
@@ -911,6 +932,9 @@ func registerSecretSyncEmulatorTests() {
 			state, err := secretSyncStatusField(namespace, secretName, "state")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(state).To(Equal("InSync"))
+
+			By("checking a Synced event was recorded on the SecretSync (T027, FR-009)")
+			waitForSyncedEvent(namespace, secretName, 30*time.Second)
 		})
 
 		It("propagates a secret rotation via the queue within 60s (SC-001, US2)", func() {
@@ -1027,6 +1051,12 @@ func registerSecretSyncEmulatorTests() {
 			statusJSON, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(statusJSON).NotTo(ContainSubstring(sentinel))
+
+			By("waiting for the Synced event on this SecretSync, so the scan below runs against events that exist")
+			// Without this, the absence check is trivially true when zero
+			// events exist (exactly what happened while the RBAC grant was on
+			// the wrong API group and every Eventf silently got 403).
+			waitForSyncedEvent(namespace, secretName, 30*time.Second)
 
 			By("scanning Kubernetes events for the sentinel value")
 			cmd = exec.Command("kubectl", "-n", namespace, "get", "events", "-o", "json")
