@@ -17,7 +17,7 @@ basic problem, but the two differ on two points:
 - **Notification model.** akv2k8s polls Key Vault on an interval. kvsynk8s
   reacts to Key Vault's own change notifications (Event Grid →
   Storage Queue), so a rotation reaches the cluster in under a minute instead
-  of waiting for the next poll. A periodic reconciliation (default every hour)
+  of waiting for the next poll. A periodic reconciliation (default every 4 hours)
   still runs underneath as a safety net for missed notifications, vault-side
   deletions, and in-cluster drift — so the cluster never depends on
   notifications alone to stay correct.

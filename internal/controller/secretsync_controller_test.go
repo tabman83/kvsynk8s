@@ -664,6 +664,102 @@ var _ = Describe("SecretSync Controller", func() {
 			}, 5*time.Second, 50*time.Millisecond).Should(Equal("SENTINEL-fake-value-v2-not-real"))
 		})
 
+		It("rewrites the managed Secret when spec.target.dataKey changes, removing the old key", func() {
+			ctx := context.Background()
+
+			name := "ss-datakey-" + shortUID()
+			vaultName := fakeVaultName
+			vaultSecret := fakeSecretName
+			targetName := "target-" + shortUID()
+			targetKey := types.NamespacedName{Name: targetName, Namespace: namespace}
+			const fakeValue = "SENTINEL-fake-value-datakey-test-not-real"
+
+			reader.set(vaultName, vaultSecret, fakeValue, "v1")
+
+			ss := newTestSecretSync(namespace, name, vaultName, vaultSecret, targetName, "foo")
+			Expect(k8sClient.Create(ctx, ss)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), ss)
+			})
+
+			r := reconcilerFor(reader)
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: namespace}}
+
+			_, err := r.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			var secret corev1.Secret
+			Expect(k8sClient.Get(ctx, targetKey, &secret)).To(Succeed())
+			Expect(string(secret.Data["foo"])).To(Equal(fakeValue))
+
+			// The user edits the spec: same vault secret, new data key. The
+			// vault version has NOT changed, so only the data comparison can
+			// notice that a rewrite is needed.
+			var latest kvsynk8sv1alpha1.SecretSync
+			Expect(k8sClient.Get(ctx, req.NamespacedName, &latest)).To(Succeed())
+			latest.Spec.Target.DataKey = "bar"
+			Expect(k8sClient.Update(ctx, &latest)).To(Succeed())
+
+			_, err = r.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, targetKey, &secret)).To(Succeed())
+			Expect(string(secret.Data["bar"])).To(Equal(fakeValue), "the new data key must carry the value")
+			Expect(secret.Data).NotTo(HaveKey("foo"), "the old data key must be removed")
+
+			var updated kvsynk8sv1alpha1.SecretSync
+			Expect(k8sClient.Get(ctx, req.NamespacedName, &updated)).To(Succeed())
+			Expect(updated.Status.State).To(Equal(kvsynk8sv1alpha1.SecretSyncStateInSync))
+			Expect(updated.Status.ObservedGeneration).To(Equal(updated.Generation))
+		})
+
+		It("restores the vault value when the managed Secret's data is edited in-cluster, via the Owns() watch (US3 AS-2)", func() {
+			ctx := context.Background()
+
+			name := "ss-datadrift-" + shortUID()
+			vaultName := fakeVaultName
+			vaultSecret := fakeSecretName
+			targetName := "target-" + shortUID()
+			dataKey := fakeDataKey
+			targetKey := types.NamespacedName{Name: targetName, Namespace: namespace}
+			const fakeValue = "SENTINEL-fake-value-datadrift-test-not-real"
+
+			mgrReader := newFakeSecretReader()
+			mgrReader.set(vaultName, vaultSecret, fakeValue, "v1")
+
+			ss := newTestSecretSync(namespace, name, vaultName, vaultSecret, targetName, dataKey)
+			Expect(k8sClient.Create(ctx, ss)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), ss)
+			})
+
+			// A long interval: only the Owns() watch, not periodic
+			// reconciliation, should be responsible for the repair below.
+			cancel := startManagerFor(mgrReader, time.Hour)
+			DeferCleanup(cancel)
+
+			var secret corev1.Secret
+			Eventually(func() error {
+				return k8sClient.Get(ctx, targetKey, &secret)
+			}).Should(Succeed())
+
+			// Someone edits the managed Secret's data directly (kubectl edit),
+			// leaving labels and annotations -- including the version
+			// annotation -- intact. Only the data comparison can see this.
+			Expect(k8sClient.Get(ctx, targetKey, &secret)).To(Succeed())
+			secret.Data[dataKey] = []byte("SENTINEL-tampered-value-not-real")
+			Expect(k8sClient.Update(ctx, &secret)).To(Succeed())
+
+			Eventually(func() (string, error) {
+				var got corev1.Secret
+				if err := k8sClient.Get(ctx, targetKey, &got); err != nil {
+					return "", err
+				}
+				return string(got.Data[dataKey]), nil
+			}, 5*time.Second, 50*time.Millisecond).Should(Equal(fakeValue),
+				"the vault value must be restored via the Owns() watch without any manual reconcile")
+		})
+
 		It("retries a transient reader failure via the rate-limited workqueue until InSync (constitution IV)", func() {
 			ctx := context.Background()
 

@@ -6,7 +6,7 @@
 
 ## Summary
 
-A Kubernetes operator, written in Go on controller-runtime, that syncs Azure Key Vault secrets to native Kubernetes Secrets. Operators declare syncs with a namespaced custom resource (`SecretSync`). The primary update path is event-driven: Key Vault publishes `SecretNewVersionCreated` events through Event Grid to an Azure Storage Queue; the operator pulls that queue (outbound-only) and re-fetches the secret value from Key Vault, updating the managed Kubernetes Secret within the 60-second target. A periodic full reconciliation (default 1 hour) is the safety net for missed events, vault-side deletions, and in-cluster drift. All Azure access uses Microsoft Entra Workload ID; no inbound endpoint, no static credentials.
+A Kubernetes operator, written in Go on controller-runtime, that syncs Azure Key Vault secrets to native Kubernetes Secrets. Operators declare syncs with a namespaced custom resource (`SecretSync`). The primary update path is event-driven: Key Vault publishes `SecretNewVersionCreated` events through Event Grid to an Azure Storage Queue; the operator pulls that queue (outbound-only) and re-fetches the secret value from Key Vault, updating the managed Kubernetes Secret within the 60-second target. A periodic full reconciliation (default 4 hours) is the safety net for missed events, vault-side deletions, and in-cluster drift. All Azure access uses Microsoft Entra Workload ID; no inbound endpoint, no static credentials.
 
 ## Technical Context
 
@@ -38,7 +38,7 @@ A Kubernetes operator, written in Go on controller-runtime, that syncs Azure Key
 | Principle | Gate | Status |
 |-----------|------|--------|
 | I. Secrets are never exposed | Design has a single code path that serializes a value (the Secret writer); logs/status/events carry vault+name+version only; tests plant sentinel values and scan all output (SC-004) | PASS |
-| II. Reliability of sync | Event path + 1 h reconciliation guarantees convergence; per-secret retry with exponential backoff; per-declaration status (InSync/Pending/Failing) on the CR status subresource | PASS |
+| II. Reliability of sync | Event path + 4 h reconciliation guarantees convergence; per-secret retry with exponential backoff; per-declaration status (InSync/Pending/Failing) on the CR status subresource | PASS |
 | III. Simplicity first | One CRD, one controller, one project; Storage Queue (not Service Bus); no webhook server, no leader election, no Helm chart in v1 (plain manifests); no admission webhooks | PASS |
 | IV. Tested changes | Sync engine, event parsing, backoff, ownership rules, and redaction covered by unit tests; reconciler behavior covered by envtest against a real API server — all failing without the change | PASS |
 | V. Least-privilege access | Azure: "Key Vault Secrets User" on the vault + "Storage Queue Data Message Processor" on the queue only. K8s: RBAC for `secretsyncs` (all verbs + status) and `secrets` (get/list/watch/create/update/delete) only, plus events | PASS |
@@ -74,7 +74,7 @@ api/
 
 internal/
 ├── controller/
-│   ├── secretsync_controller.go     # reconcile loop, finalizer, periodic requeue (1 h default)
+│   ├── secretsync_controller.go     # reconcile loop, finalizer, periodic requeue (4 h default)
 │   └── secretsync_controller_test.go  # envtest: reconcile, finalizer, ownership rules
 ├── events/
 │   ├── listener.go                  # goroutine: pull queue (adaptive delay), feed reconciler via source.Channel

@@ -52,7 +52,10 @@ crds.{install,keep}        bool     true / true
   edge case) — no required value may be defaulted to a placeholder.
 - `azure.clientID` set ⇒ all three WI markers render together (arg, pod
   label, SA annotation); unset ⇒ none of them render (FR-011).
-- `image.tag` empty ⇒ `.Chart.AppVersion` is used (FR-008).
+- `image.tag` empty ⇒ `v` + `.Chart.AppVersion` is used (FR-008) — the `v`
+  prefix is required because the image is pushed as `:vX.Y.Z`; see
+  [contracts/values.md](contracts/values.md) and
+  [contracts/release-artifacts.md](contracts/release-artifacts.md).
 - No `replicas` field exists; the Deployment hardcodes `replicas: 1` (FR-009).
 
 ## Entity: CRD lifecycle settings
