@@ -213,24 +213,7 @@ func TestSync_SkipsWriteWhenVersionAndDataMatch_Idempotent(t *testing.T) {
 	owner := newOwner("my-sync", "default", "my-vault", "my-app-password")
 
 	const storedValue = "already-stored-value"
-	existing := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      owner.Name,
-			Namespace: owner.Namespace,
-			Labels: map[string]string{
-				LabelManagedBy: LabelManagedByValue,
-			},
-			Annotations: map[string]string{
-				AnnotationVault:   owner.Spec.Vault.Name,
-				AnnotationSecret:  owner.Spec.Vault.Secret,
-				AnnotationVersion: "v3",
-			},
-		},
-		Type: corev1.SecretTypeOpaque,
-		Data: map[string][]byte{
-			owner.Spec.Vault.Secret: []byte(storedValue),
-		},
-	}
+	existing := existingSyncedSecret(owner, "v3", storedValue)
 
 	// Reader reports the SAME version and the SAME value the Secret already
 	// carries: nothing to repair, so the skip path must return the existing
@@ -282,6 +265,13 @@ func TestSync_RewritesWhenDataKeyChanges_RemovesStaleKey(t *testing.T) {
 				AnnotationSecret:  owner.Spec.Vault.Secret,
 				AnnotationVersion: "v3",
 			},
+			// The controller ownerReference a prior successful sync always
+			// leaves behind. Without it `managed` is false and the
+			// idempotency gate short-circuits before comparing the data,
+			// which would make this test pass no matter what
+			// managedSecretDataMatches returns — the exact comparison it
+			// exists to protect.
+			OwnerReferences: []metav1.OwnerReference{controllerOwnerReference(owner)},
 		},
 		Type: corev1.SecretTypeOpaque,
 		// Written under the previous spec's dataKey "foo".
@@ -397,6 +387,133 @@ func TestSync_RefusesUnmanagedExistingSecret_TargetConflict(t *testing.T) {
 	}
 }
 
+// TestSync_ManagedSecretOwnedByAnotherSecretSync_TargetConflict covers the
+// ownership half of FR-012 at the engine level: a Secret that carries the
+// managed-by label but whose controller ownerReference points at a DIFFERENT
+// SecretSync. The reader is set up to return exactly the version and value
+// the Secret already holds — the configuration that used to sail through the
+// idempotent InSync skip on the label alone, letting a conflict loser report
+// InSync over a Secret it does not own. Sync must instead classify it as
+// Failing/TargetConflict (matching the writer's AlreadyOwnedError mapping)
+// and leave the Secret untouched.
+func TestSync_ManagedSecretOwnedByAnotherSecretSync_TargetConflict(t *testing.T) {
+	owner := newOwner("my-sync", "default", "my-vault", "my-app-password")
+	otherOwner := newOwner("other-sync", "default", "my-vault", "my-app-password")
+
+	const storedValue = "value-owned-by-the-other-secretsync"
+	existing := existingSyncedSecret(owner, "v3", storedValue)
+	// Same name, same label, same annotations — but the controller owner is
+	// the OTHER SecretSync.
+	existing.OwnerReferences = []metav1.OwnerReference{controllerOwnerReference(otherOwner)}
+
+	// Matching version AND matching data: without the ownership check this is
+	// precisely the idempotent-skip configuration.
+	reader := &fakeSecretReader{value: storedValue, version: "v3"}
+	e := &Engine{Reader: reader}
+
+	status, secret, err := e.Sync(context.Background(), owner, existing)
+	if err != nil {
+		t.Fatalf("Sync() error = %v, want nil", err)
+	}
+
+	if status.State != kvsynk8sv1alpha1.SecretSyncStateFailing {
+		t.Errorf("status.State = %q, want %q", status.State, kvsynk8sv1alpha1.SecretSyncStateFailing)
+	}
+	if status.Reason != ReasonTargetConflict {
+		t.Errorf("status.Reason = %q, want %q", status.Reason, ReasonTargetConflict)
+	}
+	if status.SyncedVersion != "" {
+		t.Errorf("status.SyncedVersion = %q, want empty: a conflict loser never synced anything", status.SyncedVersion)
+	}
+	if strings.Contains(status.Message, storedValue) {
+		t.Fatalf("secret value leaked into status.Message: %q", status.Message)
+	}
+
+	if secret != existing {
+		t.Fatalf("Sync() must leave another SecretSync's Secret completely untouched (same pointer)")
+	}
+	if len(secret.OwnerReferences) != 1 || secret.OwnerReferences[0].UID != otherOwner.UID {
+		t.Fatalf("the other SecretSync's ownerReference was modified: %+v", secret.OwnerReferences)
+	}
+	if string(secret.Data[owner.Spec.Vault.Secret]) != storedValue {
+		t.Fatalf("the other SecretSync's Secret data was modified: %q", secret.Data[owner.Spec.Vault.Secret])
+	}
+}
+
+// TestSync_LabeledOwnerlessSecret_TakesWritePathNotSkip locks in the deliberate
+// middle ground: a Secret with the managed-by label but NO controller
+// ownerReference at all is not a conflict (the writer adopts it on the write
+// path, as it always has), but it must never take the no-write InSync skip
+// either — the engine cannot prove this SecretSync owns it, so it must be
+// re-written, which (re)stamps this owner's controller reference.
+func TestSync_LabeledOwnerlessSecret_TakesWritePathNotSkip(t *testing.T) {
+	owner := newOwner("my-sync", "default", "my-vault", "my-app-password")
+
+	const storedValue = "labeled-but-ownerless-value"
+	existing := existingSyncedSecret(owner, "v3", storedValue)
+	existing.OwnerReferences = nil
+
+	// Matching version and data: only the missing ownerReference distinguishes
+	// this from a legitimate idempotent skip.
+	reader := &fakeSecretReader{value: storedValue, version: "v3"}
+	e := &Engine{Reader: reader}
+
+	status, secret, err := e.Sync(context.Background(), owner, existing)
+	if err != nil {
+		t.Fatalf("Sync() error = %v, want nil", err)
+	}
+
+	if status.State != kvsynk8sv1alpha1.SecretSyncStateInSync {
+		t.Errorf("status.State = %q, want %q", status.State, kvsynk8sv1alpha1.SecretSyncStateInSync)
+	}
+	if secret == nil {
+		t.Fatal("secret = nil, want a rewritten Secret")
+	}
+	if len(secret.OwnerReferences) != 1 || secret.OwnerReferences[0].UID != owner.UID {
+		t.Fatalf("the write path must stamp this owner's controller reference, got %+v", secret.OwnerReferences)
+	}
+}
+
+func TestControllerOwnedBy(t *testing.T) {
+	owner := newOwner("my-sync", "default", "my-vault", "my-app-password")
+	otherOwner := newOwner("other-sync", "default", "my-vault", "my-app-password")
+	isController := true
+	notController := false
+
+	tests := []struct {
+		name string
+		refs []metav1.OwnerReference
+		want bool
+	}{
+		{"no owner references", nil, false},
+		{"controller reference to this owner", []metav1.OwnerReference{controllerOwnerReference(owner)}, true},
+		{"controller reference to another owner", []metav1.OwnerReference{controllerOwnerReference(otherOwner)}, false},
+		{"non-controller reference to this owner", []metav1.OwnerReference{{
+			APIVersion: kvsynk8sv1alpha1.GroupVersion.String(), Kind: secretSyncKind,
+			Name: owner.Name, UID: owner.UID, Controller: &notController,
+		}}, false},
+		{"controller is other, this owner only non-controller", []metav1.OwnerReference{
+			{
+				APIVersion: kvsynk8sv1alpha1.GroupVersion.String(), Kind: secretSyncKind,
+				Name: owner.Name, UID: owner.UID, Controller: &notController,
+			},
+			{
+				APIVersion: kvsynk8sv1alpha1.GroupVersion.String(), Kind: secretSyncKind,
+				Name: otherOwner.Name, UID: otherOwner.UID, Controller: &isController,
+			},
+		}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{OwnerReferences: tt.refs}}
+			if got := ControllerOwnedBy(secret, owner); got != tt.want {
+				t.Fatalf("ControllerOwnedBy() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestSync_ReaderNotFound_FailingSecretNotFound_NoValueAnywhere(t *testing.T) {
 	owner := newOwner("my-sync", "default", "my-vault", "does-not-exist")
 
@@ -443,8 +560,9 @@ func TestSync_ReaderNotFound_FailingSecretNotFound_NoValueAnywhere(t *testing.T)
 // workloads are already reading from.
 
 // existingSyncedSecret builds a managed Secret that looks like the result of
-// a prior successful Sync for owner at the given version/value, for use as
-// the `existing` argument in the SourceDeleted/SourceDisabled tests below.
+// a prior successful Sync for owner at the given version/value — including
+// the controller OwnerReference the writer always sets, which is what the
+// engine's ownership check (and the `managed` classification) requires.
 func existingSyncedSecret(owner *kvsynk8sv1alpha1.SecretSync, version, value string) *corev1.Secret {
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -458,6 +576,7 @@ func existingSyncedSecret(owner *kvsynk8sv1alpha1.SecretSync, version, value str
 				AnnotationSecret:  owner.Spec.Vault.Secret,
 				AnnotationVersion: version,
 			},
+			OwnerReferences: []metav1.OwnerReference{controllerOwnerReference(owner)},
 		},
 		Type: corev1.SecretTypeOpaque,
 		Data: map[string][]byte{

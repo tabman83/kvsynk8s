@@ -135,6 +135,16 @@ type SecretSyncReconciler struct {
 	// hour; production leaves it at the flag's own default.
 	ReconcileInterval time.Duration
 
+	// APIReader is an uncached client.Reader (mgr.GetAPIReader()), handed to
+	// SecretWriter so its AlreadyExists recovery can re-read the target
+	// Secret straight from the API server instead of through the possibly
+	// stale informer cache (a queue-triggered reconcile can race the informer
+	// on the operator's own just-created Secret). SetupWithManager wires it
+	// when left nil, like Recorder; a hand-built reconciler without it makes
+	// the writer fall back to its cached Client, which is what the direct
+	// (uncached) test clients already are.
+	APIReader client.Reader
+
 	// Recorder emits Kubernetes Events on the SecretSync (T027, FR-009):
 	// "Synced" (Normal) on every reconcile that ends InSync, "SyncFailed"
 	// (Warning) on every reconcile that ends Failing. SetupWithManager wires
@@ -298,13 +308,19 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	// Captured before Sync runs: Sync mutates `existing` in place on its
 	// write path (it is the same *corev1.Secret returned as `desired`), so
-	// this is the only chance to see the pre-sync annotation and data for
-	// the idempotency comparison below.
+	// this is the only chance to see the pre-sync annotation, data and
+	// ownerReferences for the idempotency comparison below. priorOwned in
+	// particular MUST be read here: Sync's write path stamps the controller
+	// ownerReference onto `existing` in memory, so after Sync returns there is
+	// no way left to tell an already-owned Secret from one this reconcile is
+	// about to adopt.
 	var priorVersion string
 	var priorData map[string][]byte
+	var priorOwned bool
 	if existing != nil {
 		priorVersion = existing.Annotations[sync.AnnotationVersion]
 		priorData = existing.DeepCopy().Data
+		priorOwned = ownedBy(existing, &ss)
 	}
 
 	engine := sync.Engine{Reader: r.Reader}
@@ -332,23 +348,39 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 
 		// Idempotency (FR-005, data-model.md): only write when the Secret is
-		// new, the synced version changed, or the Secret's pre-sync data does
-		// not match what the engine computed — a changed spec.target.dataKey,
-		// or in-cluster drift on the managed Secret's data (US3 AS-2, FR-007),
-		// both of which leave the version annotation intact. Without this
-		// check an Update would fire on every reconcile even when nothing
-		// changed, which — combined with Owns(&corev1.Secret{}) below — would
-		// retrigger a reconcile for its own no-op write and loop forever;
-		// comparing against the pre-sync snapshot keeps the no-op case
-		// write-free while still repairing real differences.
-		if existing == nil || priorVersion != status.SyncedVersion ||
+		// new, this SecretSync does not own it yet, the synced version
+		// changed, or the Secret's pre-sync data does not match what the
+		// engine computed — a changed spec.target.dataKey, or in-cluster drift
+		// on the managed Secret's data (US3 AS-2, FR-007), both of which leave
+		// the version annotation intact. Without this check an Update would
+		// fire on every reconcile even when nothing changed, which — combined
+		// with Owns(&corev1.Secret{}) below — would retrigger a reconcile for
+		// its own no-op write and loop forever; comparing against the pre-sync
+		// snapshot keeps the no-op case write-free while still repairing real
+		// differences.
+		//
+		// !priorOwned is what makes this gate agree with the engine's own
+		// ownership rule (FR-012). A Secret carrying the managed-by label but
+		// no controller ownerReference — left behind by `kubectl delete
+		// secretsync --cascade=orphan`, restored by a backup/GitOps tool that
+		// drops ownerReferences, or applied by hand — is not a conflict: the
+		// writer adopts it. But adoption is a WRITE, and if version and data
+		// happen to match already, the three checks above would all be false
+		// and the ownerReference the engine stamped in memory would never
+		// reach the API server. The CR would then report InSync over a Secret
+		// nothing links back to it: Owns(&corev1.Secret{}) could not map
+		// in-cluster edits of that Secret to any reconcile, and deleting the
+		// CR would leave the Secret behind (reconcileDelete requires
+		// ownership). Requiring ownership here forces exactly one adopting
+		// write; the next reconcile sees priorOwned and goes quiet again.
+		if existing == nil || !priorOwned || priorVersion != status.SyncedVersion ||
 			!maps.EqualFunc(priorData, desired.Data, bytes.Equal) {
 			// The actual Kubernetes write goes exclusively through
 			// SecretWriter (constitution I: one value-carrying code path),
 			// not r.Create/r.Update directly. value/version are read back off
 			// `desired` — the Secret engine.Sync already built — rather than
 			// issuing a second vault read.
-			writer := sync.SecretWriter{Client: r.Client}
+			writer := sync.SecretWriter{Client: r.Client, Reader: r.APIReader}
 			value := string(desired.Data[dataKey])
 			writeErr := writer.CreateOrUpdate(ctx, &ss, targetKey.Namespace, targetKey.Name, dataKey, value, status.SyncedVersion)
 			if writeErr != nil {
@@ -499,14 +531,11 @@ func (r *SecretSyncReconciler) deleteStaleManagedSecrets(
 
 // ownedBy reports whether secret carries a controller OwnerReference back to
 // ss, i.e. whether ss is the SecretSync that actually created/claimed it —
-// as opposed to merely sharing its target name (FR-012).
+// as opposed to merely sharing its target name (FR-012). It delegates to
+// sync.ControllerOwnedBy, the single ownership predicate the engine and the
+// writer also use, so the controller can never disagree with them.
 func ownedBy(secret *corev1.Secret, ss *kvsynk8sv1alpha1.SecretSync) bool {
-	for _, ref := range secret.OwnerReferences {
-		if ref.UID == ss.UID && ref.Controller != nil && *ref.Controller {
-			return true
-		}
-	}
-	return false
+	return sync.ControllerOwnedBy(secret, ss)
 }
 
 // resolveTargetName applies the data-model.md default for
@@ -608,6 +637,9 @@ func takesPrecedence(a, b *kvsynk8sv1alpha1.SecretSync) bool {
 func (r *SecretSyncReconciler) SetupWithManager(mgr ctrl.Manager, syncEvents <-chan event.GenericEvent) error {
 	if r.Recorder == nil {
 		r.Recorder = mgr.GetEventRecorder("kvsynk8s")
+	}
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
 	}
 
 	bldr := ctrl.NewControllerManagedBy(mgr).
