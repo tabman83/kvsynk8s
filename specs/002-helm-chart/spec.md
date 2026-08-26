@@ -46,7 +46,7 @@ A cluster operator tailors the installation at install/upgrade time through char
 
 1. **Given** the chart, **When** the user sets values for queue URL, reconcile interval, or Azure client ID, **Then** the rendered operator Deployment passes those settings to the operator process, and omitting them yields the same defaults the operator has today (no queue, 4h interval).
 2. **Given** the chart, **When** the user sets an Azure client ID for workload identity, **Then** the rendered pod carries the `azure.workload.identity/use: "true"` label and the ServiceAccount carries the `azure.workload.identity/client-id` annotation.
-3. **Given** the chart, **When** the user overrides image repository/tag/pullPolicy, resources, nodeSelector, tolerations, or affinity, **Then** the rendered Deployment reflects each override, and the image tag defaults to the chart's app version when not set.
+3. **Given** the chart, **When** the user overrides image repository/tag/pullPolicy, resources, nodeSelector, tolerations, or affinity, **Then** the rendered Deployment reflects each override, and the image tag defaults to `v` + the chart's app version when not set (FR-008).
 4. **Given** the chart, **When** the user enables or disables metrics, ServiceMonitor, or NetworkPolicy toggles, **Then** the corresponding resources appear or disappear from the rendered output, matching what the existing kustomize overlays offer.
 5. **Given** the values documentation, **When** a user reads the ServiceAccount and namespace settings, **Then** they find an explicit warning that renaming either breaks the Entra federated credential binding.
 

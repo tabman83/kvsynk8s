@@ -102,8 +102,8 @@ CI equivalent: the `helm.yml` workflow fails any PR where
 ```bash
 kind create cluster --name helm-quickstart
 
-# The chart's default image tag is the appVersion, which is the 0.0.0 dev
-# placeholder in git, so build and load a local image for this run.
+# The chart's default image tag is "v" + the appVersion, which is the v0.0.0
+# dev placeholder in git, so build and load a local image for this run.
 make docker-build IMG=kvsynk8s:helm-test
 kind load docker-image kvsynk8s:helm-test --name helm-quickstart
 

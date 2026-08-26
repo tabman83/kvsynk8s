@@ -30,8 +30,10 @@ az eventgrid event-subscription create \
   --endpoint $(az storage account show -n $SA -g $RG --query id -o tsv)/queueservices/default/queues/$QUEUE \
   --included-event-types Microsoft.KeyVault.SecretNewVersionCreated
 
-# Identity for the operator + federation with its ServiceAccount
+# Identity for the operator + federation with its ServiceAccount.
+# CLIENT_ID is needed again in step 2 to annotate the ServiceAccount.
 az identity create -n kvsynk8s-operator -g $RG
+CLIENT_ID=$(az identity show -n kvsynk8s-operator -g $RG --query clientId -o tsv)
 ISSUER=$(az aks show -n $AKS -g $RG --query oidcIssuerProfile.issuerUrl -o tsv)
 az identity federated-credential create -n kvsynk8s -g $RG \
   --identity-name kvsynk8s-operator \
@@ -48,11 +50,25 @@ az role assignment create --assignee $PRINCIPAL --role "Storage Queue Data Messa
 ## 2. Install the operator
 
 ```bash
-# kubebuilder-generated kustomize tree: CRD, RBAC, and the manager Deployment
-# (carries the workload-identity label/annotation and the queue URL +
-# client-id configuration)
+# kubebuilder-generated kustomize tree: CRD, RBAC, and the manager Deployment.
+# It carries the workload-identity pod label, but NOT the client ID or the
+# queue URL: the ServiceAccount ships a "<SET-ME>" placeholder annotation and
+# the manager has no queue configured. The two commands after the apply fill
+# both in — without them workload identity cannot authenticate and the
+# near-realtime path (V2) never activates.
 kubectl apply -k config/default
-kubectl -n kvsynk8s rollout status deploy/kvsynk8s-operator
+
+# (a) point Microsoft Entra Workload ID at the managed identity from step 1
+kubectl -n $NS annotate serviceaccount $SA_K8S \
+  azure.workload.identity/client-id=$CLIENT_ID --overwrite
+
+# (b) hand the manager the queue URL so the listener starts.
+# This changes the pod template, so it also rolls the Deployment and the new
+# pod picks up the annotation from (a) at the same time.
+kubectl -n $NS set env deploy/kvsynk8s-operator \
+  QUEUE_URL="https://$SA.queue.core.windows.net/$QUEUE"
+
+kubectl -n $NS rollout status deploy/kvsynk8s-operator
 ```
 
 ## 3. Validation scenarios

@@ -146,7 +146,7 @@ flags and the kustomize defaults. Omitted values reproduce today's behavior.
 | `operator.reconcileInterval` | `""` | `--reconcile-interval=...` arg only when set (unset = operator's built-in 4h) |
 | `azure.clientID` | `""` | when set: `--azure-client-id` arg **and** pod label `azure.workload.identity/use: "true"` **and** SA annotation `azure.workload.identity/client-id` (FR-011) |
 | `image.repository` | `ghcr.io/tabman83/kvsynk8s` | container image |
-| `image.tag` | `""` → `.Chart.AppVersion` | image tag |
+| `image.tag` | `""` → `v` + `.Chart.AppVersion` | image tag (the image is pushed with the `v` prefix, FR-008) |
 | `image.pullPolicy` | `IfNotPresent` | container pullPolicy |
 | `serviceAccount.name` | `""` → `<prefix>-controller-manager` | SA name (values.yaml carries the federated-credential warning, FR-012) |
 | `resources` | requests 10m/32Mi, limits 200m/128Mi | container resources (today's manager.yaml values) |
