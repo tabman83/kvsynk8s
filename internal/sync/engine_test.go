@@ -46,13 +46,15 @@
 //     Secret per the shape above and status {State: InSync, SyncedVersion:
 //     <version>, ObservedGeneration: owner.Generation}.
 //
-//  2. Existing Secret already carries LabelManagedBy and its
+//  2. Existing Secret already carries LabelManagedBy, its
 //     Annotations[AnnotationVersion] already equals the latest Key Vault
-//     version -> idempotent skip (FR-005): Sync returns the SAME *corev1.Secret
-//     pointer unchanged (no write needed) and status State: InSync. This must
-//     hold even if Reader's value differs from what's already stored — the
-//     skip decision is made on the version annotation alone, never by
-//     re-comparing values.
+//     version, AND its data is exactly the desired shape (the single resolved
+//     dataKey holding the fetched value) -> idempotent skip (FR-005): Sync
+//     returns the SAME *corev1.Secret pointer unchanged (no write needed) and
+//     status State: InSync. A matching version annotation alone is NOT
+//     enough: a changed spec.target.dataKey, or in-cluster drift of the
+//     managed Secret's data, must be repaired on the next reconcile even
+//     though the annotation still matches (US3 drift repair, FR-007).
 //
 //  3. Existing Secret does NOT carry LabelManagedBy (pre-existing, unmanaged
 //     resource) -> Sync MUST NOT touch it (FR-012): returns the existing
@@ -190,7 +192,7 @@ func TestSync_CreatesSecretWithLabelsAnnotationsOwnerReference_WhenNoneExists(t 
 		t.Fatalf("len(secret.OwnerReferences) = %d, want 1", len(secret.OwnerReferences))
 	}
 	ownerRef := secret.OwnerReferences[0]
-	if ownerRef.Kind != "SecretSync" || ownerRef.Name != owner.Name || ownerRef.UID != owner.UID {
+	if ownerRef.Kind != secretSyncKind || ownerRef.Name != owner.Name || ownerRef.UID != owner.UID {
 		t.Errorf("ownerRef = %+v, want Kind=SecretSync Name=%q UID=%q", ownerRef, owner.Name, owner.UID)
 	}
 	if ownerRef.Controller == nil || !*ownerRef.Controller {
@@ -207,9 +209,10 @@ func TestSync_CreatesSecretWithLabelsAnnotationsOwnerReference_WhenNoneExists(t 
 	}
 }
 
-func TestSync_SkipsWriteWhenVersionAnnotationMatches_Idempotent(t *testing.T) {
+func TestSync_SkipsWriteWhenVersionAndDataMatch_Idempotent(t *testing.T) {
 	owner := newOwner("my-sync", "default", "my-vault", "my-app-password")
 
+	const storedValue = "already-stored-value"
 	existing := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      owner.Name,
@@ -225,14 +228,14 @@ func TestSync_SkipsWriteWhenVersionAnnotationMatches_Idempotent(t *testing.T) {
 		},
 		Type: corev1.SecretTypeOpaque,
 		Data: map[string][]byte{
-			owner.Spec.Vault.Secret: []byte("already-stored-value"),
+			owner.Spec.Vault.Secret: []byte(storedValue),
 		},
 	}
 
-	// Reader reports the SAME version but a DIFFERENT value: the skip
-	// decision must be made on the version annotation alone, never by
-	// comparing values (which would require reading them unnecessarily).
-	reader := &fakeSecretReader{value: "a-different-value-should-not-be-written", version: "v3"}
+	// Reader reports the SAME version and the SAME value the Secret already
+	// carries: nothing to repair, so the skip path must return the existing
+	// pointer completely untouched.
+	reader := &fakeSecretReader{value: storedValue, version: "v3"}
 	e := &Engine{Reader: reader}
 
 	status, secret, err := e.Sync(context.Background(), owner, existing)
@@ -250,8 +253,103 @@ func TestSync_SkipsWriteWhenVersionAnnotationMatches_Idempotent(t *testing.T) {
 	if secret != existing {
 		t.Fatalf("Sync() returned a different *Secret on an idempotent skip; want the same existing pointer, unwritten")
 	}
-	if string(secret.Data[owner.Spec.Vault.Secret]) != "already-stored-value" {
+	if string(secret.Data[owner.Spec.Vault.Secret]) != storedValue {
 		t.Fatalf("existing Secret data was modified on an idempotent skip: %q", secret.Data[owner.Spec.Vault.Secret])
+	}
+}
+
+// TestSync_RewritesWhenDataKeyChanges_RemovesStaleKey covers a spec edit that
+// the version annotation cannot see: the user changes spec.target.dataKey
+// (here foo -> bar) while the vault secret itself is unchanged. Sync must
+// rewrite the Secret so that the new key carries the value and the old key is
+// gone, and report InSync with the new generation observed (FR-007; the old
+// version-only idempotency gate skipped this forever).
+func TestSync_RewritesWhenDataKeyChanges_RemovesStaleKey(t *testing.T) {
+	owner := newOwner("my-sync", "default", "my-vault", "my-app-password")
+	owner.Spec.Target.DataKey = "bar"
+	owner.Generation = 2
+
+	const value = "same-vault-value"
+	existing := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      owner.Name,
+			Namespace: owner.Namespace,
+			Labels: map[string]string{
+				LabelManagedBy: LabelManagedByValue,
+			},
+			Annotations: map[string]string{
+				AnnotationVault:   owner.Spec.Vault.Name,
+				AnnotationSecret:  owner.Spec.Vault.Secret,
+				AnnotationVersion: "v3",
+			},
+		},
+		Type: corev1.SecretTypeOpaque,
+		// Written under the previous spec's dataKey "foo".
+		Data: map[string][]byte{"foo": []byte(value)},
+	}
+
+	// Same version, same value: only the desired data key changed.
+	reader := &fakeSecretReader{value: value, version: "v3"}
+	e := &Engine{Reader: reader}
+
+	status, secret, err := e.Sync(context.Background(), owner, existing)
+	if err != nil {
+		t.Fatalf("Sync() error = %v, want nil", err)
+	}
+
+	if status.State != kvsynk8sv1alpha1.SecretSyncStateInSync {
+		t.Errorf("status.State = %q, want %q", status.State, kvsynk8sv1alpha1.SecretSyncStateInSync)
+	}
+	if status.ObservedGeneration != 2 {
+		t.Errorf("status.ObservedGeneration = %d, want 2", status.ObservedGeneration)
+	}
+
+	if secret == nil {
+		t.Fatal("secret = nil, want a rewritten Secret")
+	}
+	if string(secret.Data["bar"]) != value {
+		t.Errorf("secret.Data[%q] = %q, want %q", "bar", secret.Data["bar"], value)
+	}
+	if _, ok := secret.Data["foo"]; ok {
+		t.Errorf("stale data key %q must be removed on rewrite, still present: %v", "foo", secret.Data)
+	}
+	if len(secret.Data) != 1 {
+		t.Errorf("len(secret.Data) = %d, want exactly 1 key", len(secret.Data))
+	}
+}
+
+// TestSync_RewritesWhenManagedSecretDataDrifted covers US3 AS-2 at the engine
+// level: someone edits the managed Secret's data in-cluster (kubectl edit),
+// leaving labels and annotations intact. The version annotation still matches
+// the vault, so the old version-only idempotency gate declared it InSync and
+// the drift was never repaired; Sync must now detect the mismatch and rewrite
+// the vault value.
+func TestSync_RewritesWhenManagedSecretDataDrifted(t *testing.T) {
+	owner := newOwner("my-sync", "default", "my-vault", "my-app-password")
+
+	const vaultValue = "the-real-vault-value"
+	existing := existingSyncedSecret(owner, "v3", "tampered-in-cluster-value")
+
+	reader := &fakeSecretReader{value: vaultValue, version: "v3"}
+	e := &Engine{Reader: reader}
+
+	status, secret, err := e.Sync(context.Background(), owner, existing)
+	if err != nil {
+		t.Fatalf("Sync() error = %v, want nil", err)
+	}
+
+	if status.State != kvsynk8sv1alpha1.SecretSyncStateInSync {
+		t.Errorf("status.State = %q, want %q", status.State, kvsynk8sv1alpha1.SecretSyncStateInSync)
+	}
+	if status.SyncedVersion != "v3" {
+		t.Errorf("status.SyncedVersion = %q, want %q", status.SyncedVersion, "v3")
+	}
+
+	if secret == nil {
+		t.Fatal("secret = nil, want a rewritten Secret")
+	}
+	if got := string(secret.Data[owner.Spec.Vault.Secret]); got != vaultValue {
+		t.Errorf("secret.Data[%q] = %q, want the vault value %q restored", owner.Spec.Vault.Secret, got, vaultValue)
 	}
 }
 

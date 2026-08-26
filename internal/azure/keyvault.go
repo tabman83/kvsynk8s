@@ -8,6 +8,7 @@ package azure
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"sync"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	azruntime "github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azsecrets"
 )
@@ -193,11 +195,11 @@ func classifyGetSecretError(vaultName, secretName string, err error) error {
 		// via secretIsDisabled below, for callers that reach it some other
 		// way). The refusal is observed as a 403 on real Key Vault and as a
 		// 404 against the Lowkey Vault emulator (T030) -- neither status
-		// code alone is a reliable signal, so this checks the server's own
-		// wording instead of guessing from the status code. Nothing here
-		// echoes that wording into the error this function returns
-		// (constitution I): it is only ever used to pick which fixed
-		// sentinel applies.
+		// code alone is a reliable signal, so this checks the structured
+		// error fields in the response body instead of guessing from the
+		// status code. Nothing from that body is ever echoed into the error
+		// this function returns (constitution I): it is only ever used to
+		// pick which fixed sentinel applies.
 		if isDisabledSecretResponse(respErr) {
 			return fmt.Errorf("vault %q secret %q: %w", vaultName, secretName, ErrSecretDisabled)
 		}
@@ -220,11 +222,50 @@ func classifyGetSecretError(vaultName, secretName string, err error) error {
 	return fmt.Errorf("vault %q secret %q: %w", vaultName, secretName, ErrTransient)
 }
 
+// keyVaultErrorBody is the JSON error shape Key Vault (and Key-Vault-
+// compatible emulators) return on a failed request:
+// {"error":{"code":...,"message":...,"innererror":{"code":...}}}. Only the
+// fields classification needs are decoded.
+type keyVaultErrorBody struct {
+	Error struct {
+		Code       string `json:"code"`
+		Message    string `json:"message"`
+		InnerError struct {
+			Code string `json:"code"`
+		} `json:"innererror"`
+	} `json:"error"`
+}
+
 // isDisabledSecretResponse reports whether respErr represents Key Vault
 // refusing a get because the secret (or the specific version requested) is
-// disabled. respErr.Error() renders the cached response body -- read only
-// to classify the failure, never forwarded into this package's own error
-// text.
+// disabled. It inspects the structured error fields of the cached response
+// body -- deliberately NOT respErr.Error(), whose rendering includes the full
+// request URL: a secret whose *name* happens to contain the word "disabled"
+// (e.g. "feature-disabled-flag") would otherwise turn a plain 404 into a
+// bogus SourceDisabled, and a plain 403 would lose AccessDenied.
+//
+// Real Key Vault marks the condition authoritatively with the inner error
+// code "SecretDisabled" (on its HTTP 403 refusal). The Lowkey Vault emulator
+// (T030) answers 404 with no inner code, so the fixed phrase of the
+// disabled-refusal message ("... is not allowed on a disabled ...") is
+// accepted as a fallback marker -- the whole phrase, never the bare word
+// "disabled", so a secret name echoed inside an unrelated error message
+// cannot trigger it. The body is read only to classify the failure, never
+// forwarded into this package's own error text (constitution I).
 func isDisabledSecretResponse(respErr *azcore.ResponseError) bool {
-	return strings.Contains(strings.ToLower(respErr.Error()), "disabled")
+	if respErr.RawResponse == nil {
+		return false
+	}
+	body, err := azruntime.Payload(respErr.RawResponse)
+	if err != nil || len(body) == 0 {
+		return false
+	}
+	var kvErr keyVaultErrorBody
+	if json.Unmarshal(body, &kvErr) != nil {
+		return false
+	}
+	if kvErr.Error.InnerError.Code == "SecretDisabled" {
+		return true
+	}
+	return strings.Contains(strings.ToLower(kvErr.Error.Message), "not allowed on a disabled")
 }
