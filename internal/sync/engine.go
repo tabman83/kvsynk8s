@@ -38,6 +38,10 @@ const (
 	ReasonTransientError = "TransientError"
 )
 
+// secretSyncKind is the Kind of the owning SecretSync object, used to build
+// the controller OwnerReference on every managed Secret.
+const secretSyncKind = "SecretSync"
+
 // Engine turns a SecretSync declaration into the Kubernetes Secret it
 // describes. It performs no Kubernetes API I/O itself: the reconciler
 // (internal/controller, T013) creates/updates the returned *corev1.Secret
@@ -166,7 +170,7 @@ func controllerOwnerReference(owner *kvsynk8sv1alpha1.SecretSync) metav1.OwnerRe
 	blockDeletion := true
 	return metav1.OwnerReference{
 		APIVersion:         kvsynk8sv1alpha1.GroupVersion.String(),
-		Kind:               "SecretSync",
+		Kind:               secretSyncKind,
 		Name:               owner.Name,
 		UID:                owner.UID,
 		Controller:         &isController,

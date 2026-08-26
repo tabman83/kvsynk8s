@@ -44,7 +44,7 @@ func TestCreateOrUpdate_LabeledSecretOwnedByOtherController_TargetConflict(t *te
 			},
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion:         "kvsynk8s.io/v1alpha1",
-				Kind:               "SecretSync",
+				Kind:               secretSyncKind,
 				Name:               otherOwner.Name,
 				UID:                types.UID("some-other-uid"),
 				Controller:         &isController,

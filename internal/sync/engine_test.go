@@ -192,7 +192,7 @@ func TestSync_CreatesSecretWithLabelsAnnotationsOwnerReference_WhenNoneExists(t 
 		t.Fatalf("len(secret.OwnerReferences) = %d, want 1", len(secret.OwnerReferences))
 	}
 	ownerRef := secret.OwnerReferences[0]
-	if ownerRef.Kind != "SecretSync" || ownerRef.Name != owner.Name || ownerRef.UID != owner.UID {
+	if ownerRef.Kind != secretSyncKind || ownerRef.Name != owner.Name || ownerRef.UID != owner.UID {
 		t.Errorf("ownerRef = %+v, want Kind=SecretSync Name=%q UID=%q", ownerRef, owner.Name, owner.UID)
 	}
 	if ownerRef.Controller == nil || !*ownerRef.Controller {
