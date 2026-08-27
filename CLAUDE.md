@@ -126,12 +126,13 @@ make helm-verify         # runs helm-sync first (regenerates the machine-managed
 
 The chart checks need `helm` >= 3.8 and `python3` with PyYAML (used by
 `hack/compare-helm-kustomize.sh`, `hack/check-render.sh` and
-`hack/check-values.sh`). CI runs the whole chart suite twice, over a matrix of
-the latest 3.x and the latest 4.x (the `helm` matrix in
-`.github/workflows/helm.yml`, mirrored by the `helm` job in `release.yml`), so
-the chart cannot break on either line unnoticed. The release itself *packages*
-the chart with the 3.x floor (`HELM_VERSION` in `release.yml`) so the artifact
-is readable by every supported Helm. Bump both matrices together.
+`hack/check-values.sh`). CI runs the whole chart suite three times, over a
+matrix of the documented `>= 3.8` floor (v3.8.2), the latest 3.x and the latest
+4.x (the `helm` matrix in `.github/workflows/helm.yml`, mirrored by the `helm`
+job in `release.yml`), so the chart cannot break on any of those lines
+unnoticed. The release itself *packages* the chart with the latest 3.x
+(`HELM_VERSION` in `release.yml`) so the artifact is readable by every supported
+Helm, down to the floor. Bump both matrices together.
 
 Run a single test:
 
