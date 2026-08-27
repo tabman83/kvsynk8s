@@ -353,8 +353,12 @@ correctness. Check `status.lastSyncTime` per `SecretSync` to see whether
 reconciliation is still happening on schedule.
 
 **Queue health metrics.** When a queue URL is configured, the operator
-exposes two gauges on the standard metrics endpoint (enable it with
-`--metrics-bind-address`, it is off by default):
+exposes two gauges on the standard metrics endpoint. Both install methods
+serve that endpoint by default, over authenticated HTTPS on `:8443`: the
+chart defaults `metrics.enabled` to `true` and `install.yaml` passes the same
+`--metrics-bind-address=:8443`. It is off only if you set
+`metrics.enabled=false`, or run the binary directly without the flag (the
+bare flag default is `0`, see the table above).
 
 | Metric | Meaning |
 |---|---|
