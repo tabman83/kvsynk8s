@@ -384,7 +384,11 @@ func newAzuriteQueueClient(hostPort string) (*azqueue.QueueClient, error) {
 
 // eventGridSecretNewVersionMessage builds the Base64-encoded Event Grid
 // queue message body contracts/queue-message.md documents for a
-// SecretNewVersionCreated notification.
+// SecretNewVersionCreated notification. ObjectType is "Secret" with a capital
+// S, the exact literal a real Key Vault emits
+// (learn.microsoft.com/azure/event-grid/event-schema-key-vault), so this e2e
+// drives the operator with the production shape of the payload rather than a
+// convenient lowercase approximation.
 func eventGridSecretNewVersionMessage(eventID, vaultName, secretName, version string) string {
 	body := fmt.Sprintf(`{
 		"id": %q,
@@ -397,7 +401,7 @@ func eventGridSecretNewVersionMessage(eventID, vaultName, secretName, version st
 		"data": {
 			"Id": "https://e2e-vault.vault.azure.net/secrets/%s/%s",
 			"VaultName": %q,
-			"ObjectType": "secret",
+			"ObjectType": "Secret",
 			"ObjectName": %q,
 			"Version": %q,
 			"NBF": null,

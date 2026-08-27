@@ -36,7 +36,9 @@
 //  2. eventType != "Microsoft.KeyVault.SecretNewVersionCreated" (e.g.
 //     SecretNearExpiry, SecretExpired, or any other/unknown type) -> (nil,
 //     nil): a clean, silent discard, not an error (v1 scope).
-//  3. data.ObjectType != "secret" -> (nil, nil): same silent discard.
+//  3. data.ObjectType that is not "secret" case-insensitively -> (nil, nil):
+//     same silent discard. Azure's documented payload carries "Secret" with a
+//     capital S, so the shared fixtures below use that literal.
 //  4. Otherwise -> (&ParsedEvent{...}, nil) with VaultName/SecretName/Version
 //     copied verbatim from data.VaultName/data.ObjectName/data.Version and ID
 //     from the envelope's top-level id.
@@ -87,16 +89,25 @@ func encodedBody(payload string) []byte {
 }
 
 const (
-	testEventID  = "6a6cbc37-fake-event-id-63c2fc7b"
-	testVault    = "fake-vault"
-	testObject   = "fake-app-password"
-	testVersion  = "fakeversion0123456789abcdef01234567"
-	secretType   = "secret"
-	certType     = "certificate"
-	newVersionET = "Microsoft.KeyVault.SecretNewVersionCreated"
-	nearExpiryET = "Microsoft.KeyVault.SecretNearExpiry"
-	expiredET    = "Microsoft.KeyVault.SecretExpired"
-	unknownET    = "Microsoft.KeyVault.SomeFutureEventType"
+	testEventID = "6a6cbc37-fake-event-id-63c2fc7b"
+	testVault   = "fake-vault"
+	testObject  = "fake-app-password"
+	testVersion = "fakeversion0123456789abcdef01234567"
+	// secretType is deliberately the exact literal a real Key Vault emits --
+	// "Secret", capital S, as in the documented event schema
+	// (learn.microsoft.com/azure/event-grid/event-schema-key-vault). Every
+	// fixture in this package goes through it, so the whole suite runs against
+	// the production shape of the payload; the older lowercase spelling is
+	// still covered explicitly by TestParse_ObjectTypeCasing_Variants.
+	secretType      = "Secret"
+	secretTypeLower = "secret"
+	secretTypeUpper = "SECRET"
+	certType        = "certificate"
+	keyType         = "key"
+	newVersionET    = "Microsoft.KeyVault.SecretNewVersionCreated"
+	nearExpiryET    = "Microsoft.KeyVault.SecretNearExpiry"
+	expiredET       = "Microsoft.KeyVault.SecretExpired"
+	unknownET       = "Microsoft.KeyVault.SomeFutureEventType"
 )
 
 func TestParse_ValidSecretNewVersionCreated_ReturnsVaultAndSecretName(t *testing.T) {
@@ -170,6 +181,56 @@ func TestParse_ObjectTypeNotSecret_Discarded(t *testing.T) {
 	}
 	if got != nil {
 		t.Fatalf("Parse() = %+v, want nil (ObjectType != secret must be discarded)", got)
+	}
+}
+
+// TestParse_ObjectTypeCasing_Variants pins rule 2's object-type guard as a
+// case-insensitive match, and pins that it is still a real guard.
+//
+// This is the regression test for the bug that made the whole realtime path
+// (FR-005) dead in production while every test in the repo passed: the guard
+// compared *data.ObjectType against the lowercase literal "secret", but Azure
+// sends "Secret" (learn.microsoft.com/azure/event-grid/event-schema-key-vault),
+// so every genuine event was treated as a clean discard -- the listener
+// deleted the message and logged it at V(1) as non-actionable. The suite never
+// noticed because every fixture used the lowercase spelling. Hence: all three
+// casings must parse, and a genuinely different object type must still be
+// discarded.
+func TestParse_ObjectTypeCasing_Variants(t *testing.T) {
+	tests := []struct {
+		name       string
+		objectType string
+		wantParsed bool
+	}{
+		{name: "azure casing", objectType: secretType, wantParsed: true},
+		{name: "lowercase", objectType: secretTypeLower, wantParsed: true},
+		{name: "uppercase", objectType: secretTypeUpper, wantParsed: true},
+		{name: "certificate", objectType: certType, wantParsed: false},
+		{name: "key", objectType: keyType, wantParsed: false},
+		{name: "certificate in azure casing", objectType: "Certificate", wantParsed: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := encodedBody(eventPayload(testEventID, newVersionET, testVault, tt.objectType, testObject, testVersion))
+
+			got, err := Parse(body)
+			if err != nil {
+				t.Fatalf("Parse() error = %v, want nil (a wrong object type is a discard, not an error)", err)
+			}
+			if tt.wantParsed {
+				if got == nil {
+					t.Fatalf("Parse() = nil for ObjectType %q, want a ParsedEvent (object types are matched case-insensitively)", tt.objectType)
+				}
+				if got.SecretName != testObject {
+					t.Errorf("SecretName = %q, want %q", got.SecretName, testObject)
+				}
+				return
+			}
+			if got != nil {
+				t.Fatalf("Parse() = %+v for ObjectType %q, want nil (only secrets are actioned)", got, tt.objectType)
+			}
+		})
 	}
 }
 

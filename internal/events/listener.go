@@ -267,8 +267,16 @@ func (l *Listener) handleMessage(ctx context.Context, m azure.QueueMessage) {
 }
 
 // matchingSecretSyncs lists every SecretSync across all namespaces from the
-// manager's cached client and returns those whose spec.vault matches parsed
-// (vault name case-insensitively, per data-model.md; secret name exactly).
+// manager's cached client and returns those whose spec.vault matches parsed.
+// Both the vault name and the secret name are matched case-insensitively
+// (data-model.md): Key Vault names are case-insensitive and case-preserving,
+// so the event carries whatever casing the object was created with while
+// spec.vault.secret carries whatever the user typed, and the CRD pattern
+// allows mixed case in both. Comparing the secret name exactly makes such a
+// SecretSync sync correctly on every direct read (initial sync and every
+// periodic reconcile, which never look at the event) but match no event, so
+// every rotation is silently dropped and only the 4h safety net repairs it --
+// FR-005's realtime path is dead for that object with no visible failure.
 func (l *Listener) matchingSecretSyncs(ctx context.Context, parsed *ParsedEvent) ([]kvsynk8sv1alpha1.SecretSync, error) {
 	var list kvsynk8sv1alpha1.SecretSyncList
 	if err := l.Client.List(ctx, &list); err != nil {
@@ -277,7 +285,8 @@ func (l *Listener) matchingSecretSyncs(ctx context.Context, parsed *ParsedEvent)
 
 	var matches []kvsynk8sv1alpha1.SecretSync
 	for _, ss := range list.Items {
-		if strings.EqualFold(ss.Spec.Vault.Name, parsed.VaultName) && ss.Spec.Vault.Secret == parsed.SecretName {
+		if strings.EqualFold(ss.Spec.Vault.Name, parsed.VaultName) &&
+			strings.EqualFold(ss.Spec.Vault.Secret, parsed.SecretName) {
 			matches = append(matches, ss)
 		}
 	}

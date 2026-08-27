@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/eventgrid/azsystemevents"
 )
@@ -41,7 +42,10 @@ type ParsedEvent struct {
 	// VaultName is compared case-insensitively against SecretSync
 	// spec.vault.name (data-model.md).
 	VaultName string
-	// SecretName is compared against SecretSync spec.vault.secret.
+	// SecretName is compared case-insensitively against SecretSync
+	// spec.vault.secret: Key Vault object names are case-insensitive and
+	// case-preserving, so the casing the event carries is whatever the object
+	// was created with and need not match the casing in the spec.
 	SecretName string
 	// Version is data.Version from the event: logging/correlation only. The
 	// sync engine always fetches the latest version from Key Vault instead
@@ -62,7 +66,8 @@ type ParsedEvent struct {
 //   - eventType != "Microsoft.KeyVault.SecretNewVersionCreated" (rule 2:
 //     SecretNearExpiry, SecretExpired, or anything else/unknown) -> (nil,
 //     nil): a clean discard, not an error.
-//   - data.ObjectType != "secret" (rule 2) -> (nil, nil): same clean discard.
+//   - data.ObjectType is not "secret" case-insensitively (rule 2; Azure sends
+//     "Secret") -> (nil, nil): same clean discard.
 //   - Otherwise -> (&ParsedEvent{...}, nil).
 func Parse(body []byte) (*ParsedEvent, error) {
 	decoded, err := base64.StdEncoding.DecodeString(string(body))
@@ -98,10 +103,17 @@ func Parse(body []byte) (*ParsedEvent, error) {
 	}
 
 	// Rule 2 (continued): only secrets, never certificates/keys, even though
-	// the eventType namespace is shared conceptually -- SecretNewVersionCreated
-	// always carries ObjectType "secret" in practice, but this guard keeps
-	// the contract explicit and defends against a future schema surprise.
-	if data.ObjectType == nil || *data.ObjectType != "secret" {
+	// the eventType namespace is shared conceptually. The comparison is
+	// case-insensitive because the object type Azure actually sends is
+	// "Secret" with a capital S -- that is the literal in the documented
+	// Microsoft.KeyVault.SecretNewVersionCreated payload
+	// (learn.microsoft.com/azure/event-grid/event-schema-key-vault), and it is
+	// what a real vault emits. A case-sensitive compare here silently drops
+	// every genuine production event into the clean-discard branch below,
+	// killing the whole realtime path (FR-005) while the 4h periodic reconcile
+	// hides the breakage. Key Vault object types are not case-defined by
+	// contract, so match them the same way the names are matched.
+	if data.ObjectType == nil || !strings.EqualFold(*data.ObjectType, "secret") {
 		return nil, nil
 	}
 

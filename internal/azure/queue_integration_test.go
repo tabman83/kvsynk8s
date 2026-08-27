@@ -208,7 +208,7 @@ func TestStorageQueueSource_EventGridPayloadRoundtrip(t *testing.T) {
   "data": {
     "Id": "https://my-vault.vault.azure.net/secrets/my-app-password/abc123",
     "VaultName": "my-vault",
-    "ObjectType": "secret",
+    "ObjectType": "Secret",
     "ObjectName": "my-app-password",
     "Version": "abc123",
     "NBF": null,

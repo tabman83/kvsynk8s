@@ -26,7 +26,7 @@ event subscription on the Key Vault (system topic, Event Grid schema).
   "data": {
     "Id": "https://<vault-name>.vault.azure.net/secrets/my-app-password/<version>",
     "VaultName": "<vault-name>",
-    "ObjectType": "secret",
+    "ObjectType": "Secret",
     "ObjectName": "my-app-password",
     "Version": "<version>",
     "NBF": null,
@@ -41,10 +41,14 @@ event subscription on the Key Vault (system topic, Event Grid schema).
    metadata only; never log the body (it is not expected to contain values, but
    the redaction rule is unconditional).
 2. Act only when `eventType == "Microsoft.KeyVault.SecretNewVersionCreated"`
-   **and** `data.ObjectType == "secret"`. `SecretNearExpiry` / `SecretExpired`
-   and all other types ⇒ delete without action (v1 scope, clarification #4).
-3. Match `(data.VaultName, data.ObjectName)` against all `SecretSync` specs
-   (vault name compared case-insensitively). No match ⇒ delete, done.
+   **and** `data.ObjectType` equals `secret` **case-insensitively** — Azure
+   sends `"Secret"` with a capital S, so a case-sensitive compare discards
+   every real event. `SecretNearExpiry` / `SecretExpired` and all other object
+   types ⇒ delete without action (v1 scope, clarification #4).
+3. Match `(data.VaultName, data.ObjectName)` against all `SecretSync` specs.
+   Both names are compared **case-insensitively**: Key Vault names are
+   case-insensitive and case-preserving, so the event carries whatever casing
+   the object was created with. No match ⇒ delete, done.
    If the `SecretSync` list itself fails (cache error), the message is left
    on the queue — not deleted — so the visibility timeout redelivers it on a
    later poll instead of the event being lost (`listener.go`,
