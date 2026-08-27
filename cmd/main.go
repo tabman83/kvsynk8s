@@ -102,8 +102,13 @@ const queueSASWarning = "Configured queue URL has a query string; it is redacted
 // unparseableQueueURLMessage is what an operator gets instead of the value
 // they configured when net/url rejects it. The raw value is deliberately not
 // in it: a malformed URL can still be a SAS URL with a typo in it.
+//
+// It says the operator keeps running because it does: this is a loud
+// diagnostic, not a fatal error. See the parse check in main() for why.
 const unparseableQueueURLMessage = "Configured queue URL cannot be parsed as a URL " +
-	"(the value is not shown: it may contain a SAS token). Fix --queue-url/QUEUE_URL"
+	"(the value is not shown: it may contain a SAS token). Fix --queue-url/QUEUE_URL. " +
+	"The operator keeps running: queue delivery will not work until this is fixed, " +
+	"but every SecretSync still converges through periodic reconciliation."
 
 // queueURLLogKey is the log key both queue-URL log lines use. Named so the
 // static check in main_test.go can key off the same constant.
@@ -147,6 +152,22 @@ func queueListenerLogKeyValues(queueURL string) (warn []any, enabled []any) {
 		warn = []any{queueURLLogKey, safeQueueURL}
 	}
 	return warn, []any{queueURLLogKey, safeQueueURL}
+}
+
+// registerQueueURLFlag registers --queue-url on fs, writing into dst.
+//
+// The default stays empty on purpose and QUEUE_URL is applied after flag.Parse
+// (queueURLFromEnv), for the reason spelled out there. This registration is a
+// function rather than a StringVar call inlined in main() so that a test can
+// look at it: the leak it prevents is one token wide (passing
+// os.Getenv("QUEUE_URL") as the default), main() has no harness, and nothing
+// else in the repo reads the flag's DefValue or renders PrintDefaults. See
+// TestQueueURLFlagHasNoDefault.
+func registerQueueURLFlag(fs *flag.FlagSet, dst *string) {
+	fs.StringVar(dst, "queue-url", "",
+		"URL of the Azure Storage Queue that receives Key Vault Event Grid "+
+			"notifications (env: QUEUE_URL). Optional: without it the operator "+
+			"still converges through periodic reconciliation alone.")
 }
 
 // queueURLFromEnv returns the QUEUE_URL fallback for --queue-url.
@@ -199,13 +220,9 @@ func main() {
 			"Accepted for scaffold/manifest compatibility only: this operator runs a single "+
 			"replica and never enables leader election in practice (plan.md; Simplicity First) "+
 			"— the manager is always started with LeaderElection disabled regardless of this flag.")
-	// The default stays empty on purpose and QUEUE_URL is applied after
-	// flag.Parse (queueURLFromEnv): a flag default is printed verbatim by
-	// --help, and QUEUE_URL can carry a SAS token.
-	flag.StringVar(&queueURL, "queue-url", "",
-		"URL of the Azure Storage Queue that receives Key Vault Event Grid "+
-			"notifications (env: QUEUE_URL). Optional: without it the operator "+
-			"still converges through periodic reconciliation alone.")
+	// Registered through a named function, and with no default, on purpose:
+	// see registerQueueURLFlag.
+	registerQueueURLFlag(flag.CommandLine, &queueURL)
 	flag.DurationVar(&reconcileInterval, "reconcile-interval",
 		durationFromEnv("RECONCILE_INTERVAL", defaultReconcileInterval),
 		"How often to fully reconcile every SecretSync against Key Vault; the "+
@@ -241,21 +258,30 @@ func main() {
 
 	queueURL = queueURLFromEnv(queueURL)
 
-	// Fail fast on a queue URL net/url cannot parse. azqueue.NewQueueClient
-	// never parses the URL it is given, so a malformed one is accepted at
-	// construction and only fails on the first poll — inside
-	// http.NewRequestWithContext, which returns a *url.Error containing the
-	// raw value. internal/azure redacts that error, but the operator would
-	// still be left with a listener that can never do anything, silently
-	// degraded to periodic reconciliation. Better to say so now, without
-	// echoing the value back.
+	// Say so loudly, at startup, when net/url cannot parse the configured queue
+	// URL. azqueue.NewQueueClient never parses the URL it is given, so a
+	// malformed one is accepted at construction and only fails on the first
+	// poll — inside http.NewRequestWithContext, which returns a *url.Error
+	// containing the raw value. internal/azure redacts that error, but a
+	// redacted transport error repeated every idle poll is a poor way to learn
+	// that the value in the Deployment has a stray space or a trailing newline
+	// in it.
+	//
+	// This deliberately does NOT exit. The queue path is optional and only
+	// buys speed, never correctness (plan.md checkpoint for US2; README's
+	// "Queue events not arriving" and queue-health sections): a typo in it must
+	// degrade propagation to the periodic reconcile, not crash-loop the
+	// operator and take every SecretSync down with it. Startup continues into
+	// the normal queue branch below for the same reason — a registered listener
+	// keeps the queue health gauges published, and a growing
+	// kvsynk8s_queue_consecutive_receive_failures is exactly the documented
+	// signal for a broken queue URL.
 	if queueURL != "" {
 		if _, err := url.Parse(queueURL); err != nil {
 			// err is deliberately not passed to the logger: net/url formats a
 			// parse failure as `parse "<raw url>": ...`, so logging it would
 			// print the very value being withheld.
 			setupLog.Error(nil, unparseableQueueURLMessage)
-			os.Exit(1)
 		}
 	}
 

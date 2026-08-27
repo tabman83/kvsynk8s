@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"go/ast"
@@ -168,6 +169,11 @@ func TestQueueURLFromEnv(t *testing.T) {
 // withParsedQueueURLFlag installs a fresh flag.CommandLine holding a
 // --queue-url flag and parses it with or without that flag supplied, so
 // queueURLFromEnv's flag.Visit lookup sees the real thing rather than a stub.
+//
+// It registers the flag through registerQueueURLFlag -- the same function
+// main() uses -- rather than declaring its own StringVar: a helper that
+// hardcoded the empty default would be asserting against itself, and the
+// registration is exactly where the SAS default could come back.
 func withParsedQueueURLFlag(t *testing.T, supplied bool, value string) {
 	t.Helper()
 	saved := flag.CommandLine
@@ -175,7 +181,7 @@ func withParsedQueueURLFlag(t *testing.T, supplied bool, value string) {
 
 	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
 	var dst string
-	flag.CommandLine.StringVar(&dst, "queue-url", "", "test")
+	registerQueueURLFlag(flag.CommandLine, &dst)
 
 	var args []string
 	if supplied {
@@ -183,6 +189,36 @@ func withParsedQueueURLFlag(t *testing.T, supplied bool, value string) {
 	}
 	if err := flag.CommandLine.Parse(args); err != nil {
 		t.Fatalf("parse %v: %v", args, err)
+	}
+}
+
+// TestQueueURLFlagHasNoDefault guards the flag registration itself, which is
+// the other half of the leak: Go's flag package stores a flag's default as
+// DefValue and PrintDefaults writes it verbatim, so registering --queue-url
+// with os.Getenv("QUEUE_URL") as its default puts a SAS token on stderr for
+// `--help` and for every flag parse error (flag.CommandLine is ExitOnError, so
+// a mistyped flag calls Usage). Nothing else in the repo -- no test, no
+// hack/*.sh, no e2e spec -- looks at DefValue or PrintDefaults, so without this
+// case that one-token regression stays green.
+func TestQueueURLFlagHasNoDefault(t *testing.T) {
+	t.Setenv("QUEUE_URL", sasQueueURL)
+
+	fs := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+	var dst string
+	registerQueueURLFlag(fs, &dst)
+
+	if got := fs.Lookup("queue-url").DefValue; got != "" {
+		t.Errorf("--queue-url DefValue = %q, want %q: the default is printed verbatim by --help", got, "")
+	}
+
+	// Belt and braces, and the assertion that stays honest if the default ever
+	// moves somewhere else in the usage text: render the usage the operator
+	// would actually see and require the credential not to be in it.
+	var buf bytes.Buffer
+	fs.SetOutput(&buf)
+	fs.PrintDefaults()
+	if strings.Contains(buf.String(), sasSignature) {
+		t.Errorf("PrintDefaults() = %q, must not contain the SAS signature from QUEUE_URL", buf.String())
 	}
 }
 
