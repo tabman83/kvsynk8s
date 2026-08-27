@@ -1454,3 +1454,73 @@ func TestTakesPrecedence(t *testing.T) {
 		})
 	}
 }
+
+// TestStatusWriteContext pins both halves of what statusWriteContext exists to
+// guarantee, because either half alone is a bug.
+//
+// Detached, so the terminal status write outlives an exhausted reconcile
+// deadline — that is the whole point of the fix, and the envtest spec above
+// ("still persists Failing/TransientError ...") already fails without it.
+//
+// Bounded, which nothing else in the suite can observe: context.WithoutCancel
+// drops the manager's shutdown cancellation along with the deadline, so a
+// detached-but-unbounded status write has nothing left to interrupt it. Facing
+// a wedged or throttling API server it would block forever, permanently
+// costing one of the maxConcurrentReconciles workers and stalling graceful
+// shutdown — strictly worse than the expired context this fix replaces.
+// statusPersistTimeout is what keeps FR-008's worker protection true, so it is
+// asserted here rather than left to the comment on the constant.
+//
+// A plain unit test, no cluster needed: both properties live in the derived
+// context itself.
+func TestStatusWriteContext(t *testing.T) {
+	// The load-bearing case: the reconcile deadline is already gone by the
+	// time the failure it caused gets written.
+	t.Run("survives a parent cancelled before the write starts", func(t *testing.T) {
+		parent, cancelParent := context.WithCancel(context.Background())
+		cancelParent()
+
+		ctx, cancel := statusWriteContext(parent)
+		defer cancel()
+
+		if err := ctx.Err(); err != nil {
+			t.Fatalf("status write context must not inherit its parent's cancellation, got %v", err)
+		}
+	})
+
+	// The same must hold for a cancellation that lands mid-write — a manager
+	// shutdown, or the reconcile deadline expiring a moment later.
+	t.Run("survives a parent cancelled after the write starts", func(t *testing.T) {
+		parent, cancelParent := context.WithCancel(context.Background())
+
+		ctx, cancel := statusWriteContext(parent)
+		defer cancel()
+
+		cancelParent()
+		if err := ctx.Err(); err != nil {
+			t.Fatalf("status write context must not follow its parent's cancellation, got %v", err)
+		}
+	})
+
+	t.Run("carries a deadline of its own, no further than statusPersistTimeout", func(t *testing.T) {
+		// An hour-long parent deadline: if the derived context kept it instead
+		// of replacing it, the bound below catches that too.
+		parent, cancelParent := context.WithTimeout(context.Background(), time.Hour)
+		defer cancelParent()
+
+		start := time.Now()
+		ctx, cancel := statusWriteContext(parent)
+		defer cancel()
+
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("status write context must carry a deadline: detaching from the reconcile deadline also detaches from manager shutdown, so an unbounded write can pin a worker forever")
+		}
+		// One second of slack, like the vault-read deadline spec above: the
+		// deadline is stamped a hair after `start` was taken.
+		if latest := start.Add(statusPersistTimeout + time.Second); deadline.After(latest) {
+			t.Fatalf("status write deadline %s is further than statusPersistTimeout (%s) from the start of the write (latest allowed %s)",
+				deadline, statusPersistTimeout, latest)
+		}
+	})
+}
