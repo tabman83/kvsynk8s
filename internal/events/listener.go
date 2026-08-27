@@ -39,6 +39,26 @@ const (
 	// budget (research R6) while keeping the queue quiet when nothing is
 	// happening.
 	DefaultIdlePollInterval = 30 * time.Second
+
+	// DefaultQueueCallTimeout bounds one Receive or Delete call against the
+	// queue. Nothing below this layer imposes one: azqueue is built with
+	// default client options, whose HTTP client sets no request timeout and
+	// whose retry policy leaves TryTimeout at zero, so a connection that goes
+	// half-open (egress black-holed after the request was written, a NAT or
+	// load balancer holding the socket) leaves the call blocked with no
+	// deadline at all. Start's loop is strictly sequential, so that one call
+	// stops every later poll — the realtime path (FR-005) dies until the pod
+	// restarts, and because recordReceiveFailure only runs after Receive
+	// returns, kvsynk8s_queue_consecutive_receive_failures stays pinned at
+	// zero throughout: the operator's documented signal for a broken queue
+	// path reports healthy for the whole outage.
+	//
+	// Thirty seconds is far above what a queue operation takes when anything
+	// is working (including the SDK's own retries) and far below the point
+	// where a stalled poll matters. On expiry the call fails like any other
+	// Receive error: the failure gauge moves, the error is logged, and the
+	// loop keeps polling, so a path that heals recovers on its own.
+	DefaultQueueCallTimeout = 30 * time.Second
 )
 
 // Listener pulls Key Vault change notifications off the queue and turns
@@ -76,6 +96,9 @@ type Listener struct {
 	// Default to DefaultBusyPollInterval/DefaultIdlePollInterval.
 	BusyPollInterval time.Duration
 	IdlePollInterval time.Duration
+	// QueueCallTimeout bounds a single Receive/Delete call against the queue.
+	// Defaults to DefaultQueueCallTimeout.
+	QueueCallTimeout time.Duration
 
 	// healthMu guards the queue-receive health state below, which pollOnce
 	// maintains and mirrors into the Prometheus gauges in metrics.go (spec
@@ -110,6 +133,7 @@ func NewListener(queue azure.QueueSource, cli client.Client, events chan event.G
 		PoisonThreshold:  DefaultPoisonThreshold,
 		BusyPollInterval: DefaultBusyPollInterval,
 		IdlePollInterval: DefaultIdlePollInterval,
+		QueueCallTimeout: DefaultQueueCallTimeout,
 	}
 }
 
@@ -172,6 +196,20 @@ func (l *Listener) applyDefaults() {
 	if l.IdlePollInterval == 0 {
 		l.IdlePollInterval = DefaultIdlePollInterval
 	}
+	if l.QueueCallTimeout == 0 {
+		l.QueueCallTimeout = DefaultQueueCallTimeout
+	}
+}
+
+// queueCallContext derives the context one Receive/Delete call runs on: the
+// caller's context plus QueueCallTimeout, so a queue call that never returns
+// on its own cannot stall the poll loop forever (DefaultQueueCallTimeout).
+// Cancelling the parent still cancels the call, so shutdown is unaffected.
+func (l *Listener) queueCallContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if l.QueueCallTimeout <= 0 {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, l.QueueCallTimeout)
 }
 
 // pollOnce receives one batch and processes every message in it, returning
@@ -180,7 +218,11 @@ func (l *Listener) applyDefaults() {
 // multiple receive/process cycles deterministically, without depending on
 // real time (tasks.md T016: burst across multiple fake batches).
 func (l *Listener) pollOnce(ctx context.Context) (int, error) {
-	msgs, err := l.Queue.Receive(ctx, l.BatchSize)
+	// Bounded, and cancelled as soon as Receive returns: the messages are then
+	// processed on the caller's own context, which has no deadline of its own.
+	recvCtx, cancel := l.queueCallContext(ctx)
+	msgs, err := l.Queue.Receive(recvCtx, l.BatchSize)
+	cancel()
 	if err != nil {
 		l.recordReceiveFailure()
 		return 0, err
@@ -299,7 +341,9 @@ func (l *Listener) matchingSecretSyncs(ctx context.Context, parsed *ParsedEvent)
 // safe because every path through handleMessage is idempotent (latest-wins
 // sync, or a discard that would repeat identically).
 func (l *Listener) deleteMessage(ctx context.Context, m azure.QueueMessage) {
-	if err := l.Queue.Delete(ctx, m.ID, m.PopReceipt); err != nil {
+	delCtx, cancel := l.queueCallContext(ctx)
+	defer cancel()
+	if err := l.Queue.Delete(delCtx, m.ID, m.PopReceipt); err != nil {
 		logf.FromContext(ctx).WithName("events-listener").Error(err, "failed to delete queue message", "messageID", m.ID)
 	}
 }

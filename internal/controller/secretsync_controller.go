@@ -429,6 +429,52 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			writeErr := writer.CreateOrUpdate(ctx, &ss, targetKey.Namespace, targetKey.Name, dataKey, value, status.SyncedVersion)
 			if writeErr != nil {
 				if !errors.Is(writeErr, sync.ErrTargetConflict) {
+					// Any other write failure — an admission policy rejecting
+					// the Secret, a ResourceQuota, RBAC drift, a wedged API
+					// server — is returned for backoff retry, but the CR must
+					// not go on advertising its last good state while that
+					// lasts. Returning straight away would skip the status
+					// update at the end of Reconcile: engine.Sync already
+					// computed InSync at the new version, nothing would persist
+					// it, and the CR would keep reporting InSync at the OLD
+					// version with a stale lastSyncTime and no SyncFailed Event
+					// for the whole outage — the same unobservable failure
+					// statusPersistTimeout exists to prevent for a hung vault
+					// read, on the write side.
+					//
+					// TransientError because that is exactly what an unreadable
+					// classification is worth here: the reconcile is retried
+					// with backoff, and a cause that has since cleared resolves
+					// itself with no further status of its own.
+					status = kvsynk8sv1alpha1.SecretSyncStatus{
+						State:  kvsynk8sv1alpha1.SecretSyncStateFailing,
+						Reason: sync.ReasonTransientError,
+						// Identifiers and fixed text only, never writeErr's own
+						// string: it comes from the Kubernetes API, and what an
+						// admission webhook echoes back into it is not something
+						// this package has audited (constitution I / FR-010).
+						Message: fmt.Sprintf(
+							"failed writing secret %s/%s; keeping last synced value", ss.Namespace, targetName,
+						),
+						ObservedGeneration: ss.Generation,
+						LastSyncTime:       ss.Status.LastSyncTime,
+						SyncedVersion:      ss.Status.SyncedVersion,
+					}
+					ss.Status = status
+					// Detached from the reconcile deadline for the same reason
+					// as every other terminal status write here: a write that
+					// failed because the API server is slow would otherwise fail
+					// to report that it failed.
+					statusCtx, cancelStatus := statusWriteContext(ctx)
+					defer cancelStatus()
+					if statusErr := r.Status().Update(statusCtx, &ss); statusErr != nil {
+						// Logged, not returned: writeErr is the more useful
+						// error to hand back for backoff, and the Event below
+						// still gets the failure out even when status is stuck.
+						log.Error(statusErr, "failed to persist Failing status after a secret write error",
+							"namespace", targetKey.Namespace, "name", targetKey.Name)
+					}
+					r.recordSyncOutcome(&ss, status, targetName)
 					return ctrl.Result{}, fmt.Errorf("kvsynk8s: write secret %s: %w", targetKey, writeErr)
 				}
 				// An unmanaged Secret occupies the target name. With the
