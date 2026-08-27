@@ -298,3 +298,99 @@ func referencesIdent(expr ast.Expr, name string) bool {
 	})
 	return found
 }
+
+// TestDurationFromEnv covers the RECONCILE_INTERVAL fallback, which README.md
+// documents and which manifest-install users configure the operator through.
+// Its sibling QUEUE_URL has had dedicated cases since it was written; this one
+// had none, so a refactor dropping the env read — or breaking the
+// empty/unparseable fallback — would have left every test in the repo green
+// while every operator that set RECONCILE_INTERVAL silently ran at 4h instead.
+func TestDurationFromEnv(t *testing.T) {
+	const key = "RECONCILE_INTERVAL"
+	def := 4 * time.Hour
+
+	tests := []struct {
+		name string
+		set  bool
+		env  string
+		want time.Duration
+	}{
+		{name: "unset falls back to the default", want: def},
+		{name: "empty falls back to the default", set: true, env: "", want: def},
+		{name: "unparseable falls back to the default", set: true, env: "4 hours", want: def},
+		{name: "bare number is not a duration", set: true, env: "30", want: def},
+		{name: "a valid duration is honoured", set: true, env: "30m", want: 30 * time.Minute},
+		{name: "a compound duration is honoured", set: true, env: "1h30m", want: 90 * time.Minute},
+		// Parsed as given: the sign check lives in effectiveReconcileInterval,
+		// which is what the startup line and the reconciler both go through.
+		{name: "zero parses to zero", set: true, env: "0s", want: 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.set {
+				t.Setenv(key, tt.env)
+			} else {
+				// t.Setenv restores the previous value on cleanup, so an unset
+				// case has to clear it the same way rather than assuming the
+				// test process never had one.
+				t.Setenv(key, "")
+			}
+			if got := durationFromEnv(key, def); got != tt.want {
+				t.Errorf("durationFromEnv(%q=%q) = %v, want %v", key, tt.env, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestEffectiveReconcileInterval pins the other half: a value the controller
+// cannot honour is replaced HERE, so the "Operator configuration" line reports
+// the cadence the reconciler actually runs at. Before this, --reconcile-interval=0
+// (a common way of asking for "off") and a typo'd -4h were both accepted,
+// echoed back as configured, and then silently replaced with 4h by
+// internal/controller.
+func TestEffectiveReconcileInterval(t *testing.T) {
+	tests := []struct {
+		name            string
+		configured      time.Duration
+		want            time.Duration
+		wantSubstituted bool
+	}{
+		{name: "a positive interval is used as given", configured: 30 * time.Minute, want: 30 * time.Minute},
+		{name: "the default is positive and passes through", configured: defaultReconcileInterval, want: defaultReconcileInterval},
+		{name: "zero is replaced", configured: 0, want: defaultReconcileInterval, wantSubstituted: true},
+		{name: "negative is replaced", configured: -4 * time.Hour, want: defaultReconcileInterval, wantSubstituted: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, substituted := effectiveReconcileInterval(tt.configured)
+			if got != tt.want || substituted != tt.wantSubstituted {
+				t.Errorf("effectiveReconcileInterval(%v) = (%v, %t), want (%v, %t)",
+					tt.configured, got, substituted, tt.want, tt.wantSubstituted)
+			}
+		})
+	}
+}
+
+// TestConfigLogKeyValues_ReportsTheEffectiveInterval is the reason the
+// substitution happens in main() rather than being left to the reconciler: the
+// startup line is built from the same variable the reconciler is handed, so
+// normalizing before it is built is what keeps the two in agreement. A future
+// change that logged the raw flag and normalized later would pass every case
+// above and still print a cadence nothing runs at.
+func TestConfigLogKeyValues_ReportsTheEffectiveInterval(t *testing.T) {
+	configured := -4 * time.Hour
+	effective, substituted := effectiveReconcileInterval(configured)
+	if !substituted {
+		t.Fatalf("effectiveReconcileInterval(%v) reported no substitution", configured)
+	}
+
+	kvs := configLogKeyValues("", effective, "")
+	if !containsValue(kvs, "reconcileInterval", effective) {
+		t.Errorf("configLogKeyValues() = %v, want reconcileInterval=%v (what the controller will use)", kvs, effective)
+	}
+	if containsValue(kvs, "reconcileInterval", configured) {
+		t.Errorf("configLogKeyValues() reported the rejected value %v as the operator configuration", configured)
+	}
+}

@@ -23,9 +23,11 @@ basic problem, but the two differ on two points:
   notifications alone to stay correct.
 - **No webhook/injector.** akv2k8s also offers env-injection into pods via a
   mutating webhook (`akv2k8s-env-injector`). kvsynk8s does not: it only ever
-  writes a plain Kubernetes `Secret` object. There is no admission webhook, no
-  inbound network endpoint of any kind — the operator only ever makes outbound
-  calls (to the queue, to Key Vault, to the Kubernetes API). Consume the
+  writes a plain Kubernetes `Secret` object. There is no admission webhook, so
+  nothing in the cluster's request path ever calls into the operator: it makes
+  outbound calls only (to the queue, to Key Vault, to the Kubernetes API), and
+  the sole ports it listens on are the authenticated metrics endpoint
+  (`:8443`, optional) and the kubelet health probes (`:8081`). Consume the
   Secret the standard Kubernetes way (env var, volume mount).
 
 Scope in v1 is Key Vault **secrets** only (no certificates or keys), one vault

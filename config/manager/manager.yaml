@@ -61,8 +61,12 @@ spec:
       containers:
       - command:
         - /manager
+        # No --leader-elect: the manager is always started with leader
+        # election disabled (cmd/main.go; plan.md, Simplicity First), and no
+        # lease RBAC is granted, so the flag only ever misled someone into
+        # scaling this Deployment. Keep replicas at 1 — two replicas would run
+        # two uncoordinated controllers and two queue listeners.
         args:
-          - --leader-elect
           - --health-probe-bind-address=:8081
         image: controller:latest
         name: manager

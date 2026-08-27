@@ -88,6 +88,29 @@ func durationFromEnv(key string, def time.Duration) time.Duration {
 	return d
 }
 
+// nonPositiveReconcileIntervalMessage is logged when the configured reconcile
+// interval is zero or negative. Neither is a cadence anything can honour, and
+// internal/controller quietly substitutes its own default for them
+// (reconcileInterval()), so the value is normalized here instead — otherwise
+// the "Operator configuration" line below reports a cadence that is not the
+// one the controller runs at, and someone setting RECONCILE_INTERVAL=0 to
+// "turn the periodic reconcile off" is told it worked.
+const nonPositiveReconcileIntervalMessage = "Configured reconcile interval is not positive and is being ignored. " +
+	"The periodic reconcile cannot be turned off: it is the safety net for missed events, " +
+	"vault-side deletions and in-cluster drift. Set a positive duration, e.g. 4h."
+
+// effectiveReconcileInterval resolves what the operator will actually reconcile
+// at, returning the substituted default and true when the configured value is
+// unusable. Split out of main() for the same reason as configLogKeyValues:
+// main() has no harness, so a check written inline there is one no test can
+// observe.
+func effectiveReconcileInterval(configured time.Duration) (time.Duration, bool) {
+	if configured > 0 {
+		return configured, false
+	}
+	return defaultReconcileInterval, true
+}
+
 // queueSASWarning is logged when the configured queue URL carries a query
 // string. NewQueueSource always authenticates with DefaultAzureCredential
 // (constitution V: platform-issued, short-lived credentials only), so a SAS
@@ -257,6 +280,15 @@ func main() {
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
 	queueURL = queueURLFromEnv(queueURL)
+
+	// Before anything reports the configuration: a zero or negative interval is
+	// replaced by the default here, loudly, so the startup line below and the
+	// reconciler agree on one number.
+	if effective, substituted := effectiveReconcileInterval(reconcileInterval); substituted {
+		setupLog.Error(nil, nonPositiveReconcileIntervalMessage,
+			"configured", reconcileInterval, "using", effective)
+		reconcileInterval = effective
+	}
 
 	// Say so loudly, at startup, when net/url cannot parse the configured queue
 	// URL. azqueue.NewQueueClient never parses the URL it is given, so a

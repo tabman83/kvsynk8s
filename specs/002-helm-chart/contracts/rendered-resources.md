@@ -41,13 +41,14 @@ The comparison script asserts these fields match `install.yaml`'s Deployment:
 - Pod `securityContext`: `runAsNonRoot: true`, `seccompProfile.type: RuntimeDefault`.
 - Container `securityContext`: `readOnlyRootFilesystem: true`,
   `allowPrivilegeEscalation: false`, `capabilities.drop: ["ALL"]`.
-- Args include `--metrics-bind-address=:8443` (metrics on by default),
-  `--health-probe-bind-address=:8081`, `--leader-elect`.
-  Note: `--leader-elect` is kept only for equivalence with `install.yaml` —
-  the operator hardcodes `LeaderElection: false` in `cmd/main.go` and ignores
-  the flag. Do not drop it from the chart (breaks this contract) and do not
-  read it as leader election being enabled (FR-009's "no leader election"
-  statement refers to the code, which wins).
+- Args include `--metrics-bind-address=:8443` (metrics on by default) and
+  `--health-probe-bind-address=:8081`.
+  Note: neither install method passes `--leader-elect` any more. The operator
+  hardcodes `LeaderElection: false` in `cmd/main.go` and ignores the flag, and
+  no lease RBAC is granted, so shipping it in the manifests only suggested that
+  scaling the Deployment was safe (it is not — replicas stays 1, FR-009). The
+  binary still accepts the flag, so a hand-written Deployment that passes it
+  keeps working; both install methods must simply agree not to.
 - Container port `8081` (name `health`); pod template annotation
   `kubectl.kubernetes.io/default-container: manager`.
 - Probes: liveness `/healthz:8081` (delay 15s / period 20s), readiness
