@@ -30,8 +30,10 @@ az eventgrid event-subscription create \
   --endpoint $(az storage account show -n $SA -g $RG --query id -o tsv)/queueservices/default/queues/$QUEUE \
   --included-event-types Microsoft.KeyVault.SecretNewVersionCreated
 
-# Identity for the operator + federation with its ServiceAccount
+# Identity for the operator + federation with its ServiceAccount.
+# CLIENT_ID is needed again in step 2 to annotate the ServiceAccount.
 az identity create -n kvsynk8s-operator -g $RG
+CLIENT_ID=$(az identity show -n kvsynk8s-operator -g $RG --query clientId -o tsv)
 ISSUER=$(az aks show -n $AKS -g $RG --query oidcIssuerProfile.issuerUrl -o tsv)
 az identity federated-credential create -n kvsynk8s -g $RG \
   --identity-name kvsynk8s-operator \
@@ -47,12 +49,48 @@ az role assignment create --assignee $PRINCIPAL --role "Storage Queue Data Messa
 
 ## 2. Install the operator
 
+Install from the release manifest. It is the same CRD + RBAC + Deployment the
+kustomize tree produces, but with the image already pinned to that release's
+tag, so the pod can actually start:
+
 ```bash
-# kubebuilder-generated kustomize tree: CRD, RBAC, and the manager Deployment
-# (carries the workload-identity label/annotation and the queue URL +
-# client-id configuration)
-kubectl apply -k config/default
-kubectl -n kvsynk8s rollout status deploy/kvsynk8s-operator
+kubectl apply -f https://github.com/tabman83/kvsynk8s/releases/download/v0.1.0/install.yaml
+```
+
+Do **not** install with a bare `kubectl apply -k config/default`. Nothing under
+`config/` substitutes the image: the Deployment comes out with the
+`controller:latest` placeholder, which does not exist in any registry, so the
+pod goes straight to `ImagePullBackOff` and no scenario below can pass. Only
+`make deploy` (or the release manifest) pins a real image.
+
+To validate code that is not released yet, build and push your own image and
+deploy from source instead. Note `make deploy` runs
+`kustomize edit set image`, so it leaves `config/manager/kustomization.yaml`
+modified in your checkout — revert it when you are done:
+
+```bash
+make docker-build docker-push IMG=<your-registry>/kvsynk8s:dev
+make deploy IMG=<your-registry>/kvsynk8s:dev
+```
+
+Either way the install carries the workload-identity pod label and a real
+image, but NOT the client ID or the queue URL: the ServiceAccount ships a
+`<SET-ME>` placeholder annotation and the manager has no queue configured. The
+two commands below fill both in — without them workload identity cannot
+authenticate and the near-realtime path (V2) never activates.
+
+```bash
+# (a) point Microsoft Entra Workload ID at the managed identity from step 1
+kubectl -n $NS annotate serviceaccount $SA_K8S \
+  azure.workload.identity/client-id=$CLIENT_ID --overwrite
+
+# (b) hand the manager the queue URL so the listener starts.
+# This changes the pod template, so it also rolls the Deployment and the new
+# pod picks up the annotation from (a) at the same time.
+kubectl -n $NS set env deploy/kvsynk8s-operator \
+  QUEUE_URL="https://$SA.queue.core.windows.net/$QUEUE"
+
+kubectl -n $NS rollout status deploy/kvsynk8s-operator --timeout=180s
 ```
 
 ## 3. Validation scenarios
