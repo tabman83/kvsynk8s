@@ -26,6 +26,11 @@
 #             Defaults to this repository. Only a test seam.
 #   IMAGE     image repository whose published tags are the second witness.
 #             Defaults to the release image.
+#   REGISTRY_USER, REGISTRY_TOKEN
+#             credentials for the registry read. Optional: the package is
+#             public, so the read also works anonymously — but an authenticated
+#             read is not subject to anonymous rate limiting and still works if
+#             the package is ever made private.
 #   REGISTRY_TAGS
 #             command run instead of the built-in registry read. It must exit 0
 #             and print either one tag per line, nothing at all (no package
@@ -114,21 +119,33 @@ collect_stable true < <(git -C "$REPO_DIR" tag -l 'v[0-9]*' 2>/dev/null || true)
 # pushed as v$VERSION by nothing but this pipeline, so the registry's own tag
 # list is the second witness for "what has actually been released".
 #
-# Read anonymously: the package is public (README's install instructions rely
-# on that), and doing it without credentials keeps this step working wherever
-# it runs. Only stable versions are being looked for, so this is skipped
-# entirely for prereleases and dev builds — they returned above.
+# The read uses REGISTRY_USER/REGISTRY_TOKEN when the caller supplies them (the
+# release workflow does, from the same GITHUB_TOKEN the other registry guard
+# uses) and falls back to an anonymous read, which works because the package is
+# public. Authenticated matters mainly for rate limiting: anonymous token
+# requests share the runner's IP with everyone else on it.
+#
+# Only stable versions are being looked for, so none of this runs for
+# prereleases and dev builds — they returned above.
 default_registry_tags() {
   local host="${IMAGE%%/*}" repo="${IMAGE#*/}" body code token
   if [ "$host" != ghcr.io ]; then
     echo unreachable
     return 0
   fi
-  body="$(mktemp)"
+  body="$(mktemp)" || { echo unreachable; return 0; }
   # shellcheck disable=SC2064  # expand $body now: it is the file to remove.
   trap "rm -f '$body'" RETURN
 
-  code="$(curl -sS -o "$body" -w '%{http_code}' \
+  # GHCR answers the token endpoint with 403 DENIED — not 404 — for a package
+  # that does not exist or that the caller cannot see, so "never published" and
+  # "cannot read" are indistinguishable here. That is exactly why an unreadable
+  # registry falls back to the git tags below instead of deciding anything.
+  local auth=()
+  if [ -n "${REGISTRY_TOKEN:-}" ]; then
+    auth=(-u "${REGISTRY_USER:-token}:${REGISTRY_TOKEN}")
+  fi
+  code="$(curl -sS --retry 2 --retry-all-errors --max-time 30 "${auth[@]}" -o "$body" -w '%{http_code}' \
     "https://${host}/token?service=${host}&scope=repository:${repo}:pull" 2>/dev/null || echo 000)"
   [ "$code" = 200 ] || { echo unreachable; return 0; }
   token="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("token",""))' "$body" 2>/dev/null || true)"
@@ -136,11 +153,12 @@ default_registry_tags() {
 
   # n=1000 is far above the number of tags this package will ever hold, so the
   # list comes back in one page and no Link-header paging is needed.
-  code="$(curl -sS -o "$body" -w '%{http_code}' -H "Authorization: Bearer $token" \
+  code="$(curl -sS --retry 2 --retry-all-errors --max-time 30 -o "$body" -w '%{http_code}' \
+    -H "Authorization: Bearer $token" \
     "https://${host}/v2/${repo}/tags/list?n=1000" 2>/dev/null || echo 000)"
   case "$code" in
     200) ;;
-    404) return 0 ;;  # nothing published under this name yet
+    404) return 0 ;;  # a token was issued but nothing is published under this name
     *) echo unreachable; return 0 ;;
   esac
   python3 -c '
@@ -163,10 +181,30 @@ registry_tags() {
 
 published="$(registry_tags)"
 if [ "$published" = unreachable ]; then
-  # Fail closed, and it costs nothing: check-release-overwrite.sh runs moments
-  # later in the same job and refuses outright when it cannot read the
-  # registry, so no release that would have succeeded is losing :latest here.
-  decide false "could not read the published tags of $IMAGE, so it is unknown whether a newer version is already released"
+  # Say so, then decide on the git tags alone — the answer this script gave
+  # before the registry witness existed.
+  #
+  # Deciding "false" here instead would be worse than the hole it guards. The
+  # registry is unreadable for mundane reasons (anonymous rate limiting, a 5xx,
+  # the package renamed or made private, and GHCR's 403-for-unpublished above),
+  # and a false answer does not stop the release: it publishes the version,
+  # leaves :latest on the older one, and — since the GitHub Release now follows
+  # the same decision — leaves releases/latest/download/install.yaml serving
+  # the older operator too, with nothing but a warning to say so.
+  #
+  # check-release-overwrite.sh is NOT a backstop for that. It refuses on an
+  # unreadable registry only when it gets that far: a tag-push release whose
+  # tag already points at the commit being built short-circuits before its
+  # registry probe, so on that trigger nothing else would catch it.
+  #
+  # What is left open is narrow and no worse than before: a release that died
+  # before writing its tag stays invisible only while the registry is also
+  # unreadable. Every other time, the witness below sees it.
+  echo "check-latest-eligible: could not read the published tags of $IMAGE; deciding from the git tags alone." >&2
+  if [ -n "${GITHUB_ACTIONS:-}" ]; then
+    echo "::warning title=Registry not consulted::Could not read the published tags of $IMAGE, so the :latest decision for v$version is based only on the git tags. A release that failed before creating its tag would not be visible."
+  fi
+  published=""
 fi
 collect_stable false <<< "$published"
 

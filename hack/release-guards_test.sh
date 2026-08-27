@@ -83,6 +83,10 @@ make_registry() { # make_registry <name> [tag...]
 }
 
 # check <name> <expected-exit> <expected-substring> -- <command...>
+#
+# Prefix the substring with "!" to assert its ABSENCE instead. Without that,
+# passing "" asserts nothing about the output at all, which is how a case ends
+# up unable to fail.
 check() {
   local name="$1" want_exit="$2" want_text="$3"
   shift 4 # name, exit, text, "--"
@@ -91,6 +95,10 @@ check() {
   local problem=""
   if [ "$rc" -ne "$want_exit" ]; then
     problem="expected exit $want_exit, got $rc"
+  elif [ "${want_text:0:1}" = "!" ]; then
+    if [[ "$out" == *"${want_text:1}"* ]]; then
+      problem="output contained '${want_text:1}', which it must not"
+    fi
   elif [ -n "$want_text" ] && [[ "$out" != *"$want_text"* ]]; then
     problem="output did not contain '$want_text'"
   fi
@@ -203,16 +211,28 @@ check "newer than everything published takes :latest" 0 "true" -- \
 # sha256-* attestation tags. None of them is a version to be older than.
 check "dev, latest and attestation tags are not releases" 0 "true" -- \
   env REPO_DIR="$two_repo" REGISTRY_TAGS="$published_junk" "$LATEST" 0.3.0
-check "registry junk is not reported as a hand-made tag" 0 "" -- \
+check "registry junk is not reported as a hand-made tag" 0 "!ignoring tag" -- \
   env REPO_DIR="$two_repo" REGISTRY_TAGS="$published_junk" "$LATEST" 0.3.0
 
-# A registry that cannot be read is not permission to move :latest. This costs
-# nothing: check-release-overwrite.sh refuses the release outright moments
-# later for the same reason.
-check "unreadable registry leaves :latest alone" 0 "false" -- \
+# A registry that cannot be read falls back to the git tags — the answer this
+# script gave before the second witness existed — and says so. Deciding "false"
+# instead would be worse than the hole it guards: the release still publishes,
+# but :latest and the GitHub Release both stay on the older version, and on a
+# tag-push release check-release-overwrite.sh short-circuits before its own
+# registry probe, so nothing else would catch it.
+check "unreadable registry falls back to the git tags" 0 "true" -- \
   env REPO_DIR="$two_repo" REGISTRY_TAGS="$unreachable_registry" "$LATEST" 0.3.0
-check "unreadable registry says why" 0 "could not read the published tags" -- \
+check "unreadable registry says the tags decided it" 0 "newer than the newest stable release, v0.2.0" -- \
   env REPO_DIR="$two_repo" REGISTRY_TAGS="$unreachable_registry" "$LATEST" 0.3.0
+check "unreadable registry says so out loud" 0 "could not read the published tags" -- \
+  env REPO_DIR="$two_repo" REGISTRY_TAGS="$unreachable_registry" "$LATEST" 0.3.0
+
+# The fallback is a fallback, not an amnesty: git-tag ordering still refuses an
+# older release, and a first release with no tags anywhere still takes :latest.
+check "unreadable registry still refuses an older version" 0 "false" -- \
+  env REPO_DIR="$two_repo" REGISTRY_TAGS="$unreachable_registry" "$LATEST" 0.1.0
+check "unreadable registry still allows the first release" 0 "no stable release exists yet" -- \
+  env REPO_DIR="$empty_repo" REGISTRY_TAGS="$unreachable_registry" "$LATEST" 0.1.0
 
 # A prerelease is decided before either witness is consulted, so a broken
 # registry cannot make a dev build fail or hang.
