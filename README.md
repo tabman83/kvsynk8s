@@ -214,6 +214,11 @@ az role assignment create --assignee $PRINCIPAL --role "Storage Queue Data Messa
   --scope "$(az storage account show -n $SA -g $RG --query id -o tsv)/queueServices/default/queues/$QUEUE"
 ```
 
+The event subscription's delivery schema does not matter. The command above
+uses the default (Event Grid schema), but if you add
+`--event-delivery-schema cloudeventschemav1_0`, or your Bicep/Terraform sets
+it, the operator reads that too. Both schemas carry the same data.
+
 Two roles, nothing more: `Key Vault Secrets User` on the vault (read
 secrets — never write, never list/manage keys or certs) and
 `Storage Queue Data Message Processor` on the queue (read + delete messages —

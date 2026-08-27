@@ -23,8 +23,11 @@
 //
 // body is the raw queue message text exactly as azure.QueueMessage.Text
 // carries it: still Base64-encoded, per contracts/queue-message.md ("Queue
-// message body: Base64-encoded JSON of a single Event Grid schema event").
-// Parse itself does the Base64 decode + JSON unmarshal (rule 1).
+// message body: Base64-encoded JSON of a single event"). Both delivery schemas
+// Event Grid can be configured to send -- Event Grid schema and CloudEvents
+// v1.0 -- are accepted; the Base64 wrapping belongs to the Storage Queue
+// destination, not to the schema, so it is the same either way. Parse itself
+// does the Base64 decode + JSON unmarshal (rule 1).
 //
 // Return contract (contracts/queue-message.md "Processing rules"):
 //
@@ -33,9 +36,11 @@
 //     error's message NEVER echoes any byte of the message body (constitution
 //     I: this rule is unconditional, not merely because values are not
 //     expected on this path).
-//  2. eventType != "Microsoft.KeyVault.SecretNewVersionCreated" (e.g.
+//  2. event type != "Microsoft.KeyVault.SecretNewVersionCreated" (e.g.
 //     SecretNearExpiry, SecretExpired, or any other/unknown type) -> (nil,
-//     nil): a clean, silent discard, not an error (v1 scope).
+//     nil): a clean, silent discard, not an error (v1 scope). The type is
+//     resolved from `eventType` (Event Grid schema), else `type`
+//     (CloudEvents v1.0); the value is the same string in both.
 //  3. data.ObjectType that is not "secret" case-insensitively -> (nil, nil):
 //     same silent discard. Azure's documented payload carries "Secret" with a
 //     capital S, so the shared fixtures below use that literal.
@@ -94,8 +99,42 @@ func eventPayloadWithTimestamps(id, eventType, vaultName, objectType, objectName
 }`, id, vaultName, objectName, eventType, vaultName, objectName, version, vaultName, objectType, objectName, version, nbf, exp)
 }
 
+// cloudEventPayload builds the same event as eventPayload but in the
+// CloudEvents v1.0 delivery schema, which is what Event Grid puts on the queue
+// when the event subscription was created with
+// `--event-delivery-schema cloudeventschemav1_0`
+// (learn.microsoft.com/azure/event-grid/cloud-event-schema). The shape is the
+// published CloudEvents sample for SecretNewVersionCreated on
+// learn.microsoft.com/azure/event-grid/event-schema-key-vault: the event type
+// moves from "eventType" to "type", "topic" becomes "source", "eventTime"
+// becomes "time", "dataVersion"/"metadataVersion" are replaced by
+// "specversion" -- and "data" is byte-for-byte the same object as in the Event
+// Grid schema sample, which is why both schemas must produce the identical
+// ParsedEvent.
+func cloudEventPayload(id, eventType, vaultName, objectType, objectName, version string) string {
+	return fmt.Sprintf(`{
+  "id": %q,
+  "source": "/subscriptions/sub-id/resourceGroups/rg/providers/Microsoft.KeyVault/vaults/%s",
+  "subject": %q,
+  "type": %q,
+  "time": "2026-08-21T10:12:33.1234567Z",
+  "data": {
+    "Id": "https://%s.vault.azure.net/secrets/%s/%s",
+    "VaultName": %q,
+    "ObjectType": %q,
+    "ObjectName": %q,
+    "Version": %q,
+    "NBF": %s,
+    "EXP": %s
+  },
+  "specversion": "1.0"
+}`, id, vaultName, objectName, eventType, vaultName, objectName, version, vaultName, objectType, objectName, version, docNBF, docEXP)
+}
+
 // encodedBody Base64-encodes payload the way Event Grid encodes events when
-// delivering to a Storage Queue (contracts/queue-message.md "Envelope").
+// delivering to a Storage Queue (contracts/queue-message.md "Envelope"). The
+// Base64 wrapping is a property of the Storage Queue destination, not of the
+// event schema, so it is identical for both delivery schemas.
 func encodedBody(payload string) []byte {
 	return []byte(base64.StdEncoding.EncodeToString([]byte(payload)))
 }
@@ -403,5 +442,152 @@ func TestParse_MissingData_MalformedError(t *testing.T) {
 	}
 	if !errors.Is(err, ErrMalformedMessage) {
 		t.Errorf("Parse() error = %v, want it to wrap ErrMalformedMessage (missing data)", err)
+	}
+}
+
+// TestParse_NullData_MalformedError pins the other spelling of "no data
+// payload". It matters because Parse no longer type-asserts the SDK
+// envelope's `any` Data field to []byte -- it decodes `data` as a
+// json.RawMessage -- and a JSON `null` decodes into a RawMessage perfectly
+// happily, as the four literal bytes `null`. Without an explicit check that
+// would stop being malformed and fall through to a ParsedEvent with every
+// field empty, which the listener would then try to match against SecretSync
+// objects. Absent and null must both stay malformed.
+func TestParse_NullData_MalformedError(t *testing.T) {
+	body := encodedBody(fmt.Sprintf(`{"id": %q, "eventType": %q, "data": null}`, testEventID, newVersionET))
+
+	got, err := Parse(body)
+	if got != nil {
+		t.Fatalf("Parse() = %+v, want nil on malformed input", got)
+	}
+	if !errors.Is(err, ErrMalformedMessage) {
+		t.Errorf("Parse() error = %v, want it to wrap ErrMalformedMessage (null data)", err)
+	}
+}
+
+// TestParse_CloudEventsSchema_SameParsedEventAsEventGridSchema is the
+// regression test for the third way this parser could silently kill the whole
+// realtime path (FR-005) while every test passed.
+//
+// Event Grid lets whoever creates the event subscription choose the delivery
+// schema, and CloudEvents v1.0 is a supported, documented choice
+// (learn.microsoft.com/azure/event-grid/cloud-event-schema:
+// `--event-delivery-schema cloudeventschemav1_0`). A CloudEvents envelope has
+// no "eventType" field at all -- the type lives in "type". Parse used to
+// decode into azsystemevents.EventGridEvent, which models only the Event Grid
+// spelling, so EventType came back nil and *every* message was rejected as
+// ErrMalformedMessage: the listener deleted each one as poison and the log
+// blamed the message body instead of the subscription's schema setting, which
+// makes it near-impossible to diagnose from the operator's side. 100% of
+// rotations lost until the 4h periodic reconcile.
+//
+// The data payload is identical across the two schemas, so the two envelopes
+// must produce the exact same ParsedEvent -- that equality is the assertion,
+// not just "CloudEvents parses".
+func TestParse_CloudEventsSchema_SameParsedEventAsEventGridSchema(t *testing.T) {
+	eventGrid, err := Parse(encodedBody(eventPayload(testEventID, newVersionET, testVault, secretType, testObject, testVersion)))
+	if err != nil {
+		t.Fatalf("Parse(Event Grid schema) error = %v, want nil", err)
+	}
+	if eventGrid == nil {
+		t.Fatal("Parse(Event Grid schema) = nil, want a ParsedEvent")
+	}
+
+	cloudEvent, err := Parse(encodedBody(cloudEventPayload(testEventID, newVersionET, testVault, secretType, testObject, testVersion)))
+	if err != nil {
+		t.Fatalf("Parse(CloudEvents schema) error = %v, want nil (CloudEvents is a supported delivery schema)", err)
+	}
+	if cloudEvent == nil {
+		t.Fatal("Parse(CloudEvents schema) = nil, want a ParsedEvent")
+	}
+
+	want := ParsedEvent{ID: testEventID, VaultName: testVault, SecretName: testObject, Version: testVersion}
+	if *eventGrid != want {
+		t.Errorf("Parse(Event Grid schema) = %+v, want %+v", *eventGrid, want)
+	}
+	if *cloudEvent != want {
+		t.Errorf("Parse(CloudEvents schema) = %+v, want %+v", *cloudEvent, want)
+	}
+	if *cloudEvent != *eventGrid {
+		t.Errorf("the two delivery schemas disagree: CloudEvents = %+v, Event Grid = %+v", *cloudEvent, *eventGrid)
+	}
+}
+
+// TestParse_CloudEventsSchema_NonActionableTypes_Discarded holds that resolving
+// the type out of "type" feeds rule 2's guard exactly like "eventType" does:
+// a CloudEvents envelope carrying a type we do not act on is still a clean
+// discard, (nil, nil), never an error. Otherwise accepting CloudEvents would
+// turn every SecretNearExpiry into a logged malformed message.
+func TestParse_CloudEventsSchema_NonActionableTypes_Discarded(t *testing.T) {
+	tests := []struct {
+		name      string
+		eventType string
+	}{
+		{name: "near expiry", eventType: nearExpiryET},
+		{name: "expired", eventType: expiredET},
+		{name: "unknown future type", eventType: unknownET},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := encodedBody(cloudEventPayload(testEventID, tt.eventType, testVault, secretType, testObject, testVersion))
+
+			got, err := Parse(body)
+			if err != nil {
+				t.Fatalf("Parse() error = %v, want nil (a non-actionable type is a discard, not an error)", err)
+			}
+			if got != nil {
+				t.Fatalf("Parse() = %+v, want nil (%s is out of v1 scope)", got, tt.eventType)
+			}
+		})
+	}
+}
+
+// TestParse_CloudEventsSchema_ObjectTypeNotSecret_Discarded pins that the
+// ObjectType guard is unchanged by the envelope the event arrived in: the data
+// payload is the same object in both schemas, so a certificate event stays a
+// clean discard.
+func TestParse_CloudEventsSchema_ObjectTypeNotSecret_Discarded(t *testing.T) {
+	body := encodedBody(cloudEventPayload(testEventID, newVersionET, testVault, certType, testObject, testVersion))
+
+	got, err := Parse(body)
+	if err != nil {
+		t.Fatalf("Parse() error = %v, want nil (discard, not an error)", err)
+	}
+	if got != nil {
+		t.Fatalf("Parse() = %+v, want nil (ObjectType != secret must be discarded)", got)
+	}
+}
+
+// TestParse_NeitherEventTypeNorType_MalformedError keeps the floor under the
+// two-spelling lookup: an envelope that carries neither spelling really is
+// unusable, and stays ErrMalformedMessage rather than becoming a silent
+// discard. The wording is asserted too, because an error naming only
+// "eventType" sends an operator who chose CloudEvents looking in the wrong
+// place -- the exact diagnosis problem this change exists to fix. The sentinel
+// re-checks constitution I on this path: the wording is fixed and static, so
+// nothing derived from the body can ride out in it.
+func TestParse_NeitherEventTypeNorType_MalformedError(t *testing.T) {
+	const marker = "SENTINEL-no-event-type-marker-ghi789"
+	body := encodedBody(fmt.Sprintf(`{
+  "id": %q,
+  "source": "/subscriptions/sub-id/resourceGroups/rg/providers/Microsoft.KeyVault/vaults/%s",
+  "subject": %q,
+  "specversion": "1.0",
+  "data": {"VaultName": %q, "ObjectType": %q, "ObjectName": %q}
+}`, testEventID, testVault, marker, testVault, secretType, marker))
+
+	got, err := Parse(body)
+	if got != nil {
+		t.Fatalf("Parse() = %+v, want nil on malformed input", got)
+	}
+	if !errors.Is(err, ErrMalformedMessage) {
+		t.Fatalf("Parse() error = %v, want it to wrap ErrMalformedMessage (neither eventType nor type)", err)
+	}
+	if !strings.Contains(err.Error(), "eventType or type") {
+		t.Errorf("Parse() error = %q, want it to name both spellings so the operator knows which schemas were looked for", err.Error())
+	}
+	if strings.Contains(err.Error(), marker) {
+		t.Fatalf("Parse() error echoes message body content: %q", err.Error())
 	}
 }

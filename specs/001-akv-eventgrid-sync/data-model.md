@@ -66,9 +66,9 @@ Write rules:
 
 ## Change notification (transient)
 
-An Event Grid schema event pulled from the Azure Storage Queue. See [contracts/queue-message.md](contracts/queue-message.md).
+A Key Vault event pulled from the Azure Storage Queue, in either delivery schema — the subscription's `--event-delivery-schema` decides, and both are accepted. See [contracts/queue-message.md](contracts/queue-message.md).
 
-Fields used: `eventType` (filter: only `Microsoft.KeyVault.SecretNewVersionCreated` acts), `data.VaultName`, `data.ObjectName`, `data.ObjectType` (filter: `secret`, matched case-insensitively — Azure sends `Secret`), `data.Version`, `id` (logging/correlation). Carries no secret value by design.
+Fields used: `eventType` (Event Grid schema) or `type` (CloudEvents v1.0), first non-empty wins — only `Microsoft.KeyVault.SecretNewVersionCreated` acts, and the value is the same string in both schemas; `data.VaultName`, `data.ObjectName`, `data.ObjectType` (filter: `secret`, matched case-insensitively — Azure sends `Secret`), `data.Version`, `id` (logging/correlation). Carries no secret value by design.
 
 Mapping: `(VaultName, ObjectName)` → all `SecretSync` resources across namespaces whose `spec.vault` matches. Both the vault name and the secret name are compared case-insensitively, because Key Vault names are case-insensitive and case-preserving: the event carries the casing the object was created with, which need not match the casing written in the spec. No match ⇒ delete message, done (FR-006). Match ⇒ trigger `SyncEngine` for each; the engine fetches the **latest** version from Key Vault, not `data.Version` (latest-wins, research R8).
 
