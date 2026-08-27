@@ -62,6 +62,26 @@ make_probe() { # make_probe <answer...>
   printf '%s\n' "$script"
 }
 
+# A stand-in for the registry's tag list. Prints the given tags, one per line —
+# or nothing at all, which is what an unpublished package looks like. Pass the
+# single word "unreachable" for the registry-is-down case.
+make_registry() { # make_registry <name> [tag...]
+  local name="$1"; shift
+  local script="$workdir/registry-$name.sh"
+  local args="" tag
+  for tag in "$@"; do
+    args="$args $(printf '%q' "$tag")"
+  done
+  {
+    echo '#!/usr/bin/env bash'
+    # One tag per line, which is the contract REGISTRY_TAGS documents. No tags
+    # at all means an unpublished package, so the script prints nothing.
+    [ -z "$args" ] || echo "printf '%s\n'$args"
+  } > "$script"
+  chmod +x "$script"
+  printf '%s\n' "$script"
+}
+
 # check <name> <expected-exit> <expected-substring> -- <command...>
 check() {
   local name="$1" want_exit="$2" want_text="$3"
@@ -94,65 +114,110 @@ double_digit_repo="$(make_repo latest-doubledigit v0.9.0 v0.10.0)"
 prerelease_only_repo="$(make_repo latest-prerelease-only v0.2.0-rc1)"
 junk_repo="$(make_repo latest-junk v0.1.0 v1.2 vfoo1)"
 
+# Every case below that is about git-tag ordering pins the registry to "nothing
+# published", so the two witnesses are exercised one at a time. The registry
+# ones come after.
+no_registry="$(make_registry none)"
+
 # The very first release must take :latest even though nothing came before it.
 check "first-ever release takes :latest" 0 "true" -- \
-  env REPO_DIR="$empty_repo" "$LATEST" 0.1.0
+  env REPO_DIR="$empty_repo" REGISTRY_TAGS="$no_registry" "$LATEST" 0.1.0
 check "first-ever release says why" 0 "no stable release exists yet" -- \
-  env REPO_DIR="$empty_repo" "$LATEST" 0.1.0
+  env REPO_DIR="$empty_repo" REGISTRY_TAGS="$no_registry" "$LATEST" 0.1.0
 
 # The normal case: a new version, newer than everything released.
 check "newer version takes :latest" 0 "true" -- \
-  env REPO_DIR="$two_repo" "$LATEST" 0.3.0
+  env REPO_DIR="$two_repo" REGISTRY_TAGS="$no_registry" "$LATEST" 0.3.0
 
 # HOLE 1 itself: re-running an older stable release must leave :latest alone.
 check "older version does not take :latest" 0 "false" -- \
-  env REPO_DIR="$two_repo" "$LATEST" 0.1.0
+  env REPO_DIR="$two_repo" REGISTRY_TAGS="$no_registry" "$LATEST" 0.1.0
 check "older version warns about the newer one" 0 "older than the newest stable release, v0.2.0" -- \
-  env REPO_DIR="$two_repo" "$LATEST" 0.1.0
+  env REPO_DIR="$two_repo" REGISTRY_TAGS="$no_registry" "$LATEST" 0.1.0
 
 # Re-running the newest release: :latest already points here, so this is a
 # no-op rather than something to refuse.
 check "equal to newest takes :latest" 0 "true" -- \
-  env REPO_DIR="$two_repo" "$LATEST" 0.2.0
+  env REPO_DIR="$two_repo" REGISTRY_TAGS="$no_registry" "$LATEST" 0.2.0
 
 # Ordering must be semver-aware. Lexicographically 0.9.1 beats 0.10.0.
 check "0.9.1 is older than 0.10.0" 0 "false" -- \
-  env REPO_DIR="$double_digit_repo" "$LATEST" 0.9.1
+  env REPO_DIR="$double_digit_repo" REGISTRY_TAGS="$no_registry" "$LATEST" 0.9.1
 check "0.11.0 is newer than 0.10.0" 0 "true" -- \
-  env REPO_DIR="$double_digit_repo" "$LATEST" 0.11.0
+  env REPO_DIR="$double_digit_repo" REGISTRY_TAGS="$no_registry" "$LATEST" 0.11.0
 
 # Prereleases and dev builds never own :latest, whatever the ordering says.
 check "prerelease never takes :latest" 0 "false" -- \
-  env REPO_DIR="$two_repo" "$LATEST" 0.3.0-rc1
+  env REPO_DIR="$two_repo" REGISTRY_TAGS="$no_registry" "$LATEST" 0.3.0-rc1
 check "dev build never takes :latest" 0 "is a prerelease" -- \
-  env REPO_DIR="$two_repo" "$LATEST" 0.2.1-dev.42
+  env REPO_DIR="$two_repo" REGISTRY_TAGS="$no_registry" "$LATEST" 0.2.1-dev.42
 
 # A repository holding only prerelease tags has no stable release to be older
 # than, so the first stable one still takes :latest.
 check "only prerelease tags counts as no stable release" 0 "true" -- \
-  env REPO_DIR="$prerelease_only_repo" "$LATEST" 0.2.0
+  env REPO_DIR="$prerelease_only_repo" REGISTRY_TAGS="$no_registry" "$LATEST" 0.2.0
 
 # Tags the release pipeline could never have created are not releases.
 check "hand-made tags are ignored" 0 "true" -- \
-  env REPO_DIR="$junk_repo" "$LATEST" 0.2.0
+  env REPO_DIR="$junk_repo" REGISTRY_TAGS="$no_registry" "$LATEST" 0.2.0
 check "hand-made tags are reported" 0 "ignoring tag 'v1.2'" -- \
-  env REPO_DIR="$junk_repo" "$LATEST" 0.2.0
+  env REPO_DIR="$junk_repo" REGISTRY_TAGS="$no_registry" "$LATEST" 0.2.0
 
 # Malformed input makes no decision at all.
 check "leading v is refused" 2 "is not a version" -- \
-  env REPO_DIR="$two_repo" "$LATEST" v0.3.0
+  env REPO_DIR="$two_repo" REGISTRY_TAGS="$no_registry" "$LATEST" v0.3.0
 check "two-part version is refused" 2 "is not a version" -- \
-  env REPO_DIR="$two_repo" "$LATEST" 1.2
+  env REPO_DIR="$two_repo" REGISTRY_TAGS="$no_registry" "$LATEST" 1.2
 check "build metadata is refused" 2 "is not a version" -- \
-  env REPO_DIR="$two_repo" "$LATEST" "1.2.3+build"
+  env REPO_DIR="$two_repo" REGISTRY_TAGS="$no_registry" "$LATEST" "1.2.3+build"
 check "no arguments is refused" 2 "usage:" -- \
-  env REPO_DIR="$two_repo" "$LATEST"
+  env REPO_DIR="$two_repo" REGISTRY_TAGS="$no_registry" "$LATEST"
 
 # GITHUB_OUTPUT gets the decision the workflow gates on.
 github_output="$workdir/github_output"
 : > "$github_output"
-GITHUB_OUTPUT="$github_output" REPO_DIR="$two_repo" "$LATEST" 0.1.0 >/dev/null 2>&1
+GITHUB_OUTPUT="$github_output" REPO_DIR="$two_repo" REGISTRY_TAGS="$no_registry" "$LATEST" 0.1.0 >/dev/null 2>&1
 check "writes latest=false to GITHUB_OUTPUT" 0 "latest=false" -- cat "$github_output"
+
+# The registry is the second witness, and it exists because the git tag is
+# written by the LAST job of the release workflow: a run that published the
+# image and then died leaves a released version with no tag at all. Without
+# this, dispatching an older version afterwards would drag :latest backwards —
+# the very thing this guard was written to stop, just through the gap the tag
+# ordering cannot see.
+published_newer="$(make_registry newer v0.1.0 v0.2.0 v1.0.0)"
+published_junk="$(make_registry junk v0.1.0 v0.2.0 latest v0.2.1-dev.7 sha256-deadbeef)"
+unreachable_registry="$(make_registry down unreachable)"
+
+check "a published version with no tag still blocks :latest" 0 "false" -- \
+  env REPO_DIR="$two_repo" REGISTRY_TAGS="$published_newer" "$LATEST" 0.2.1
+check "and says which version it lost to" 0 "older than the newest stable release, v1.0.0" -- \
+  env REPO_DIR="$two_repo" REGISTRY_TAGS="$published_newer" "$LATEST" 0.2.1
+
+# Being newer than everything, tagged or merely published, is still the normal
+# case and still takes :latest.
+check "newer than everything published takes :latest" 0 "true" -- \
+  env REPO_DIR="$two_repo" REGISTRY_TAGS="$published_newer" "$LATEST" 1.1.0
+
+# The registry holds more than releases: dev builds, :latest itself, and the
+# sha256-* attestation tags. None of them is a version to be older than.
+check "dev, latest and attestation tags are not releases" 0 "true" -- \
+  env REPO_DIR="$two_repo" REGISTRY_TAGS="$published_junk" "$LATEST" 0.3.0
+check "registry junk is not reported as a hand-made tag" 0 "" -- \
+  env REPO_DIR="$two_repo" REGISTRY_TAGS="$published_junk" "$LATEST" 0.3.0
+
+# A registry that cannot be read is not permission to move :latest. This costs
+# nothing: check-release-overwrite.sh refuses the release outright moments
+# later for the same reason.
+check "unreadable registry leaves :latest alone" 0 "false" -- \
+  env REPO_DIR="$two_repo" REGISTRY_TAGS="$unreachable_registry" "$LATEST" 0.3.0
+check "unreadable registry says why" 0 "could not read the published tags" -- \
+  env REPO_DIR="$two_repo" REGISTRY_TAGS="$unreachable_registry" "$LATEST" 0.3.0
+
+# A prerelease is decided before either witness is consulted, so a broken
+# registry cannot make a dev build fail or hang.
+check "prerelease never touches the registry" 0 "is a prerelease" -- \
+  env REPO_DIR="$two_repo" REGISTRY_TAGS=/nonexistent/registry-probe "$LATEST" 0.3.0-rc1
 
 # --- check-release-overwrite.sh ---------------------------------------------
 

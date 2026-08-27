@@ -149,6 +149,10 @@ jobs:
         id: latest
         env:
           VERSION: ${{ steps.resolve.outputs.version }}
+          # The guard reads the image's published tags as a second witness, so
+          # a version whose release run died before creating its git tag still
+          # counts as released. Read anonymously: the package is public.
+          IMAGE: ${{ env.IMAGE }}
         run: hack/check-latest-eligible.sh "$VERSION" > /dev/null
 
       - name: Record the :latest decision in the summary
@@ -327,6 +331,20 @@ jobs:
           hack/check-render.sh /tmp/render/default.yaml /tmp/render/nondefault.yaml
           hack/check-values.sh
 
+      # helm.yml runs this too, and calls it release-critical there: the image
+      # is pushed as :vX.Y.Z while the chart is packaged with appVersion X.Y.Z,
+      # so the chart has to put the "v" back. It is repeated here because this
+      # workflow does not depend on helm.yml — a chart that lost the prefix
+      # could be released green while helm.yml sat red on master, and every
+      # default install of it would pull a tag that does not exist.
+      - name: Default image tag resolves to the tag the release actually pushes
+        run: |
+          helm package charts/kvsynk8s --version 9.9.9 --app-version 9.9.9 --destination /tmp/pkg
+          got="$(helm template kvsynk8s /tmp/pkg/kvsynk8s-9.9.9.tgz --namespace kvsynk8s \
+                 | grep -m1 -oE 'ghcr\.io/tabman83/kvsynk8s:[^"]+')"
+          echo "rendered image: $got"
+          test "$got" = "ghcr.io/tabman83/kvsynk8s:v9.9.9"
+
       - name: Chart is in sync with the generated manifests
         run: |
           make manifests helm-sync
@@ -481,6 +499,12 @@ jobs:
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
+          # pipefail, because the default shell for a `run:` block is `bash -e`
+          # WITHOUT it: piping helm into tee would otherwise hand the step tee's
+          # exit status, and a failed push would sail past. The digest grep is no
+          # backstop either — registry errors routinely quote a blob URL with a
+          # sha256 in it, which would be attested as if it were the chart.
+          set -o pipefail
           # helm prints "Digest: sha256:..." on success; keep it for the attestation.
           helm push "kvsynk8s-${VERSION}.tgz" oci://ghcr.io/tabman83/charts 2>&1 | tee /tmp/push.log
           DIGEST="$(grep -oE 'sha256:[0-9a-f]{64}' /tmp/push.log | head -1)"
@@ -537,6 +561,13 @@ jobs:
           tag_name: ${{ needs.prepare.outputs.tag }}
           target_commitish: ${{ github.sha }}
           prerelease: ${{ needs.prepare.outputs.prerelease }}
+          # The same decision that gates the image's :latest tag
+          # (hack/check-latest-eligible.sh). Left unset, the create-release API
+          # defaults it to true, so releasing an older stable — a backport,
+          # which this pipeline supports on purpose — would mark it "Latest
+          # release" and make releases/latest/download/install.yaml serve the
+          # OLD operator, while the image :latest correctly stayed put.
+          make_latest: ${{ needs.prepare.outputs.latest }}
           files: |
             dist/install.yaml
             dist/kvsynk8s-*.tgz
