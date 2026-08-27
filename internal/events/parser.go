@@ -15,6 +15,7 @@
 package events
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -54,16 +55,58 @@ type ParsedEvent struct {
 	Version string
 }
 
+// eventEnvelope is the handful of top-level fields Parse actually reads,
+// decoded into a local struct instead of into azsystemevents.EventGridEvent.
+//
+// Event Grid lets whoever creates the event subscription choose the delivery
+// schema, and CloudEvents v1.0 is a supported, documented choice
+// (learn.microsoft.com/azure/event-grid/cloud-event-schema, selected with
+// `--event-delivery-schema cloudeventschemav1_0`). The two envelopes carry the
+// same event under different top-level names, and the Key Vault event schema
+// page publishes a sample of each: the event type is `eventType` in the Event
+// Grid schema and `type` in CloudEvents, while everything else that differs
+// (`topic`/`source`, `eventTime`/`time`, `dataVersion`/`metadataVersion` vs
+// `specversion`) is not read here at all. The `data` object is byte-for-byte
+// identical between the two.
+//
+// azsystemevents.EventGridEvent models only the Event Grid spelling, so it left
+// EventType nil for every CloudEvents message and Parse rejected all of them
+// with ErrMalformedMessage: an operator who picked CloudEvents when creating
+// the subscription lost 100% of the realtime path (FR-005) and got a log
+// blaming the message body instead of the subscription's schema setting, which
+// hides the real cause. Same class of silent death as the ObjectType and
+// NBF/EXP bugs below, one level further out in the message, and the same fix:
+// stop leaning on an SDK type that models a shape we do not control, and decode
+// the few fields we read ourselves. The event-type constant still comes from
+// the SDK.
+type eventEnvelope struct {
+	ID string `json:"id"`
+	// EventType is the Event Grid schema spelling of the event type, Type the
+	// CloudEvents one. A real message carries exactly one of them; Parse
+	// resolves whichever is present.
+	EventType string `json:"eventType"`
+	Type      string `json:"type"`
+	// Data stays raw so nothing inside it can make the envelope fail to
+	// decode -- see the comment on the data struct in Parse. It also replaces
+	// the `envelope.Data.([]byte)` type assertion the SDK envelope required,
+	// which depended on an SDK implementation detail (its generated
+	// UnmarshalJSON happening to stash raw bytes in an `any` field).
+	Data json.RawMessage `json:"data"`
+}
+
 // Parse decodes and interprets one raw queue message body (still
 // Base64-encoded, exactly as azure.QueueMessage.Text carries it) into a
-// ParsedEvent, or reports that the message should be discarded.
+// ParsedEvent, or reports that the message should be discarded. Both delivery
+// schemas Event Grid can be configured to send are accepted (see
+// eventEnvelope); the Base64 wrapping is a property of the Storage Queue
+// destination, not of the schema, so it is the same either way.
 //
 // Return contract (contracts/queue-message.md "Processing rules"):
 //   - Malformed body of any kind -> (nil, error) wrapping ErrMalformedMessage.
 //     The error text is always fixed, static wording -- never anything
 //     derived from body itself -- so it can never echo message content
 //     (constitution I).
-//   - eventType != "Microsoft.KeyVault.SecretNewVersionCreated" (rule 2:
+//   - event type != "Microsoft.KeyVault.SecretNewVersionCreated" (rule 2:
 //     SecretNearExpiry, SecretExpired, or anything else/unknown) -> (nil,
 //     nil): a clean discard, not an error.
 //   - data.ObjectType is not "secret" case-insensitively (rule 2; Azure sends
@@ -75,25 +118,40 @@ func Parse(body []byte) (*ParsedEvent, error) {
 		return nil, fmt.Errorf("%w: invalid base64 encoding", ErrMalformedMessage)
 	}
 
-	var envelope azsystemevents.EventGridEvent
+	var envelope eventEnvelope
 	if err := json.Unmarshal(decoded, &envelope); err != nil {
 		return nil, fmt.Errorf("%w: invalid event grid envelope", ErrMalformedMessage)
 	}
-	if envelope.EventType == nil {
-		return nil, fmt.Errorf("%w: missing eventType", ErrMalformedMessage)
+
+	// Resolve the event type across both delivery schemas: whichever spelling
+	// carries it wins, and only an envelope carrying neither is genuinely
+	// unusable. The static wording names both spellings on purpose -- an error
+	// naming only eventType points an operator who chose CloudEvents at the
+	// message when the answer is in the subscription.
+	eventType := envelope.EventType
+	if eventType == "" {
+		eventType = envelope.Type
+	}
+	if eventType == "" {
+		return nil, fmt.Errorf("%w: missing eventType or type", ErrMalformedMessage)
 	}
 
-	id := derefString(envelope.ID)
+	id := envelope.ID
 
 	// Rule 2: act only on SecretNewVersionCreated; every other type
 	// (SecretNearExpiry, SecretExpired, anything unrecognized) is out of v1
-	// scope and discarded without error.
-	if *envelope.EventType != azsystemevents.TypeKeyVaultSecretNewVersionCreated {
+	// scope and discarded without error. The type value is the same string in
+	// both schemas, so one comparison against the SDK constant covers both.
+	if eventType != azsystemevents.TypeKeyVaultSecretNewVersionCreated {
 		return nil, nil
 	}
 
-	dataBytes, ok := envelope.Data.([]byte)
-	if !ok {
+	// A `data` that is absent or explicitly null is a malformed message for an
+	// otherwise-actionable event type (rule 1). json.RawMessage happily accepts
+	// a JSON null as the four bytes `null`, so it has to be rejected here
+	// rather than being left to decode into an all-nil data struct.
+	dataBytes := bytes.TrimSpace(envelope.Data)
+	if len(dataBytes) == 0 || bytes.Equal(dataBytes, []byte("null")) {
 		return nil, fmt.Errorf("%w: missing event data", ErrMalformedMessage)
 	}
 
@@ -114,8 +172,9 @@ func Parse(body []byte) (*ParsedEvent, error) {
 	// These four strings are everything the listener needs, and any spelling of
 	// NBF/EXP -- string, number, null, absent -- is simply ignored. Field names
 	// are the documented PascalCase ones; encoding/json matches object keys
-	// case-insensitively, so a camelCase variant would bind too. The envelope
-	// and the event-type constant still come from the SDK.
+	// case-insensitively, so a camelCase variant would bind too. This object is
+	// identical in both delivery schemas, so it is decoded the same way for
+	// either. The event-type constant still comes from the SDK.
 	var data struct {
 		VaultName  *string
 		ObjectType *string

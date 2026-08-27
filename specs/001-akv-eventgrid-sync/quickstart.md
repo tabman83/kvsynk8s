@@ -47,6 +47,11 @@ az role assignment create --assignee $PRINCIPAL --role "Storage Queue Data Messa
   --scope "$(az storage account show -n $SA -g $RG --query id -o tsv)/queueServices/default/queues/$QUEUE"
 ```
 
+The event subscription's delivery schema does not matter. The command above
+uses the default (Event Grid schema), but
+`--event-delivery-schema cloudeventschemav1_0` works just as well: the parser
+accepts both (contracts/queue-message.md "Envelope").
+
 ## 2. Install the operator
 
 Install from the release manifest. It is the same CRD + RBAC + Deployment the
