@@ -47,9 +47,21 @@ type TargetSpec struct {
 	// namespace. Defaults to the SecretSync's own name when empty. This
 	// default is applied by the controller at reconcile time, not by the CRD
 	// schema.
+	// The pattern is apimachinery's dns1123SubdomainFmt verbatim, so it plus
+	// MaxLength=253 accept exactly what IsDNS1123Subdomain accepts — the rule
+	// the API server applies to the managed Secret's metadata.name. Same
+	// reasoning as the dataKey rule below: a name the API server will always
+	// reject (an empty label, "my..secret"; a label edged with a hyphen,
+	// "a.-b") would only produce a SecretSync whose Secret can never be
+	// created, and that Invalid is not ErrTargetConflict, so Reconcile returns
+	// it before writing any status — the CR would sit at Pending with an empty
+	// reason forever. Reject it at admission instead.
+	// There is deliberately no per-label length rule: IsDNS1123Subdomain
+	// enforces only the 253-char total and this regex. The 63-char limit
+	// belongs to IsDNS1123Label, which Secret names are not checked against.
 	// +optional
 	// +kubebuilder:validation:MaxLength=253
-	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$`
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	SecretName string `json:"secretName,omitempty"`
 
 	// dataKey is the key under .data to store the value in. Defaults to the
