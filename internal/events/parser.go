@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/eventgrid/azsystemevents"
 )
@@ -41,7 +42,10 @@ type ParsedEvent struct {
 	// VaultName is compared case-insensitively against SecretSync
 	// spec.vault.name (data-model.md).
 	VaultName string
-	// SecretName is compared against SecretSync spec.vault.secret.
+	// SecretName is compared case-insensitively against SecretSync
+	// spec.vault.secret: Key Vault object names are case-insensitive and
+	// case-preserving, so the casing the event carries is whatever the object
+	// was created with and need not match the casing in the spec.
 	SecretName string
 	// Version is data.Version from the event: logging/correlation only. The
 	// sync engine always fetches the latest version from Key Vault instead
@@ -62,7 +66,8 @@ type ParsedEvent struct {
 //   - eventType != "Microsoft.KeyVault.SecretNewVersionCreated" (rule 2:
 //     SecretNearExpiry, SecretExpired, or anything else/unknown) -> (nil,
 //     nil): a clean discard, not an error.
-//   - data.ObjectType != "secret" (rule 2) -> (nil, nil): same clean discard.
+//   - data.ObjectType is not "secret" case-insensitively (rule 2; Azure sends
+//     "Secret") -> (nil, nil): same clean discard.
 //   - Otherwise -> (&ParsedEvent{...}, nil).
 func Parse(body []byte) (*ParsedEvent, error) {
 	decoded, err := base64.StdEncoding.DecodeString(string(body))
@@ -92,16 +97,47 @@ func Parse(body []byte) (*ParsedEvent, error) {
 		return nil, fmt.Errorf("%w: missing event data", ErrMalformedMessage)
 	}
 
-	var data azsystemevents.KeyVaultSecretNewVersionCreatedEventData
+	// The data payload is decoded into this local struct on purpose, not into
+	// azsystemevents.KeyVaultSecretNewVersionCreatedEventData. That SDK type
+	// (v1.0.0, models.go) declares NBF and EXP as *float32 and its generated
+	// UnmarshalJSON is strict, but the published sample for this very event
+	// (learn.microsoft.com/azure/event-grid/event-schema-key-vault) spells them
+	// as JSON strings -- "NBF":"1559081980" -- while the property table on the
+	// same page calls them numbers. Decoding the documented sample with the SDK
+	// type therefore fails with `cannot unmarshal string into Go value of type
+	// float32`, Parse returns ErrMalformedMessage, and the listener deletes the
+	// message as malformed: the rotation is lost until the 4h periodic
+	// reconcile. That is the same silent death of FR-005's realtime path as the
+	// ObjectType casing bug below, one step earlier.
+	//
+	// Parse reads neither NBF nor EXP, so it must not be able to fail on them.
+	// These four strings are everything the listener needs, and any spelling of
+	// NBF/EXP -- string, number, null, absent -- is simply ignored. Field names
+	// are the documented PascalCase ones; encoding/json matches object keys
+	// case-insensitively, so a camelCase variant would bind too. The envelope
+	// and the event-type constant still come from the SDK.
+	var data struct {
+		VaultName  *string
+		ObjectType *string
+		ObjectName *string
+		Version    *string
+	}
 	if err := json.Unmarshal(dataBytes, &data); err != nil {
 		return nil, fmt.Errorf("%w: invalid event data", ErrMalformedMessage)
 	}
 
 	// Rule 2 (continued): only secrets, never certificates/keys, even though
-	// the eventType namespace is shared conceptually -- SecretNewVersionCreated
-	// always carries ObjectType "secret" in practice, but this guard keeps
-	// the contract explicit and defends against a future schema surprise.
-	if data.ObjectType == nil || *data.ObjectType != "secret" {
+	// the eventType namespace is shared conceptually. The comparison is
+	// case-insensitive because the object type Azure actually sends is
+	// "Secret" with a capital S -- that is the literal in the documented
+	// Microsoft.KeyVault.SecretNewVersionCreated payload
+	// (learn.microsoft.com/azure/event-grid/event-schema-key-vault), and it is
+	// what a real vault emits. A case-sensitive compare here silently drops
+	// every genuine production event into the clean-discard branch below,
+	// killing the whole realtime path (FR-005) while the 4h periodic reconcile
+	// hides the breakage. Key Vault object types are not case-defined by
+	// contract, so match them the same way the names are matched.
+	if data.ObjectType == nil || !strings.EqualFold(*data.ObjectType, "secret") {
 		return nil, nil
 	}
 

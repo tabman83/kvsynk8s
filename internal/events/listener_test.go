@@ -30,9 +30,10 @@
 // Behavior under test (contracts/queue-message.md rules 3, 5, 6; data-model.md
 // vault matching; tasks.md T016 / SC-005):
 //
-//  1. A matched event (case-insensitive vault name, exact secret name) against
-//     one or more SecretSync objects across namespaces emits one
-//     event.GenericEvent per match, then deletes the queue message.
+//  1. A matched event (vault name and secret name both matched
+//     case-insensitively) against one or more SecretSync objects across
+//     namespaces emits one event.GenericEvent per match, then deletes the
+//     queue message.
 //  2. An event matching no SecretSync is deleted with no event emitted
 //     (FR-006).
 //  3. DequeueCount > 5 (PoisonThreshold) => the message is deleted without
@@ -209,6 +210,71 @@ func TestListener_MatchedEvent_EmitsReconcileRequests_CaseInsensitiveVaultMatch(
 
 	if deleted := queue.deletedIDs(); len(deleted) != 1 || deleted[0] != "msg-1" {
 		t.Errorf("deleted = %v, want [msg-1]", deleted)
+	}
+}
+
+// TestListener_SecretNameCasingDiffersFromSpec_StillMatches is the regression
+// test for the silently-dropped-rotation bug: matchingSecretSyncs compared the
+// vault name with strings.EqualFold but the secret name with ==. Key Vault
+// object names are case-insensitive and case-preserving, and the CRD pattern
+// for spec.vault.secret allows mixed case, so a spec whose casing differs from
+// the vault's syncs fine on every direct read (initial sync, every periodic
+// reconcile) and then matches no event at all: the message is deleted at V(1)
+// as unmatched and the rotation is only picked up hours later by the periodic
+// safety net. Here the spec and the event disagree on the casing of BOTH
+// names, and the reconcile request must still be produced.
+func TestListener_SecretNameCasingDiffersFromSpec_StillMatches(t *testing.T) {
+	match := newSecretSync("ns-a", "sync-a", "My-Vault", "App-Password")
+	cli := fakeClientWith(t, match)
+
+	// What the vault actually emits: the casing the objects were created with.
+	body := encodedBody(eventPayload(testEventID, newVersionET, "my-VAULT", secretType, "app-password", testVersion))
+	msg := azure.QueueMessage{ID: "msg-casing", PopReceipt: "pop-casing", Text: string(body), DequeueCount: 1}
+	queue := newFakeQueueSource([]azure.QueueMessage{msg})
+
+	events := make(chan event.GenericEvent, 10)
+	l := NewListener(queue, cli, events)
+
+	if _, err := l.pollOnce(context.Background()); err != nil {
+		t.Fatalf("pollOnce() error = %v, want nil", err)
+	}
+
+	got := drainEvents(t, events, 1)
+	want := types.NamespacedName{Namespace: "ns-a", Name: "sync-a"}
+	if got[0] != want {
+		t.Errorf("reconcile request for %v, want %v", got[0], want)
+	}
+
+	if deleted := queue.deletedIDs(); len(deleted) != 1 || deleted[0] != "msg-casing" {
+		t.Errorf("deleted = %v, want [msg-casing]", deleted)
+	}
+}
+
+// TestListener_DifferentSecretName_DoesNotMatch keeps the secret-name
+// comparison honest: case-insensitive must not mean "matches anything".
+func TestListener_DifferentSecretName_DoesNotMatch(t *testing.T) {
+	other := newSecretSync("ns-a", "sync-a", testVault, "some-other-secret")
+	cli := fakeClientWith(t, other)
+
+	body := encodedBody(eventPayload(testEventID, newVersionET, testVault, secretType, testObject, testVersion))
+	msg := azure.QueueMessage{ID: "msg-other-name", PopReceipt: "pop-on", Text: string(body), DequeueCount: 1}
+	queue := newFakeQueueSource([]azure.QueueMessage{msg})
+
+	events := make(chan event.GenericEvent, 10)
+	l := NewListener(queue, cli, events)
+
+	if _, err := l.pollOnce(context.Background()); err != nil {
+		t.Fatalf("pollOnce() error = %v, want nil", err)
+	}
+
+	select {
+	case evt := <-events:
+		t.Fatalf("a SecretSync for a different secret must not match, but got event %+v", evt)
+	default:
+	}
+
+	if deleted := queue.deletedIDs(); len(deleted) != 1 || deleted[0] != "msg-other-name" {
+		t.Errorf("deleted = %v, want [msg-other-name]", deleted)
 	}
 }
 

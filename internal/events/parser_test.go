@@ -36,7 +36,9 @@
 //  2. eventType != "Microsoft.KeyVault.SecretNewVersionCreated" (e.g.
 //     SecretNearExpiry, SecretExpired, or any other/unknown type) -> (nil,
 //     nil): a clean, silent discard, not an error (v1 scope).
-//  3. data.ObjectType != "secret" -> (nil, nil): same silent discard.
+//  3. data.ObjectType that is not "secret" case-insensitively -> (nil, nil):
+//     same silent discard. Azure's documented payload carries "Secret" with a
+//     capital S, so the shared fixtures below use that literal.
 //  4. Otherwise -> (&ParsedEvent{...}, nil) with VaultName/SecretName/Version
 //     copied verbatim from data.VaultName/data.ObjectName/data.Version and ID
 //     from the envelope's top-level id.
@@ -60,6 +62,18 @@ import (
 //
 //nolint:unparam // see comment above
 func eventPayload(id, eventType, vaultName, objectType, objectName, version string) string {
+	return eventPayloadWithTimestamps(id, eventType, vaultName, objectType, objectName, version, docNBF, docEXP)
+}
+
+// eventPayloadWithTimestamps is eventPayload with NBF/EXP spelled out by the
+// caller, as a raw JSON literal each. It exists because Microsoft documents
+// those two fields inconsistently on the same page: the
+// SecretNewVersionCreated sample sends them quoted ("NBF":"1559081980") while
+// the property table below it calls them numbers, and a payload with neither
+// (null, or the field absent) is equally plausible from a vault that has no
+// dates set. Parse reads neither field, so every one of those spellings must
+// come out as the same ParsedEvent -- see TestParse_NBFAndEXPSpellings.
+func eventPayloadWithTimestamps(id, eventType, vaultName, objectType, objectName, version, nbf, exp string) string {
 	return fmt.Sprintf(`{
   "id": %q,
   "topic": "/subscriptions/sub-id/resourceGroups/rg/providers/Microsoft.KeyVault/vaults/%s",
@@ -74,10 +88,10 @@ func eventPayload(id, eventType, vaultName, objectType, objectName, version stri
     "ObjectType": %q,
     "ObjectName": %q,
     "Version": %q,
-    "NBF": null,
-    "EXP": null
+    "NBF": %s,
+    "EXP": %s
   }
-}`, id, vaultName, objectName, eventType, vaultName, objectName, version, vaultName, objectType, objectName, version)
+}`, id, vaultName, objectName, eventType, vaultName, objectName, version, vaultName, objectType, objectName, version, nbf, exp)
 }
 
 // encodedBody Base64-encodes payload the way Event Grid encodes events when
@@ -87,16 +101,39 @@ func encodedBody(payload string) []byte {
 }
 
 const (
-	testEventID  = "6a6cbc37-fake-event-id-63c2fc7b"
-	testVault    = "fake-vault"
-	testObject   = "fake-app-password"
-	testVersion  = "fakeversion0123456789abcdef01234567"
-	secretType   = "secret"
-	certType     = "certificate"
-	newVersionET = "Microsoft.KeyVault.SecretNewVersionCreated"
-	nearExpiryET = "Microsoft.KeyVault.SecretNearExpiry"
-	expiredET    = "Microsoft.KeyVault.SecretExpired"
-	unknownET    = "Microsoft.KeyVault.SomeFutureEventType"
+	testEventID = "6a6cbc37-fake-event-id-63c2fc7b"
+	testVault   = "fake-vault"
+	testObject  = "fake-app-password"
+	testVersion = "fakeversion0123456789abcdef01234567"
+	// secretType is deliberately the exact literal a real Key Vault emits --
+	// "Secret", capital S, as in the documented event schema
+	// (learn.microsoft.com/azure/event-grid/event-schema-key-vault). Every
+	// fixture in this package goes through it, so the whole suite runs against
+	// the production shape of the payload; the older lowercase spelling is
+	// still covered explicitly by TestParse_ObjectTypeCasing_Variants.
+	secretType = "Secret"
+	// docNBF/docEXP are the raw JSON literals Microsoft's own
+	// SecretNewVersionCreated sample uses for those two fields on
+	// learn.microsoft.com/azure/event-grid/event-schema-key-vault: quoted
+	// strings, not numbers. Every fixture in this package carries them, so the
+	// whole suite -- parser and listener alike -- runs against a payload that
+	// is byte-for-byte the shape of the published example instead of a
+	// convenient one. TestParse_NBFAndEXPSpellings covers the other spellings
+	// the same page leaves open.
+	docNBF = `"1559081980"`
+	docEXP = `"1559082102"`
+	// nullJSON is the spelling every fixture in this package used before the
+	// NBF/EXP typing fix, and the one a vault object with no not-before/expiry
+	// dates set produces. It is the only spelling the old parser accepted.
+	nullJSON        = "null"
+	secretTypeLower = "secret"
+	secretTypeUpper = "SECRET"
+	certType        = "certificate"
+	keyType         = "key"
+	newVersionET    = "Microsoft.KeyVault.SecretNewVersionCreated"
+	nearExpiryET    = "Microsoft.KeyVault.SecretNearExpiry"
+	expiredET       = "Microsoft.KeyVault.SecretExpired"
+	unknownET       = "Microsoft.KeyVault.SomeFutureEventType"
 )
 
 func TestParse_ValidSecretNewVersionCreated_ReturnsVaultAndSecretName(t *testing.T) {
@@ -170,6 +207,136 @@ func TestParse_ObjectTypeNotSecret_Discarded(t *testing.T) {
 	}
 	if got != nil {
 		t.Fatalf("Parse() = %+v, want nil (ObjectType != secret must be discarded)", got)
+	}
+}
+
+// TestParse_ObjectTypeCasing_Variants pins rule 2's object-type guard as a
+// case-insensitive match, and pins that it is still a real guard.
+//
+// This is the regression test for the bug that made the whole realtime path
+// (FR-005) dead in production while every test in the repo passed: the guard
+// compared *data.ObjectType against the lowercase literal "secret", but Azure
+// sends "Secret" (learn.microsoft.com/azure/event-grid/event-schema-key-vault),
+// so every genuine event was treated as a clean discard -- the listener
+// deleted the message and logged it at V(1) as non-actionable. The suite never
+// noticed because every fixture used the lowercase spelling. Hence: all three
+// casings must parse, and a genuinely different object type must still be
+// discarded.
+func TestParse_ObjectTypeCasing_Variants(t *testing.T) {
+	tests := []struct {
+		name       string
+		objectType string
+		wantParsed bool
+	}{
+		{name: "azure casing", objectType: secretType, wantParsed: true},
+		{name: "lowercase", objectType: secretTypeLower, wantParsed: true},
+		{name: "uppercase", objectType: secretTypeUpper, wantParsed: true},
+		{name: "certificate", objectType: certType, wantParsed: false},
+		{name: "key", objectType: keyType, wantParsed: false},
+		{name: "certificate in azure casing", objectType: "Certificate", wantParsed: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := encodedBody(eventPayload(testEventID, newVersionET, testVault, tt.objectType, testObject, testVersion))
+
+			got, err := Parse(body)
+			if err != nil {
+				t.Fatalf("Parse() error = %v, want nil (a wrong object type is a discard, not an error)", err)
+			}
+			if tt.wantParsed {
+				if got == nil {
+					t.Fatalf("Parse() = nil for ObjectType %q, want a ParsedEvent (object types are matched case-insensitively)", tt.objectType)
+				}
+				if got.SecretName != testObject {
+					t.Errorf("SecretName = %q, want %q", got.SecretName, testObject)
+				}
+				return
+			}
+			if got != nil {
+				t.Fatalf("Parse() = %+v for ObjectType %q, want nil (only secrets are actioned)", got, tt.objectType)
+			}
+		})
+	}
+}
+
+// TestParse_NBFAndEXPSpellings pins that NBF and EXP cannot decide whether an
+// event is actionable, whichever way Azure spells them.
+//
+// This is a regression test with a real failure behind it. Parse used to decode
+// data into azsystemevents.KeyVaultSecretNewVersionCreatedEventData, which
+// types NBF/EXP as *float32 with a strict generated UnmarshalJSON. Microsoft's
+// published SecretNewVersionCreated sample sends them as quoted strings
+// ("NBF":"1559081980") while the property table on that same page calls them
+// numbers (learn.microsoft.com/azure/event-grid/event-schema-key-vault) -- so
+// the documented payload failed to decode, Parse returned ErrMalformedMessage,
+// and listener.go deleted the message as malformed. A rotation lost, repaired
+// only hours later by the periodic reconcile: exactly the FR-005 failure this
+// file's ObjectType tests exist to prevent, one step earlier in Parse. Nothing
+// caught it because every fixture used "NBF": null, which happens to decode.
+//
+// Parse reads neither field, so the fix was to stop decoding them at all. This
+// test holds that: same event, four spellings of two fields Parse ignores, one
+// identical ParsedEvent.
+func TestParse_NBFAndEXPSpellings(t *testing.T) {
+	tests := []struct {
+		name string
+		nbf  string
+		exp  string
+	}{
+		{name: "quoted strings, as in the documented sample", nbf: docNBF, exp: docEXP},
+		{name: "numbers, as in the documented property table", nbf: "1559081980", exp: "1559082102"},
+		{name: "null, as when the object has no dates set", nbf: nullJSON, exp: nullJSON},
+		{name: "one of each, in case a vault is inconsistent", nbf: docNBF, exp: "1559082102"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := encodedBody(eventPayloadWithTimestamps(
+				testEventID, newVersionET, testVault, secretType, testObject, testVersion, tt.nbf, tt.exp))
+
+			got, err := Parse(body)
+			if err != nil {
+				t.Fatalf("Parse() error = %v, want nil (NBF/EXP are never read, so they cannot make a message malformed)", err)
+			}
+			if got == nil {
+				t.Fatal("Parse() = nil, want a ParsedEvent")
+			}
+			want := ParsedEvent{ID: testEventID, VaultName: testVault, SecretName: testObject, Version: testVersion}
+			if *got != want {
+				t.Errorf("Parse() = %+v, want %+v", *got, want)
+			}
+		})
+	}
+}
+
+// TestParse_NBFAndEXPAbsent_Parses covers the remaining shape: a data payload
+// that omits the two timestamps entirely. Same reason as
+// TestParse_NBFAndEXPSpellings -- Parse must not depend on fields it does not
+// read.
+func TestParse_NBFAndEXPAbsent_Parses(t *testing.T) {
+	body := encodedBody(fmt.Sprintf(`{
+  "id": %q,
+  "eventType": %q,
+  "data": {
+    "Id": "https://%s.vault.azure.net/secrets/%s/%s",
+    "VaultName": %q,
+    "ObjectType": %q,
+    "ObjectName": %q,
+    "Version": %q
+  }
+}`, testEventID, newVersionET, testVault, testObject, testVersion, testVault, secretType, testObject, testVersion))
+
+	got, err := Parse(body)
+	if err != nil {
+		t.Fatalf("Parse() error = %v, want nil", err)
+	}
+	if got == nil {
+		t.Fatal("Parse() = nil, want a ParsedEvent when NBF/EXP are absent")
+	}
+	want := ParsedEvent{ID: testEventID, VaultName: testVault, SecretName: testObject, Version: testVersion}
+	if *got != want {
+		t.Errorf("Parse() = %+v, want %+v", *got, want)
 	}
 }
 
