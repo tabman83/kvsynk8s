@@ -19,6 +19,7 @@ package controller
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -47,6 +48,20 @@ func capturingReconcileLogger() (logr.Logger, *bytes.Buffer) {
 	buf := &bytes.Buffer{}
 	core := zapcore.NewCore(zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig()), zapcore.AddSync(buf), zapcore.DebugLevel)
 	return zapr.NewLogger(zap.New(core)), buf
+}
+
+// leakForms returns every textual shape the sentinel can take in structured
+// log output. The plain string is the obvious one; the base64 form is the
+// non-obvious one and the reason this helper exists: zapr hands a []byte (and
+// a map[string][]byte, such as Secret.Data) to zap.Any, which encodes it as
+// base64 in JSON. So `log.Info("...", "data", secret.Data)` -- a real leak of
+// the synced value into the operator log -- would NOT put the sentinel in the
+// buffer as plain text, and a check for the plain form alone would pass while
+// the log held a trivially decodable copy of the value. Mirrors leakForms in
+// internal/sync/redaction_test.go (duplicated rather than shared: both are
+// test-only helpers in different packages).
+func leakForms(sentinel string) []string {
+	return []string{sentinel, base64.StdEncoding.EncodeToString([]byte(sentinel))}
 }
 
 // gatedReader wraps another azure.SecretReader and blocks every GetLatest
@@ -140,8 +155,13 @@ var _ = Describe("SecretSync Controller: log redaction and Pending state", func(
 		// without this, the no-sentinel assertions below could pass vacuously
 		// because nothing was wired up.
 		Expect(logs).To(ContainSubstring("reconciled SecretSync"))
-		Expect(logs).NotTo(ContainSubstring(sentinelV1))
-		Expect(logs).NotTo(ContainSubstring(sentinelV2))
+		Expect(logs).To(ContainSubstring("deleted stale managed secret"))
+		for _, sentinel := range []string{sentinelV1, sentinelV2} {
+			for _, form := range leakForms(sentinel) {
+				Expect(logs).NotTo(ContainSubstring(form),
+					"the secret value must not reach the operator log in any encoding")
+			}
+		}
 	})
 
 	// data-model.md: "(created) -> Pending" is a distinct, persisted state.
