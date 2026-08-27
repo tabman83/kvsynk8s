@@ -8,9 +8,13 @@ event subscription on the Key Vault (system topic, Event Grid schema).
 
 - Queue message body: Base64-encoded JSON of a single Event Grid schema event
   (Event Grid encodes the event this way when delivering to Storage Queues).
-- Parsed with the Azure SDK for Go `azsystemevents` module: unmarshal the
-  EventGridEvent envelope, then the data payload as
-  `KeyVaultSecretNewVersionCreatedEventData`.
+- The envelope is unmarshalled with the Azure SDK for Go `azsystemevents`
+  module (`EventGridEvent`, plus its event-type constant). The `data` payload
+  is **not** unmarshalled as `KeyVaultSecretNewVersionCreatedEventData`: that
+  type declares `NBF`/`EXP` as `*float32` and rejects the quoted-string form
+  Microsoft's own sample uses, which would make the documented payload
+  "malformed" and lose the event. Only the four strings below are decoded, into
+  a local struct in `parser.go`.
 
 ## Example event (as delivered, after Base64 decoding)
 
@@ -29,11 +33,19 @@ event subscription on the Key Vault (system topic, Event Grid schema).
     "ObjectType": "Secret",
     "ObjectName": "my-app-password",
     "Version": "<version>",
-    "NBF": null,
-    "EXP": null
+    "NBF": "1559081980",
+    "EXP": "1559082102"
   }
 }
 ```
+
+`NBF`/`EXP` are shown the way the sample on
+[learn.microsoft.com/azure/event-grid/event-schema-key-vault](https://learn.microsoft.com/azure/event-grid/event-schema-key-vault)
+shows them — quoted strings — even though the property table on that same page
+calls them numbers. Both spellings, plus `null` and the fields being absent
+altogether, must parse: the fields used are only `VaultName`, `ObjectType`,
+`ObjectName` and `Version`, and nothing else in the payload can make a message
+malformed.
 
 ## Processing rules (FR-004, FR-005, FR-006; research R4, R8, R9)
 

@@ -97,7 +97,31 @@ func Parse(body []byte) (*ParsedEvent, error) {
 		return nil, fmt.Errorf("%w: missing event data", ErrMalformedMessage)
 	}
 
-	var data azsystemevents.KeyVaultSecretNewVersionCreatedEventData
+	// The data payload is decoded into this local struct on purpose, not into
+	// azsystemevents.KeyVaultSecretNewVersionCreatedEventData. That SDK type
+	// (v1.0.0, models.go) declares NBF and EXP as *float32 and its generated
+	// UnmarshalJSON is strict, but the published sample for this very event
+	// (learn.microsoft.com/azure/event-grid/event-schema-key-vault) spells them
+	// as JSON strings -- "NBF":"1559081980" -- while the property table on the
+	// same page calls them numbers. Decoding the documented sample with the SDK
+	// type therefore fails with `cannot unmarshal string into Go value of type
+	// float32`, Parse returns ErrMalformedMessage, and the listener deletes the
+	// message as malformed: the rotation is lost until the 4h periodic
+	// reconcile. That is the same silent death of FR-005's realtime path as the
+	// ObjectType casing bug below, one step earlier.
+	//
+	// Parse reads neither NBF nor EXP, so it must not be able to fail on them.
+	// These four strings are everything the listener needs, and any spelling of
+	// NBF/EXP -- string, number, null, absent -- is simply ignored. Field names
+	// are the documented PascalCase ones; encoding/json matches object keys
+	// case-insensitively, so a camelCase variant would bind too. The envelope
+	// and the event-type constant still come from the SDK.
+	var data struct {
+		VaultName  *string
+		ObjectType *string
+		ObjectName *string
+		Version    *string
+	}
 	if err := json.Unmarshal(dataBytes, &data); err != nil {
 		return nil, fmt.Errorf("%w: invalid event data", ErrMalformedMessage)
 	}

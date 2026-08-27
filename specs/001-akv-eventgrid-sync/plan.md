@@ -15,7 +15,7 @@ A Kubernetes operator, written in Go on controller-runtime, that syncs Azure Key
 **Primary Dependencies**:
 - controller-runtime + kubebuilder scaffolding: CRD generation, reconcile loop with workqueue/backoff, finalizers, status updates, owned-resource watches
 - client-go (transitive) for Secret read/write
-- Azure SDK for Go: `azsecrets` (secret fetch), `azqueue` v2 (notification queue pull), `azsystemevents` (typed `KeyVaultSecretNewVersionCreatedEventData` deserialization), `azidentity` ≥ 1.3 (`DefaultAzureCredential` → workload identity)
+- Azure SDK for Go: `azsecrets` (secret fetch), `azqueue` v2 (notification queue pull), `azsystemevents` (Event Grid envelope + event-type constants; the `data` payload is decoded into a local four-field struct instead — research R4 revision), `azidentity` ≥ 1.3 (`DefaultAzureCredential` → workload identity)
 
 **Storage**: none of its own — all state lives in the Kubernetes API (CR status subresource + managed Secrets); the Azure Storage Queue is transport, not storage
 

@@ -384,11 +384,15 @@ func newAzuriteQueueClient(hostPort string) (*azqueue.QueueClient, error) {
 
 // eventGridSecretNewVersionMessage builds the Base64-encoded Event Grid
 // queue message body contracts/queue-message.md documents for a
-// SecretNewVersionCreated notification. ObjectType is "Secret" with a capital
-// S, the exact literal a real Key Vault emits
-// (learn.microsoft.com/azure/event-grid/event-schema-key-vault), so this e2e
-// drives the operator with the production shape of the payload rather than a
-// convenient lowercase approximation.
+// SecretNewVersionCreated notification. It is deliberately byte-for-byte the
+// shape of the sample published at
+// learn.microsoft.com/azure/event-grid/event-schema-key-vault, not a
+// convenient approximation of it, because two details of that sample each
+// broke the realtime path on their own: ObjectType is "Secret" with a capital
+// S (a case-sensitive compare against "secret" discarded every real event),
+// and NBF/EXP are quoted strings (decoding them into the SDK's *float32 fields
+// made the documented payload "malformed" and deleted the message). This e2e
+// is what proves the operator survives both end to end.
 func eventGridSecretNewVersionMessage(eventID, vaultName, secretName, version string) string {
 	body := fmt.Sprintf(`{
 		"id": %q,
@@ -404,8 +408,8 @@ func eventGridSecretNewVersionMessage(eventID, vaultName, secretName, version st
 			"ObjectType": "Secret",
 			"ObjectName": %q,
 			"Version": %q,
-			"NBF": null,
-			"EXP": null
+			"NBF": "1559081980",
+			"EXP": "1559082102"
 		}
 	}`, eventID, secretName, secretName, version, vaultName, secretName, version)
 	return base64.StdEncoding.EncodeToString([]byte(body))
