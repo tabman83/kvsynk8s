@@ -357,7 +357,11 @@ func TestEffectiveReconcileInterval(t *testing.T) {
 		wantSubstituted bool
 	}{
 		{name: "a positive interval is used as given", configured: 30 * time.Minute, want: 30 * time.Minute},
-		{name: "the default is positive and passes through", configured: defaultReconcileInterval, want: defaultReconcileInterval},
+		{
+			name:       "the default is positive and passes through",
+			configured: defaultReconcileInterval,
+			want:       defaultReconcileInterval,
+		},
 		{name: "zero is replaced", configured: 0, want: defaultReconcileInterval, wantSubstituted: true},
 		{name: "negative is replaced", configured: -4 * time.Hour, want: defaultReconcileInterval, wantSubstituted: true},
 	}
