@@ -20,6 +20,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
 	"time"
 
@@ -85,6 +86,59 @@ func durationFromEnv(key string, def time.Duration) time.Duration {
 		return def
 	}
 	return d
+}
+
+// unparseableQueueURLPlaceholder stands in for a --queue-url/QUEUE_URL value
+// that net/url cannot parse. A malformed URL can still be a SAS URL with a
+// typo in it, so the raw value is never echoed back into the log; the operator
+// gets a marker and looks at their own configuration instead.
+const unparseableQueueURLPlaceholder = "<unparseable>"
+
+// redactedQueryMarker replaces a queue URL's query string in log output. It is
+// appended rather than simply dropped so the log still tells an operator that
+// they configured a URL with a query string: without it they would read back a
+// bare URL that does not match what they set and think the flag was ignored.
+const redactedQueryMarker = "?<redacted>"
+
+// redactQueueURL reduces a Storage Queue URL to the part that is safe to log —
+// scheme, host and path — and reports whether the original carried a query
+// string.
+//
+// Azure hands Storage Queue URLs out with a SAS token in the query string
+// (?sv=...&sig=...), and azure.NewQueueSource passes whatever it is given
+// straight to azqueue without parsing it, so a SAS URL is accepted as input.
+// The signature in it is a live bearer credential for the queue, and the
+// operator's stdout usually reaches a log aggregator with far wider read
+// access than the queue itself — so it is stripped here (constitution I's
+// redaction rule is about synced secret *values*, but the same reasoning
+// applies to any credential we would otherwise print). Userinfo
+// (user:password@host) goes for the same reason.
+//
+// The empty string maps to the empty string, not to a placeholder: no queue
+// configured is a real, non-secret state of the config, and the log must stay
+// honest about it (the "No queue URL configured" branch below reads the same
+// way).
+func redactQueueURL(raw string) (safe string, hadQuery bool) {
+	if raw == "" {
+		return "", false
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return unparseableQueueURLPlaceholder, false
+	}
+	hadQuery = u.RawQuery != "" || u.ForceQuery
+	u.User = nil
+	u.RawQuery = ""
+	u.ForceQuery = false
+	// A fragment never reaches the server, so it cannot itself be a working
+	// credential, but a pasted token can end up in one — drop it too.
+	u.Fragment = ""
+	u.RawFragment = ""
+	safe = u.String()
+	if hadQuery {
+		safe += redactedQueryMarker
+	}
+	return safe, hadQuery
 }
 
 // nolint:gocyclo
@@ -158,12 +212,15 @@ func main() {
 		}
 	}
 
-	// None of these are secret values: a queue URL and a reconcile interval
-	// are operational config, and a workload identity client ID is a public
-	// identifier, not a credential (constitution I only forbids secret
-	// *values* — the ones synced into Kubernetes Secrets).
+	// None of these are secret values: a reconcile interval is operational
+	// config, and a workload identity client ID is a public identifier, not a
+	// credential (constitution I only forbids secret *values* — the ones
+	// synced into Kubernetes Secrets). The queue URL is logged without its
+	// query string, because that is where a SAS token would sit and a SAS
+	// signature is a live credential for the queue; see redactQueueURL.
+	safeQueueURL, queueURLHasQuery := redactQueueURL(queueURL)
 	setupLog.Info("Operator configuration",
-		"queueURL", queueURL,
+		"queueURL", safeQueueURL,
 		"reconcileInterval", reconcileInterval,
 		"azureClientID", azureClientID,
 	)
@@ -283,6 +340,19 @@ func main() {
 	// normal reconcile + periodic requeue path is entirely untouched.
 	var eventsCh chan event.GenericEvent
 	if queueURL != "" {
+		if queueURLHasQuery {
+			// NewQueueSource always authenticates with
+			// DefaultAzureCredential (constitution V: platform-issued,
+			// short-lived credentials only), so a SAS token in the URL is not
+			// a working auth path here — it is ignored, and it only puts a
+			// live credential somewhere it does not need to be. Warn once
+			// rather than reject: dropping the query string outright would
+			// change how the URL is handed to azqueue.
+			setupLog.Info("Configured queue URL has a query string; it is redacted from logs. "+
+				"If it is a SAS token it is not used: this operator always authenticates "+
+				"with DefaultAzureCredential. Configure the queue URL without one.",
+				"queueURL", safeQueueURL)
+		}
 		queueSource, err := azure.NewQueueSource(queueURL)
 		if err != nil {
 			setupLog.Error(err, "Failed to create storage queue source")
@@ -295,7 +365,7 @@ func main() {
 			setupLog.Error(err, "Failed to register queue listener")
 			os.Exit(1)
 		}
-		setupLog.Info("Queue listener enabled", "queueURL", queueURL)
+		setupLog.Info("Queue listener enabled", "queueURL", safeQueueURL)
 	} else {
 		setupLog.Info("No queue URL configured; relying on periodic reconciliation only")
 	}
