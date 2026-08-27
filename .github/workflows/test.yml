@@ -27,3 +27,21 @@ jobs:
         run: |
           go mod tidy
           make test
+
+  # The two release guards decide whether :latest moves and whether an already
+  # published version may be rebuilt. Neither can be tried out by running the
+  # release workflow — getting them wrong means a broken or a silently
+  # overwritten release — so their decision table is driven from a shell here.
+  release-guards:
+    permissions:
+      contents: read
+    name: Release guards
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Exercise the release guards
+        run: hack/release-guards_test.sh

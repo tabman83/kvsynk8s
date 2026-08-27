@@ -31,6 +31,16 @@ FROM gcr.io/distroless/static:nonroot
 # public once in its package settings.
 LABEL org.opencontainers.image.source=https://github.com/tabman83/kvsynk8s
 
+# The commit this image was built from. The release pipeline creates the git tag
+# LAST, so between the image push and the tag there is a published version with
+# no tag to identify it; hack/check-release-overwrite.sh reads this label back
+# off the registry to tell a legitimate same-commit re-run of a failed release
+# from a different commit silently overwriting a published version. Empty when
+# nobody passed it, which that guard deliberately treats as "cannot tell" and
+# refuses, rather than assuming the safe case.
+ARG GIT_REVISION=""
+LABEL org.opencontainers.image.revision=$GIT_REVISION
+
 WORKDIR /
 COPY --from=builder /workspace/manager .
 USER 65532:65532

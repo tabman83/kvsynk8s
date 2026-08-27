@@ -49,12 +49,16 @@ jobs:
     name: Work out what is being released
     permissions:
       contents: read
+      # Read-only, so the overwrite guard below can see what is already
+      # published under this version.
+      packages: read
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.resolve.outputs.version }}
       tag: ${{ steps.resolve.outputs.tag }}
       prerelease: ${{ steps.resolve.outputs.prerelease }}
       channel: ${{ steps.resolve.outputs.channel }}
+      latest: ${{ steps.latest.outputs.latest }}
     steps:
       # Full history so the dev build can find the last stable tag.
       - name: Clone the code
@@ -107,25 +111,14 @@ jobs:
             exit 1
           fi
 
-          # A dispatch of a version that is already released would silently
-          # rebuild it from the current HEAD and overwrite the published
-          # artifacts. If the tag already exists it must point at the commit
-          # being built: the same commit is a deliberate re-run and is fine
-          # (the workflow converges on re-runs by design, see publish-chart
-          # and the install.yaml upload), any other commit is refused.
-          if [ -n "$INPUT_VERSION" ]; then
-            if TAG_COMMIT="$(git rev-parse -q --verify "refs/tags/v$VERSION^{commit}")"; then
-              if [ "$TAG_COMMIT" != "$GITHUB_SHA" ]; then
-                echo "::error::tag v$VERSION already exists and points at $TAG_COMMIT, not at $GITHUB_SHA. Refusing to rebuild a released version from a different commit. Pick a new version, or delete the tag first if you really mean to replace the release." >&2
-                exit 1
-              fi
-              echo "Tag v$VERSION already exists and points at this commit; treating this as a re-run of the same release."
-            fi
-          fi
+          # Rebuilding an already published version is guarded by
+          # hack/check-release-overwrite.sh, two steps down — it needs the
+          # registry as well as the git tag, so it cannot live here.
 
-          # A semver prerelease suffix means: do not move :latest, and mark the
-          # GitHub Release as a prerelease. Every dev build has one by
-          # construction, so dev builds can never take over :latest.
+          # A semver prerelease suffix means: mark the GitHub Release as a
+          # prerelease. Every dev build has one by construction. Whether
+          # :latest moves is a separate, stricter question, answered by
+          # hack/check-latest-eligible.sh in the next step.
           case "$VERSION" in
             *-*) PRERELEASE=true ;;
             *)   PRERELEASE=false ;;
@@ -146,8 +139,46 @@ jobs:
             echo "| chart / app version | \`$VERSION\` |"
             echo "| image tag | \`v$VERSION\` |"
             echo "| prerelease | \`$PRERELEASE\` |"
-            echo "| moves :latest | \`$([ "$PRERELEASE" = false ] && echo yes || echo no)\` |"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # Being a stable release is not enough to own :latest — it also has to be
+      # the NEWEST stable release. Re-running an older one is legitimate and
+      # must still rebuild its own versioned tag, but it must not drag :latest
+      # backwards. The script explains the reasoning and warns when it says no.
+      - name: Decide whether this release may move :latest
+        id: latest
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: hack/check-latest-eligible.sh "$VERSION" > /dev/null
+
+      - name: Record the :latest decision in the summary
+        env:
+          MOVES: ${{ steps.latest.outputs.latest }}
+        run: echo "| moves :latest | \`$([ "$MOVES" = true ] && echo yes || echo no)\` |" >> "$GITHUB_STEP_SUMMARY"
+
+      # The guard below reads the registry. The package is public, so an
+      # anonymous read would usually work, but logging in keeps the guard
+      # working if that ever changes rather than failing closed on every run.
+      # Stable only: every dev version carries this run's number, so it is
+      # unique by construction and cannot collide with anything published.
+      - name: Log in to GitHub Container Registry (to read what is published)
+        if: steps.resolve.outputs.channel == 'stable'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The git tag is written by the LAST job of this workflow, so a release
+      # that died halfway leaves the image and the chart published under a
+      # version with no tag. A tag-only guard cannot see that state, and would
+      # wave through a dispatch of the same version from a different commit.
+      - name: Refuse to rebuild a published version from a different commit
+        if: steps.resolve.outputs.channel == 'stable'
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+          IMAGE: ${{ env.IMAGE }}
+        run: hack/check-release-overwrite.sh "$VERSION" "$GITHUB_SHA"
 
   test:
     permissions:
@@ -333,8 +364,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # GIT_REVISION becomes org.opencontainers.image.revision on the image.
+      # Passed explicitly rather than left to the Makefile's `git rev-parse
+      # HEAD` fallback, so the label records the commit this run was dispatched
+      # for — which is exactly what hack/check-release-overwrite.sh compares
+      # against on a later run.
       - name: Build and push the release image (multi-arch, via make docker-buildx)
-        run: make docker-buildx IMG=${{ env.IMAGE }}:${{ needs.prepare.outputs.tag }}
+        run: make docker-buildx IMG=${{ env.IMAGE }}:${{ needs.prepare.outputs.tag }} GIT_REVISION=${{ github.sha }}
 
       - name: Resolve the digest that was actually pushed
         id: image
@@ -355,12 +391,24 @@ jobs:
           subject-digest: ${{ steps.image.outputs.digest }}
           push-to-registry: true
 
-      # Only a stable release owns :latest. A prerelease that moved it would be
-      # handed to everyone running `docker pull ...:latest` or installing the
-      # install.yaml from the previous release.
+      # Only the newest stable release owns :latest — prepare worked that out,
+      # see hack/check-latest-eligible.sh. Gating on `prerelease == false`
+      # alone was not enough: a re-run of an older stable release passed it and
+      # quietly pointed :latest at the older operator.
       - name: Tag the same manifest list as latest
-        if: needs.prepare.outputs.prerelease == 'false'
+        if: needs.prepare.outputs.latest == 'true'
         run: docker buildx imagetools create --tag ${{ env.IMAGE }}:latest ${{ env.IMAGE }}:${{ needs.prepare.outputs.tag }}
+
+      # A prerelease skipping :latest is routine and needs no comment. A stable
+      # release skipping it means someone re-ran an old release and should not
+      # walk away thinking :latest now points at what they just built.
+      - name: Say out loud that :latest was left alone
+        if: needs.prepare.outputs.latest != 'true' && needs.prepare.outputs.prerelease == 'false'
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          IMAGE: ${{ env.IMAGE }}
+        run: |
+          echo "::warning title=latest tag was left alone::$TAG was rebuilt and pushed, but it is not the newest stable release, so $IMAGE:latest still points at the newer version."
 
       - name: Render the install manifest
         run: make build-installer IMG=${{ env.IMAGE }}:${{ needs.prepare.outputs.tag }}
