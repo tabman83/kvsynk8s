@@ -244,7 +244,7 @@ Kubernetes Secret in the same namespace.
 | `spec.vault.name` | string | yes | — | 3–24 chars, `^[a-zA-Z][a-zA-Z0-9-]+$` (Key Vault naming rules). Name of the vault, not its URI. |
 | `spec.vault.secret` | string | yes | — | 1–127 chars, `^[a-zA-Z0-9-]+$`. Name of the secret inside the vault. |
 | `spec.target.secretName` | string | no | the `SecretSync`'s own name | max 253 chars, `^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$` (DNS-1123 subdomain). Name of the Kubernetes Secret to create, in the same namespace as the `SecretSync`. |
-| `spec.target.dataKey` | string | no | the vault secret name | max 253 chars, `^[-._a-zA-Z0-9]+$`. Key under the Secret's `.data` the value is stored at. |
+| `spec.target.dataKey` | string | no | the vault secret name | max 253 chars, `^[-._a-zA-Z0-9]+$`, and it must not be `.` or start with `..` (Kubernetes Secret data key rules). Key under the Secret's `.data` the value is stored at. |
 
 There is no cross-namespace targeting: the target namespace is always the
 `SecretSync`'s own namespace.
