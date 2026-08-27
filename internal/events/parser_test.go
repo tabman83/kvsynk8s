@@ -23,8 +23,11 @@
 //
 // body is the raw queue message text exactly as azure.QueueMessage.Text
 // carries it: still Base64-encoded, per contracts/queue-message.md ("Queue
-// message body: Base64-encoded JSON of a single Event Grid schema event").
-// Parse itself does the Base64 decode + JSON unmarshal (rule 1).
+// message body: Base64-encoded JSON of a single event"). Both delivery schemas
+// Event Grid can be configured to send -- Event Grid schema and CloudEvents
+// v1.0 -- are accepted; the Base64 wrapping belongs to the Storage Queue
+// destination, not to the schema, so it is the same either way. Parse itself
+// does the Base64 decode + JSON unmarshal (rule 1).
 //
 // Return contract (contracts/queue-message.md "Processing rules"):
 //
@@ -33,9 +36,11 @@
 //     error's message NEVER echoes any byte of the message body (constitution
 //     I: this rule is unconditional, not merely because values are not
 //     expected on this path).
-//  2. eventType != "Microsoft.KeyVault.SecretNewVersionCreated" (e.g.
+//  2. event type != "Microsoft.KeyVault.SecretNewVersionCreated" (e.g.
 //     SecretNearExpiry, SecretExpired, or any other/unknown type) -> (nil,
-//     nil): a clean, silent discard, not an error (v1 scope).
+//     nil): a clean, silent discard, not an error (v1 scope). The type is
+//     resolved from `eventType` (Event Grid schema), else `type`
+//     (CloudEvents v1.0); the value is the same string in both.
 //  3. data.ObjectType that is not "secret" case-insensitively -> (nil, nil):
 //     same silent discard. Azure's documented payload carries "Secret" with a
 //     capital S, so the shared fixtures below use that literal.
