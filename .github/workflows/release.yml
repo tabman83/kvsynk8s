@@ -37,9 +37,11 @@ concurrency:
 
 env:
   IMAGE: ghcr.io/tabman83/kvsynk8s
-  # The chart is PACKAGED with the floor version it documents, so the artifact
-  # is readable by every supported Helm. The `helm` job below validates the
-  # chart on both the 3.x and 4.x lines.
+  # The chart is PACKAGED with a 3.x Helm, so the artifact stays readable by
+  # every supported Helm, down to the >= 3.8 floor the chart documents. This is
+  # not the floor itself, it is the latest 3.x. The `helm` job below validates
+  # the chart on all three matrix legs: the 3.8 floor, the latest 3.x and the
+  # latest 4.x.
   HELM_VERSION: v3.21.4
 
 jobs:
@@ -228,8 +230,8 @@ jobs:
           go-version-file: go.mod
 
       - name: Install kind
-        # Pinned like HELM_VERSION above. v0.32.0 is the latest stable kind
-        # release; bump here and in test-e2e.yml together.
+        # Pinned like HELM_VERSION above, so a new kind release cannot change
+        # CI under us. Bump deliberately, here and in test-e2e.yml together.
         env:
           KIND_VERSION: v0.32.0
         run: |

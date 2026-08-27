@@ -24,8 +24,9 @@ jobs:
           go-version-file: go.mod
 
       - name: Install kind
-        # Pinned like HELM_VERSION in release.yml. v0.32.0 is the latest stable
-        # kind release; bump here and in release.yml together.
+        # Pinned like HELM_VERSION in release.yml, so a new kind release cannot
+        # change CI under us. Bump deliberately, here and in release.yml
+        # together.
         env:
           KIND_VERSION: v0.32.0
         run: |
