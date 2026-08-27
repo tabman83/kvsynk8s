@@ -1,5 +1,10 @@
 # Image URL to use all building/pushing image targets
 IMG ?= controller:latest
+# Commit baked into the image as org.opencontainers.image.revision. The release
+# pipeline passes GITHUB_SHA explicitly; locally it falls back to HEAD, and to
+# empty outside a git checkout. hack/check-release-overwrite.sh reads it back
+# off the registry to tell a re-run from an overwrite.
+GIT_REVISION ?= $(shell git rev-parse HEAD 2>/dev/null)
 # YEAR defines the year value used for substituting the YEAR placeholder in the boilerplate header.
 YEAR ?= $(shell date +%Y)
 
@@ -160,7 +165,7 @@ run: manifests generate fmt vet ## Run a controller from your host.
 # More info: https://docs.docker.com/develop/develop-images/build_enhancements/
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
-	$(CONTAINER_TOOL) build -t ${IMG} .
+	$(CONTAINER_TOOL) build --build-arg GIT_REVISION=$(GIT_REVISION) -t ${IMG} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
@@ -190,7 +195,7 @@ docker-buildx: ## Build and push docker image for the manager for cross-platform
 	# that fails has to fail here. The cost is that the two cleanup lines below
 	# are skipped on failure, which matters only locally (leftover builder and
 	# Dockerfile.cross); CI runners are thrown away.
-	$(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${IMG} -f Dockerfile.cross .
+	$(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --build-arg GIT_REVISION=$(GIT_REVISION) --tag ${IMG} -f Dockerfile.cross .
 	- $(CONTAINER_TOOL) buildx rm kvsynk8s-builder
 	rm Dockerfile.cross
 
