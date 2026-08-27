@@ -53,13 +53,14 @@ spec:
         - --metrics-bind-address=:8443
         {{- end }}
         {{- /*
-          --leader-elect is kept for byte-equivalence with the install.yaml
-          manifest install. The operator parses the flag and then ignores it:
-          cmd/main.go always starts the manager with LeaderElection: false.
-          Do not read it as leader election being on, and do not drop it —
-          hack/compare-helm-kustomize.sh fails if it disappears.
+          No --leader-elect here or in install.yaml. The operator parses the
+          flag and ignores it — cmd/main.go always starts the manager with
+          LeaderElection: false — so shipping it only ever suggested that
+          scaling this Deployment was safe. It is not: replicas is pinned at 1
+          above, and two replicas would run two uncoordinated controllers and
+          two queue listeners. The flag is still accepted by the binary, so a
+          hand-written Deployment that passes it keeps working.
         */}}
-        - --leader-elect
         - --health-probe-bind-address=:8081
         {{- /*
           Quoted through `quote` so a value with YAML-significant characters in
