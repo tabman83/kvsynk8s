@@ -83,7 +83,11 @@ func NewQueueSource(queueURL string) (QueueSource, error) {
 func (s *storageQueueSource) Receive(ctx context.Context, maxMessages int32) ([]QueueMessage, error) {
 	resp, err := s.client.DequeueMessages(ctx, &azqueue.DequeueMessagesOptions{NumberOfMessages: &maxMessages})
 	if err != nil {
-		return nil, fmt.Errorf("dequeue messages: %w", err)
+		// redactURLError, not the raw err: a pre-HTTP transport failure comes
+		// back from azqueue as a *url.Error containing the full request URL,
+		// SAS query string and all, and Listener.Start logs whatever this
+		// returns on every failed poll, forever.
+		return nil, fmt.Errorf("dequeue messages: %w", redactURLError(err))
 	}
 
 	out := make([]QueueMessage, 0, len(resp.Messages))
@@ -104,7 +108,9 @@ func (s *storageQueueSource) Receive(ctx context.Context, maxMessages int32) ([]
 // Delete implements QueueSource.
 func (s *storageQueueSource) Delete(ctx context.Context, messageID, popReceipt string) error {
 	if _, err := s.client.DeleteMessage(ctx, messageID, popReceipt, nil); err != nil {
-		return fmt.Errorf("delete message %s: %w", messageID, err)
+		// Same redaction as Receive, for the same reason: this error is logged
+		// by Listener.deleteMessage.
+		return fmt.Errorf("delete message %s: %w", messageID, redactURLError(err))
 	}
 	return nil
 }
