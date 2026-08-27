@@ -63,7 +63,12 @@ Standard kubebuilder layout, one Go module, one controller.
   that ever places a secret value into a Kubernetes object
   (`SecretWriter.CreateOrUpdate`). Every other package that needs a value
   synced goes through this file. Nothing here logs the value; a static AST
-  check in `internal/sync/redaction_test.go` enforces that.
+  check in `internal/sync/redaction_test.go` enforces that. A Secret is
+  writable when it carries the `managed-by` label OR a controller
+  ownerReference whose UID matches the owning `SecretSync` (the `writable`
+  predicate) — either alone is enough, so a Secret this SecretSync provably
+  created is repaired (label re-stamped) rather than wedged in
+  `TargetConflict` if something strips the label in-cluster.
 - **`internal/azure/keyvault.go`** and **`internal/azure/queue.go`** — thin
   wrappers around `azsecrets` and `azqueue`, each behind a small interface
   (`SecretReader`, `QueueSource`) so the rest of the codebase never imports
@@ -84,7 +89,10 @@ Standard kubebuilder layout, one Go module, one controller.
   `listener.go` is a `manager.Runnable` that polls the queue with an adaptive
   delay (2s busy / 30s idle), matches events against `SecretSync` objects via
   the manager's cached client, and injects matches into the controller
-  through a `source.Channel`.
+  through a `source.Channel`. Every Receive/Delete call against the queue runs
+  under its own `QueueCallTimeout` (default 30s) — the Azure SDK's own client
+  imposes none, so without it a half-open connection would block the poll
+  loop, and the realtime path, forever.
 
 **Auth.** Azure: `azidentity.DefaultAzureCredential`, i.e. Microsoft Entra
 Workload ID in-cluster (falls back through the standard credential chain
