@@ -179,6 +179,25 @@ func (d *deadlineCapturingReader) captured() (time.Time, bool) {
 
 var _ azure.SecretReader = (*deadlineCapturingReader)(nil)
 
+// deadlineConsumingReader models a black-holed Key Vault endpoint: GetLatest
+// neither answers nor fails fast, it hangs until the reconcile's own deadline
+// expires and only then reports the timeout. internal/azure classifies a
+// network-level failure with no HTTP response as ErrTransient, so that is what
+// comes back here; the message carries vault and secret identifiers only, like
+// classifyGetSecretError's own (constitution I).
+//
+// The point of the double is what it leaves behind rather than what it
+// returns: every call site after it in Reconcile receives an already-expired
+// context.
+type deadlineConsumingReader struct{}
+
+func (deadlineConsumingReader) GetLatest(ctx context.Context, vaultName, secretName string) (string, string, error) {
+	<-ctx.Done()
+	return "", "", fmt.Errorf("vault %q secret %q: %w", vaultName, secretName, azure.ErrTransient)
+}
+
+var _ azure.SecretReader = deadlineConsumingReader{}
+
 // startManagerFor spins up a full manager (cache + registered controller, no
 // metrics/health/webhook endpoints) around a fresh SecretSyncReconciler using
 // reader and interval, and starts it in the background. Returning cancel lets
@@ -617,6 +636,79 @@ var _ = Describe("SecretSync Controller", func() {
 			// would flake on scheduling jitter.
 			Expect(deadline).To(BeTemporally("<=", start.Add(reconcileTimeout+time.Second)),
 				"the deadline must be no further than reconcileTimeout from the start of the reconcile")
+		})
+
+		// The other half of the timeout contract: a reconcile that actually
+		// runs out of budget must still say so. A hung vault read consumes the
+		// whole deadline, comes back as a transient failure, and leaves every
+		// later call in Reconcile holding an expired context — including the
+		// status write that reports the failure. Persisted on that same
+		// context, the update fails instantly, Reconcile returns before the
+		// Event is recorded, and since each backoff retry repeats identically
+		// the CR would report its last good state, with a stale lastSyncTime
+		// and no Events at all, for the entire outage (FR-009).
+		It("still persists Failing/TransientError and still emits SyncFailed when the vault read eats the deadline", func() {
+			ctx := context.Background()
+
+			suffix := shortUID()
+			name := "ss-hung-read-" + suffix
+			vaultSecret := "hung-read-secret-" + suffix
+			targetName := "target-hung-read-" + suffix
+			const sentinel = "SENTINEL-fake-value-hung-read-not-real"
+
+			reader.set(fakeVaultName, vaultSecret, sentinel, "v1")
+
+			ss := newTestSecretSync(namespace, name, fakeVaultName, vaultSecret, targetName, fakeDataKey)
+			Expect(k8sClient.Create(ctx, ss)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), ss)
+			})
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{Name: targetName, Namespace: namespace},
+				})
+			})
+
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: namespace}}
+
+			// Seed a healthy sync first, so the state the CR must move off is
+			// a real InSync rather than the empty initial one — that is what
+			// makes the staleness observable.
+			_, err := reconcilerFor(reader).Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			var seeded kvsynk8sv1alpha1.SecretSync
+			Expect(k8sClient.Get(ctx, req.NamespacedName, &seeded)).To(Succeed())
+			Expect(seeded.Status.State).To(Equal(kvsynk8sv1alpha1.SecretSyncStateInSync))
+
+			recorder := events.NewFakeRecorder(10)
+			hung := reconcilerFor(deadlineConsumingReader{})
+			hung.Recorder = recorder
+
+			// Reconcile derives its deadline with context.WithTimeout, which
+			// keeps whichever bound is tighter — so a short-lived incoming
+			// context reproduces a minute-long hang in a second, without the
+			// test having to wait out reconcileTimeout.
+			hungCtx, cancelHung := context.WithTimeout(ctx, time.Second)
+			defer cancelHung()
+			_, err = hung.Reconcile(hungCtx, req)
+
+			// A transient failure is returned for backoff (constitution II),
+			// so an error here is expected — but it must be THAT error, from
+			// the end of a reconcile that completed its bookkeeping, not a
+			// failed status update short-circuiting everything after it.
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("retrying with backoff"))
+
+			var after kvsynk8sv1alpha1.SecretSync
+			Expect(k8sClient.Get(ctx, req.NamespacedName, &after)).To(Succeed())
+			Expect(after.Status.State).To(Equal(kvsynk8sv1alpha1.SecretSyncStateFailing))
+			Expect(after.Status.Reason).To(Equal(syncpkg.ReasonTransientError))
+
+			var evt string
+			Eventually(recorder.Events).Should(Receive(&evt))
+			Expect(evt).To(ContainSubstring("SyncFailed"))
+			Expect(evt).To(ContainSubstring(syncpkg.ReasonTransientError))
+			Expect(evt).NotTo(ContainSubstring(sentinel))
 		})
 	})
 
@@ -1361,4 +1453,74 @@ func TestTakesPrecedence(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestStatusWriteContext pins both halves of what statusWriteContext exists to
+// guarantee, because either half alone is a bug.
+//
+// Detached, so the terminal status write outlives an exhausted reconcile
+// deadline — that is the whole point of the fix, and the envtest spec above
+// ("still persists Failing/TransientError ...") already fails without it.
+//
+// Bounded, which nothing else in the suite can observe: context.WithoutCancel
+// drops the manager's shutdown cancellation along with the deadline, so a
+// detached-but-unbounded status write has nothing left to interrupt it. Facing
+// a wedged or throttling API server it would block forever, permanently
+// costing one of the maxConcurrentReconciles workers and stalling graceful
+// shutdown — strictly worse than the expired context this fix replaces.
+// statusPersistTimeout is what keeps FR-008's worker protection true, so it is
+// asserted here rather than left to the comment on the constant.
+//
+// A plain unit test, no cluster needed: both properties live in the derived
+// context itself.
+func TestStatusWriteContext(t *testing.T) {
+	// The load-bearing case: the reconcile deadline is already gone by the
+	// time the failure it caused gets written.
+	t.Run("survives a parent cancelled before the write starts", func(t *testing.T) {
+		parent, cancelParent := context.WithCancel(context.Background())
+		cancelParent()
+
+		ctx, cancel := statusWriteContext(parent)
+		defer cancel()
+
+		if err := ctx.Err(); err != nil {
+			t.Fatalf("status write context must not inherit its parent's cancellation, got %v", err)
+		}
+	})
+
+	// The same must hold for a cancellation that lands mid-write — a manager
+	// shutdown, or the reconcile deadline expiring a moment later.
+	t.Run("survives a parent cancelled after the write starts", func(t *testing.T) {
+		parent, cancelParent := context.WithCancel(context.Background())
+
+		ctx, cancel := statusWriteContext(parent)
+		defer cancel()
+
+		cancelParent()
+		if err := ctx.Err(); err != nil {
+			t.Fatalf("status write context must not follow its parent's cancellation, got %v", err)
+		}
+	})
+
+	t.Run("carries a deadline of its own, no further than statusPersistTimeout", func(t *testing.T) {
+		// An hour-long parent deadline: if the derived context kept it instead
+		// of replacing it, the bound below catches that too.
+		parent, cancelParent := context.WithTimeout(context.Background(), time.Hour)
+		defer cancelParent()
+
+		start := time.Now()
+		ctx, cancel := statusWriteContext(parent)
+		defer cancel()
+
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("status write context must carry a deadline: detaching from the reconcile deadline also detaches from manager shutdown, so an unbounded write can pin a worker forever")
+		}
+		// One second of slack, like the vault-read deadline spec above: the
+		// deadline is stamped a hair after `start` was taken.
+		if latest := start.Add(statusPersistTimeout + time.Second); deadline.After(latest) {
+			t.Fatalf("status write deadline %s is further than statusPersistTimeout (%s) from the start of the write (latest allowed %s)",
+				deadline, statusPersistTimeout, latest)
+		}
+	})
 }

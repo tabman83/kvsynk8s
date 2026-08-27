@@ -86,6 +86,36 @@ const maxConcurrentReconciles = 2
 // retries with backoff as for any other transient failure.
 const reconcileTimeout = time.Minute
 
+// statusPersistTimeout bounds the terminal status write, which deliberately
+// runs on a context detached from the per-reconcile deadline above.
+//
+// The detachment exists because reconcileTimeout expiring is itself one of the
+// outcomes status has to report. A black-holed Key Vault endpoint (as opposed
+// to the common fast-error case) burns the entire reconcile budget; the
+// resulting deadline error has no HTTP response, so internal/azure classifies
+// it as ErrTransient; engine.Sync turns that into Failing/TransientError with
+// err == nil — a status the CR must show. Written on the same, now-expired
+// context, that update fails instantly and Reconcile returns before
+// recordSyncOutcome ever runs, so no SyncFailed Event is emitted either
+// (FR-009). Every backoff retry then repeats identically: for the whole
+// outage the CR keeps reporting its last good state with a stale
+// lastSyncTime, and anything alerting on status.state or on Events sees a
+// perfectly healthy SecretSync.
+//
+// FR-008's worker protection is not weakened by this. Only the status write
+// escapes the reconcile deadline — never the vault read, never the Secret
+// write — and it gets its own short budget, so a wedged API server still
+// cannot pin one of the maxConcurrentReconciles workers.
+const statusPersistTimeout = 5 * time.Second
+
+// statusWriteContext derives the context a terminal status write runs on:
+// ctx's values with ctx's cancellation and deadline dropped, plus a fresh
+// statusPersistTimeout of its own. context.WithoutCancel keeps values, so the
+// controller-runtime logger stays in the returned context.
+func statusWriteContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), statusPersistTimeout)
+}
+
 // ManagedSecretCacheOptions returns the cache configuration the manager must
 // be built with: the corev1.Secret informer behind Owns(&corev1.Secret{}) is
 // restricted, with a label selector, to Secrets carrying
@@ -290,7 +320,15 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			LastSyncTime:       ss.Status.LastSyncTime,
 			SyncedVersion:      ss.Status.SyncedVersion,
 		}
-		if err := r.Status().Update(ctx, &ss); err != nil {
+		// Terminal status, so it is persisted on a detached context like the
+		// one at the end of Reconcile — see statusPersistTimeout. This path
+		// cannot itself exhaust the reconcile deadline (it runs off cached
+		// reads, before any vault call), but the rule that a terminal status
+		// and its Event always survive the deadline is worth having hold at
+		// every site rather than only where it is currently load-bearing.
+		statusCtx, cancelStatus := statusWriteContext(ctx)
+		defer cancelStatus()
+		if err := r.Status().Update(statusCtx, &ss); err != nil {
 			return ctrl.Result{}, fmt.Errorf("kvsynk8s: update status for %s: %w", req.NamespacedName, err)
 		}
 		r.recordSyncOutcome(&ss, ss.Status, targetName)
@@ -416,7 +454,13 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 
 	ss.Status = status
-	if err := r.Status().Update(ctx, &ss); err != nil {
+	// Detached from the per-reconcile deadline on purpose (statusPersistTimeout):
+	// this is the write that makes a reconcile which ran out of budget — a hung
+	// vault read is the realistic case — observable at all, and it is what lets
+	// recordSyncOutcome below still emit the SyncFailed Event.
+	statusCtx, cancelStatus := statusWriteContext(ctx)
+	defer cancelStatus()
+	if err := r.Status().Update(statusCtx, &ss); err != nil {
 		return ctrl.Result{}, fmt.Errorf("kvsynk8s: update status for %s: %w", req.NamespacedName, err)
 	}
 	r.recordSyncOutcome(&ss, status, targetName)
