@@ -127,11 +127,36 @@ func (w *SecretWriter) CreateOrUpdate(
 		return fmt.Errorf("kvsynk8s: get secret %s/%s: %w", namespace, name, err)
 	}
 
-	if existing.Labels[LabelManagedBy] != LabelManagedByValue {
+	if !writable(existing, owner) {
 		return fmt.Errorf("kvsynk8s: secret %s/%s: %w", namespace, name, ErrTargetConflict)
 	}
 
 	return w.update(ctx, owner, existing, dataKey, value, version)
+}
+
+// writable reports whether the writer may write over the Secret currently at
+// the target name, i.e. whether it is one kvsynk8s wrote rather than someone
+// else's object (FR-012, first writer wins). Two independent proofs count, and
+// either alone is enough:
+//
+//   - the managed-by label: some kvsynk8s SecretSync wrote it. Which one is
+//     not settled here — a label with a controller ownerReference pointing at
+//     a DIFFERENT SecretSync is still a conflict, caught by update's
+//     AlreadyOwnedError mapping; a label with no controller owner at all is
+//     the orphan left by `--cascade=orphan` or a backup restore, which the
+//     writer adopts.
+//   - a controller ownerReference whose UID is this owner's: this owner
+//     provably created it, whatever its labels say now. Requiring the label
+//     too would wedge a Secret whose label was stripped in-cluster into a
+//     permanent TargetConflict about the CR's own Secret: the label-filtered
+//     cache (controller.ManagedSecretCacheOptions) hides it, so the reconciler
+//     sees NotFound, Create hits AlreadyExists, and every later reconcile
+//     repeats that identically — rotations would stop reaching that Secret
+//     forever, while every other kind of in-cluster drift on it is repaired
+//     automatically (FR-007). populateManagedSecret re-stamps the label on the
+//     write this unblocks, so the repair is a single reconcile.
+func writable(secret *corev1.Secret, owner *kvsynk8sv1alpha1.SecretSync) bool {
+	return secret.Labels[LabelManagedBy] == LabelManagedByValue || ControllerOwnedBy(secret, owner)
 }
 
 // update rewrites an existing managed Secret in place (labels, annotations,
@@ -203,7 +228,9 @@ func (w *SecretWriter) create(
 //
 //   - a genuinely foreign Secret at the target name — unmanaged, or managed
 //     by a different SecretSync — that the label-filtered cache could not
-//     see. First-writer-wins (FR-012) classifies that as ErrTargetConflict.
+//     see. First-writer-wins (FR-012) classifies that as ErrTargetConflict,
+//     here for the unmanaged one and in update (AlreadyOwnedError) for the one
+//     another SecretSync controls.
 //   - this operator's OWN managed Secret, created moments ago, that the
 //     cached Get in CreateOrUpdate has not observed yet (a queue-triggered
 //     reconcile racing the informer). That is not a conflict: falling
@@ -212,10 +239,10 @@ func (w *SecretWriter) create(
 //     event until a later reconcile self-heals it.
 //
 // The re-read goes through reader() — the uncached APIReader when wired — so
-// it cannot repeat the very cache staleness being recovered from. Only a
-// Secret that carries BOTH the managed-by label AND a controller
-// ownerReference to this owner is treated as our own; anything else stays a
-// conflict.
+// it cannot repeat the very cache staleness being recovered from. What counts
+// as ours is decided by writable, the same predicate CreateOrUpdate's
+// found-the-Secret path uses, so the two paths cannot disagree about the same
+// occupant; anything writable rejects stays a conflict.
 func (w *SecretWriter) recoverAlreadyExists(
 	ctx context.Context,
 	owner *kvsynk8sv1alpha1.SecretSync,
@@ -229,7 +256,7 @@ func (w *SecretWriter) recoverAlreadyExists(
 		// simply succeed.
 		return fmt.Errorf("kvsynk8s: re-read secret %s/%s after AlreadyExists: %w", namespace, name, getErr)
 	}
-	if current.Labels[LabelManagedBy] == LabelManagedByValue && ControllerOwnedBy(current, owner) {
+	if writable(current, owner) {
 		return w.update(ctx, owner, current, dataKey, value, version)
 	}
 	return fmt.Errorf("kvsynk8s: create secret %s/%s: %w", namespace, name, ErrTargetConflict)

@@ -199,6 +199,75 @@ func TestCreateOrUpdate_AlreadyExistsOnForeignSecret_TargetConflict(t *testing.T
 	}
 }
 
+// TestCreateOrUpdate_OwnSecretWithLabelStripped_RepairedNotConflicted covers
+// the inverse of the two conflict cases above: a Secret this very owner
+// created — its controller ownerReference still points at it by UID — whose
+// managed-by label was removed in-cluster (a hand edit, or a GitOps/backup
+// tool rewriting metadata).
+//
+// Requiring the label as well as the ownerReference used to wedge that Secret
+// permanently: the label-filtered cache hides it, so the reconciler sees
+// NotFound, Create comes back AlreadyExists, and the writer answered
+// ErrTargetConflict about the CR's own Secret — on every reconcile, forever,
+// so rotations stopped reaching it until someone restored the label by hand.
+// Ownership by UID is proof enough to write; the write restores the label.
+//
+// Both routes to the occupant are exercised: the direct Get (an unfiltered
+// client sees it) and the AlreadyExists recovery (what the filtered cache
+// actually produces in production).
+func TestCreateOrUpdate_OwnSecretWithLabelStripped_RepairedNotConflicted(t *testing.T) {
+	tests := []struct {
+		name   string
+		client func(t *testing.T, objs ...client.Object) client.WithWatch
+	}{
+		{
+			name: "found by the pre-write Get",
+			client: func(t *testing.T, objs ...client.Object) client.WithWatch {
+				t.Helper()
+				return fake.NewClientBuilder().WithScheme(redactionScheme(t)).WithObjects(objs...).Build()
+			},
+		},
+		{
+			name:   "invisible to the cache, surfaced by AlreadyExists",
+			client: staleCacheClient,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			owner := newOwner("my-sync", "default", "my-vault", "my-app-password")
+
+			stripped := existingSyncedSecret(owner, "v1", "old-value")
+			delete(stripped.Labels, LabelManagedBy)
+
+			cli := tt.client(t, stripped)
+			w := &SecretWriter{Client: cli, Reader: cli}
+
+			err := w.CreateOrUpdate(context.Background(), owner, owner.Namespace, owner.Name, "my-app-password", "new-value", "v2")
+			if err != nil {
+				t.Fatalf("CreateOrUpdate() error = %v, want nil (the owner's own Secret must be repaired, not conflicted)", err)
+			}
+
+			var got corev1.Secret
+			if getErr := cli.Get(context.Background(), client.ObjectKey{Namespace: owner.Namespace, Name: owner.Name}, &got); getErr != nil {
+				t.Fatalf("get repaired secret: %v", getErr)
+			}
+			if got.Labels[LabelManagedBy] != LabelManagedByValue {
+				t.Fatalf("labels = %v, want the managed-by label restored by the repairing write", got.Labels)
+			}
+			if string(got.Data["my-app-password"]) != "new-value" {
+				t.Fatalf("data was not updated: %v", got.Data)
+			}
+			if got.Annotations[AnnotationVersion] != "v2" {
+				t.Fatalf("version annotation = %q, want %q", got.Annotations[AnnotationVersion], "v2")
+			}
+			if len(got.OwnerReferences) != 1 || got.OwnerReferences[0].UID != owner.UID {
+				t.Fatalf("ownerReferences = %+v, want exactly one controller reference to the owner", got.OwnerReferences)
+			}
+		})
+	}
+}
+
 func TestManagedSecretDataMatches(t *testing.T) {
 	tests := []struct {
 		name    string

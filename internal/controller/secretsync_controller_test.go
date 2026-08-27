@@ -34,6 +34,7 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/config"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -197,6 +198,38 @@ func (deadlineConsumingReader) GetLatest(ctx context.Context, vaultName, secretN
 }
 
 var _ azure.SecretReader = deadlineConsumingReader{}
+
+// secretWriteRejectingClient wraps a real client and fails every Create and
+// Update of a corev1.Secret, leaving every other call — including the
+// SecretSync status writes Reconcile ends on — going to the real API server.
+// It models the class of persistent write failure the operator has no control
+// over: an admission policy or ResourceQuota rejecting the managed Secret, or
+// RBAC drift revoking the write. Deliberately NOT AlreadyExists or a conflict,
+// so the writer classifies it as a plain error rather than a target conflict.
+type secretWriteRejectingClient struct {
+	client.Client
+	err error
+}
+
+func (c secretWriteRejectingClient) Create(
+	ctx context.Context, obj client.Object, opts ...client.CreateOption,
+) error {
+	if _, isSecret := obj.(*corev1.Secret); isSecret {
+		return c.err
+	}
+	return c.Client.Create(ctx, obj, opts...)
+}
+
+func (c secretWriteRejectingClient) Update(
+	ctx context.Context, obj client.Object, opts ...client.UpdateOption,
+) error {
+	if _, isSecret := obj.(*corev1.Secret); isSecret {
+		return c.err
+	}
+	return c.Client.Update(ctx, obj, opts...)
+}
+
+var _ client.Client = secretWriteRejectingClient{}
 
 // startManagerFor spins up a full manager (cache + registered controller, no
 // metrics/health/webhook endpoints) around a fresh SecretSyncReconciler using
@@ -709,6 +742,93 @@ var _ = Describe("SecretSync Controller", func() {
 			Expect(evt).To(ContainSubstring("SyncFailed"))
 			Expect(evt).To(ContainSubstring(syncpkg.ReasonTransientError))
 			Expect(evt).NotTo(ContainSubstring(sentinel))
+		})
+	})
+
+	// The same observability contract as the hung-read spec above, on the
+	// other side of the reconcile: the vault read succeeds and the engine
+	// computes InSync at the new version, but the Secret write itself keeps
+	// failing. Returning that error for backoff without persisting anything
+	// would leave the CR reporting InSync at the OLD version, with a stale
+	// lastSyncTime and no Event, for as long as the write kept failing —
+	// exactly what an operator would be alerting on to catch this.
+	Context("persistent Secret write failure", func() {
+		It("persists Failing/TransientError and emits SyncFailed when the Secret write keeps failing", func() {
+			ctx := context.Background()
+
+			suffix := shortUID()
+			name := "ss-write-fail-" + suffix
+			vaultSecret := "write-fail-secret-" + suffix
+			targetName := "target-write-fail-" + suffix
+			const sentinelV1 = "SENTINEL-fake-value-write-fail-v1-not-real"
+			const sentinelV2 = "SENTINEL-fake-value-write-fail-v2-not-real"
+
+			reader.set(fakeVaultName, vaultSecret, sentinelV1, "v1")
+
+			ss := newTestSecretSync(namespace, name, fakeVaultName, vaultSecret, targetName, fakeDataKey)
+			Expect(k8sClient.Create(ctx, ss)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), ss)
+			})
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{Name: targetName, Namespace: namespace},
+				})
+			})
+
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: namespace}}
+
+			// A healthy sync first: the stale state the CR must move off has to
+			// be a real InSync at a real version for the staleness to be
+			// observable at all.
+			_, err := reconcilerFor(reader).Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			var seeded kvsynk8sv1alpha1.SecretSync
+			Expect(k8sClient.Get(ctx, req.NamespacedName, &seeded)).To(Succeed())
+			Expect(seeded.Status.State).To(Equal(kvsynk8sv1alpha1.SecretSyncStateInSync))
+			Expect(seeded.Status.SyncedVersion).To(Equal("v1"))
+
+			// The vault rotates, so the next reconcile has a genuine write to
+			// make — and every attempt at it is rejected from here on.
+			reader.set(fakeVaultName, vaultSecret, sentinelV2, "v2")
+
+			recorder := events.NewFakeRecorder(10)
+			blocked := reconcilerFor(reader)
+			blocked.Client = secretWriteRejectingClient{
+				Client: k8sClient,
+				err: apierrors.NewForbidden(
+					corev1.Resource("secrets"), targetName,
+					fmt.Errorf("admission webhook rejected the request")),
+			}
+			blocked.Recorder = recorder
+
+			_, err = blocked.Reconcile(ctx, req)
+			Expect(err).To(HaveOccurred(), "a failed Secret write is still returned for backoff retry")
+			Expect(err.Error()).To(ContainSubstring("write secret"))
+			Expect(err.Error()).NotTo(ContainSubstring(sentinelV2))
+
+			var after kvsynk8sv1alpha1.SecretSync
+			Expect(k8sClient.Get(ctx, req.NamespacedName, &after)).To(Succeed())
+			Expect(after.Status.State).To(Equal(kvsynk8sv1alpha1.SecretSyncStateFailing),
+				"a CR whose Secret cannot be written must not keep reporting InSync")
+			Expect(after.Status.Reason).To(Equal(syncpkg.ReasonTransientError))
+			Expect(after.Status.Message).NotTo(ContainSubstring(sentinelV2))
+			// FR-013: the failed sync advances neither the recorded version nor
+			// the last-known-good sync time.
+			Expect(after.Status.SyncedVersion).To(Equal("v1"))
+			Expect(after.Status.LastSyncTime).To(Equal(seeded.Status.LastSyncTime))
+
+			var evt string
+			Eventually(recorder.Events).Should(Receive(&evt))
+			Expect(evt).To(ContainSubstring("SyncFailed"))
+			Expect(evt).To(ContainSubstring(syncpkg.ReasonTransientError))
+			Expect(evt).NotTo(ContainSubstring(sentinelV2))
+
+			// The Secret itself keeps its last synced value: a rejected write
+			// never deletes or blanks what was already there.
+			var secret corev1.Secret
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: targetName, Namespace: namespace}, &secret)).To(Succeed())
+			Expect(string(secret.Data[fakeDataKey])).To(Equal(sentinelV1))
 		})
 	})
 

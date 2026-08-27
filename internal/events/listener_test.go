@@ -543,16 +543,21 @@ func TestListener_ApplyDefaults(t *testing.T) {
 	if zeroed.IdlePollInterval != DefaultIdlePollInterval {
 		t.Errorf("IdlePollInterval = %v, want %v", zeroed.IdlePollInterval, DefaultIdlePollInterval)
 	}
+	if zeroed.QueueCallTimeout != DefaultQueueCallTimeout {
+		t.Errorf("QueueCallTimeout = %v, want %v", zeroed.QueueCallTimeout, DefaultQueueCallTimeout)
+	}
 
 	overridden := &Listener{
 		BatchSize:        7,
 		PoisonThreshold:  2,
 		BusyPollInterval: 5 * time.Millisecond,
 		IdlePollInterval: 7 * time.Millisecond,
+		QueueCallTimeout: 9 * time.Millisecond,
 	}
 	overridden.applyDefaults()
 	if overridden.BatchSize != 7 || overridden.PoisonThreshold != 2 ||
-		overridden.BusyPollInterval != 5*time.Millisecond || overridden.IdlePollInterval != 7*time.Millisecond {
+		overridden.BusyPollInterval != 5*time.Millisecond || overridden.IdlePollInterval != 7*time.Millisecond ||
+		overridden.QueueCallTimeout != 9*time.Millisecond {
 		t.Errorf("applyDefaults() overwrote explicitly-set fields: %+v", overridden)
 	}
 }
@@ -660,5 +665,86 @@ func TestListener_NonActionableEvent_DeletedWithoutEmit(t *testing.T) {
 
 	if deleted := queue.deletedIDs(); len(deleted) != 1 || deleted[0] != "msg-near-expiry" {
 		t.Errorf("deleted = %v, want [msg-near-expiry] (non-actionable events are still consumed)", deleted)
+	}
+}
+
+// hangingQueueSource models the half-open connection the queue call timeout
+// exists for: Receive and Delete never answer on their own, they only return
+// when the context they were given ends. Nothing below the listener imposes a
+// deadline (azqueue is built with default client options: no HTTP client
+// timeout, TryTimeout zero), so without QueueCallTimeout these calls would
+// block forever.
+type hangingQueueSource struct{}
+
+func (hangingQueueSource) Receive(ctx context.Context, _ int32) ([]azure.QueueMessage, error) {
+	<-ctx.Done()
+	return nil, fmt.Errorf("dequeue messages: %w", ctx.Err())
+}
+
+func (hangingQueueSource) Delete(ctx context.Context, messageID string, _ string) error {
+	<-ctx.Done()
+	return fmt.Errorf("delete message %s: %w", messageID, ctx.Err())
+}
+
+var _ azure.QueueSource = hangingQueueSource{}
+
+// TestListener_HungReceive_BoundedByQueueCallTimeout pins the contract that
+// makes a stalled queue survivable: Start's loop is strictly sequential, so a
+// Receive that never returns stops every later poll AND freezes
+// consecutiveReceiveFailures at zero -- the operator's documented signal for
+// a broken queue path would report healthy for the whole outage. The call must
+// instead be cut off at QueueCallTimeout, counted as a failure, and the loop
+// left free to poll again.
+func TestListener_HungReceive_BoundedByQueueCallTimeout(t *testing.T) {
+	l := NewListener(hangingQueueSource{}, fakeClientWith(t), make(chan event.GenericEvent, 1))
+	l.QueueCallTimeout = 50 * time.Millisecond
+
+	var (
+		err  error
+		done = make(chan struct{})
+	)
+	go func() {
+		defer close(done)
+		_, err = l.pollOnce(context.Background())
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("pollOnce() never returned: a hung Receive must be bounded by QueueCallTimeout")
+	}
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("pollOnce() error = %v, want a wrapped context.DeadlineExceeded", err)
+	}
+
+	l.healthMu.Lock()
+	failures := l.consecutiveReceiveFailures
+	l.healthMu.Unlock()
+	if failures != 1 {
+		t.Errorf("consecutiveReceiveFailures = %d, want 1 (a timed-out Receive is a failed Receive)", failures)
+	}
+}
+
+// TestListener_HungDelete_BoundedByQueueCallTimeout is the same contract for
+// the other queue call. A delete that hangs would stall the message loop just
+// as thoroughly as a hung Receive; bounded, it degrades to the behavior a
+// failed delete already has -- logged, and the message reappears after its
+// visibility timeout, which is safe because every handleMessage path is
+// idempotent.
+func TestListener_HungDelete_BoundedByQueueCallTimeout(t *testing.T) {
+	l := NewListener(hangingQueueSource{}, fakeClientWith(t), make(chan event.GenericEvent, 1))
+	l.QueueCallTimeout = 50 * time.Millisecond
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		l.deleteMessage(context.Background(), azure.QueueMessage{ID: "msg-hung-delete", PopReceipt: "pop-hung"})
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("deleteMessage() never returned: a hung Delete must be bounded by QueueCallTimeout")
 	}
 }
