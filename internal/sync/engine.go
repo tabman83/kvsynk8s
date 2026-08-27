@@ -108,9 +108,19 @@ func (e *Engine) Sync(
 	// FR-012, first-writer-wins: never touch a pre-existing Secret this
 	// SecretSync did not create, no matter what the vault currently holds.
 	// Checked before ever calling the vault so a conflicting declaration
-	// never even attempts a read.
-	managed := existing != nil && existing.Labels[LabelManagedBy] == LabelManagedByValue
-	if existing != nil && !managed {
+	// never even attempts a read. Two distinct conflict shapes:
+	//   - no managed-by label: an unmanaged Secret created by someone else;
+	//   - labeled, but controller-owned by a DIFFERENT SecretSync. The label
+	//     only proves "some kvsynk8s SecretSync wrote this"; WHICH one is
+	//     recorded solely in the controller ownerReference UID — the same
+	//     rule the controller's ownedBy and the writer's AlreadyOwnedError
+	//     mapping already apply. Without this second check, a conflict loser
+	//     whose data/version happened to match the winner's would take the
+	//     idempotent InSync skip below over a Secret it does not own, and the
+	//     reconciler's write gate would then never reach the writer's own
+	//     ownership check.
+	labeled := existing != nil && existing.Labels[LabelManagedBy] == LabelManagedByValue
+	if existing != nil && !labeled {
 		status.State = kvsynk8sv1alpha1.SecretSyncStateFailing
 		status.Reason = ReasonTargetConflict
 		status.Message = fmt.Sprintf(
@@ -119,6 +129,25 @@ func (e *Engine) Sync(
 		)
 		return status, existing, nil
 	}
+	if labeled {
+		if ref := metav1.GetControllerOf(existing); ref != nil && ref.UID != owner.UID {
+			status.State = kvsynk8sv1alpha1.SecretSyncStateFailing
+			status.Reason = ReasonTargetConflict
+			status.Message = fmt.Sprintf(
+				"secret %s/%s is already owned by another SecretSync",
+				owner.Namespace, targetName,
+			)
+			return status, existing, nil
+		}
+	}
+
+	// managed: this Secret is verifiably a prior write of THIS SecretSync —
+	// labeled AND controller-owned by owner. A labeled Secret with no
+	// controller owner at all is not a conflict (the writer adopts it on the
+	// write path below, exactly as it always has), but it is not `managed`
+	// either: the idempotent skip must never accept a Secret this SecretSync
+	// cannot prove it owns.
+	managed := labeled && ControllerOwnedBy(existing, owner)
 
 	value, version, err := e.Reader.GetLatest(ctx, owner.Spec.Vault.Name, owner.Spec.Vault.Secret)
 	if err != nil {
@@ -181,6 +210,18 @@ func controllerOwnerReference(owner *kvsynk8sv1alpha1.SecretSync) metav1.OwnerRe
 		Controller:         &isController,
 		BlockOwnerDeletion: &blockDeletion,
 	}
+}
+
+// ControllerOwnedBy reports whether secret's controller OwnerReference points
+// at owner by UID — i.e. whether owner is the SecretSync that actually
+// created/claimed secret, as opposed to merely sharing its target name or its
+// managed-by label (FR-012). This is the single ownership predicate for the
+// whole codebase: the engine's conflict/idempotency checks above, the writer's
+// AlreadyExists recovery, and the controller's deletion/GC paths (ownedBy) all
+// delegate to the same UID comparison so they can never disagree.
+func ControllerOwnedBy(secret *corev1.Secret, owner *kvsynk8sv1alpha1.SecretSync) bool {
+	ref := metav1.GetControllerOf(secret)
+	return ref != nil && ref.UID == owner.UID
 }
 
 // classifyReaderError maps a SecretReader.GetLatest error to a

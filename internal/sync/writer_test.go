@@ -9,10 +9,13 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 // TestCreateOrUpdate_LabeledSecretOwnedByOtherController_TargetConflict
@@ -79,6 +82,120 @@ func TestCreateOrUpdate_LabeledSecretOwnedByOtherController_TargetConflict(t *te
 	}
 	if len(got.OwnerReferences) != 1 || got.OwnerReferences[0].Name != otherOwner.Name {
 		t.Fatalf("conflicting Secret's ownerReferences were modified: %+v", got.OwnerReferences)
+	}
+}
+
+// staleCacheClient builds a fake client whose FIRST Get for any Secret
+// returns NotFound while every later Get (and all other verbs) passes
+// through to the real fake store. This simulates the informer-cache race
+// CreateOrUpdate can hit: the cached pre-write Get reports NotFound for a
+// Secret the API server already has, Create then fails with AlreadyExists,
+// and the recovery re-read (the second Get) sees the truth.
+func staleCacheClient(t *testing.T, objs ...client.Object) client.WithWatch {
+	t.Helper()
+	firstGet := true
+	return fake.NewClientBuilder().
+		WithScheme(redactionScheme(t)).
+		WithObjects(objs...).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if firstGet {
+					firstGet = false
+					return apierrors.NewNotFound(schema.GroupResource{Resource: "secrets"}, key.Name)
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+		}).
+		Build()
+}
+
+// TestCreateOrUpdate_AlreadyExistsOnOwnSecret_FallsThroughToUpdate covers the
+// informer race on the operator's OWN Secret: the cached Get misses it,
+// Create returns AlreadyExists, and the uncached re-read shows a Secret that
+// carries both the managed-by label and a controller ownerReference to this
+// very owner. That must NOT be classified as ErrTargetConflict (which used to
+// flap the CR to a false Failing/TargetConflict with a spurious SyncFailed
+// event); CreateOrUpdate must fall through to the update path and converge.
+func TestCreateOrUpdate_AlreadyExistsOnOwnSecret_FallsThroughToUpdate(t *testing.T) {
+	owner := newOwner("my-sync", "default", "my-vault", "my-app-password")
+
+	own := existingSyncedSecret(owner, "v1", "old-value")
+	cli := staleCacheClient(t, own)
+	w := &SecretWriter{Client: cli, Reader: cli}
+
+	err := w.CreateOrUpdate(context.Background(), owner, owner.Namespace, owner.Name, "my-app-password", "new-value", "v2")
+	if err != nil {
+		t.Fatalf("CreateOrUpdate() error = %v, want nil (own just-created Secret is not a conflict)", err)
+	}
+
+	var got corev1.Secret
+	if getErr := cli.Get(context.Background(), client.ObjectKey{Namespace: owner.Namespace, Name: owner.Name}, &got); getErr != nil {
+		t.Fatalf("get secret after recovery: %v", getErr)
+	}
+	if string(got.Data["my-app-password"]) != "new-value" {
+		t.Fatalf("secret data = %q, want the new value written through the update path", got.Data["my-app-password"])
+	}
+	if got.Annotations[AnnotationVersion] != "v2" {
+		t.Fatalf("version annotation = %q, want %q", got.Annotations[AnnotationVersion], "v2")
+	}
+	if len(got.OwnerReferences) != 1 || got.OwnerReferences[0].UID != owner.UID {
+		t.Fatalf("ownerReferences = %+v, want exactly one controller reference to the owner", got.OwnerReferences)
+	}
+}
+
+// TestCreateOrUpdate_AlreadyExistsOnForeignSecret_TargetConflict pins the
+// other half of the recovery: when the Secret that caused AlreadyExists is
+// NOT verifiably this owner's — unmanaged, or labeled but controller-owned by
+// a different SecretSync — the classification stays ErrTargetConflict and the
+// occupant is left untouched (FR-012).
+func TestCreateOrUpdate_AlreadyExistsOnForeignSecret_TargetConflict(t *testing.T) {
+	owner := newOwner("my-sync", "default", "my-vault", "my-app-password")
+	otherOwner := newOwner("other-sync", "default", "my-vault", "my-app-password")
+
+	unmanaged := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      owner.Name,
+			Namespace: owner.Namespace,
+			Labels:    map[string]string{"created-by": "some-other-tool"},
+		},
+		Type: corev1.SecretTypeOpaque,
+		Data: map[string][]byte{"unrelated-key": []byte("unrelated-value")},
+	}
+
+	otherOwned := existingSyncedSecret(otherOwner, "v1", "owned-by-someone-else")
+
+	tests := []struct {
+		name     string
+		occupant *corev1.Secret
+	}{
+		{"unmanaged occupant", unmanaged},
+		{"labeled occupant owned by another SecretSync", otherOwned},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			before := tt.occupant.DeepCopy()
+			cli := staleCacheClient(t, tt.occupant)
+			w := &SecretWriter{Client: cli, Reader: cli}
+
+			err := w.CreateOrUpdate(context.Background(), owner, owner.Namespace, tt.occupant.Name, "my-app-password", "new-value", "v2")
+			if !errors.Is(err, ErrTargetConflict) {
+				t.Fatalf("CreateOrUpdate() error = %v, want wrapped ErrTargetConflict", err)
+			}
+
+			var got corev1.Secret
+			if getErr := cli.Get(context.Background(), client.ObjectKey{Namespace: owner.Namespace, Name: tt.occupant.Name}, &got); getErr != nil {
+				t.Fatalf("get occupant secret: %v", getErr)
+			}
+			for key, want := range before.Data {
+				if string(got.Data[key]) != string(want) {
+					t.Fatalf("occupant data[%q] = %q, want untouched %q", key, got.Data[key], want)
+				}
+			}
+			if len(got.OwnerReferences) != len(before.OwnerReferences) {
+				t.Fatalf("occupant ownerReferences were modified: %+v", got.OwnerReferences)
+			}
+		})
 	}
 }
 

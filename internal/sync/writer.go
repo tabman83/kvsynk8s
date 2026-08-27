@@ -73,6 +73,23 @@ type SecretWriter struct {
 	// Client is used to read the current state of the target Secret and to
 	// create or update it. Required.
 	Client client.Client
+
+	// Reader, when set, is an UNCACHED reader (mgr.GetAPIReader()) used only
+	// to re-check the target after Create fails with AlreadyExists. The
+	// cached Client can race the informer: a queue-triggered reconcile right
+	// after this operator's own Create may still see NotFound from the cache
+	// while the API server already has the Secret, and without an uncached
+	// re-read that race would be misclassified as ErrTargetConflict. Falls
+	// back to Client when nil, so hand-built writers (tests) keep working.
+	Reader client.Reader
+}
+
+// reader returns the uncached Reader when wired, or Client otherwise.
+func (w *SecretWriter) reader() client.Reader {
+	if w.Reader != nil {
+		return w.Reader
+	}
+	return w.Client
 }
 
 // CreateOrUpdate ensures that an Opaque Secret named `name` in `namespace`
@@ -112,6 +129,21 @@ func (w *SecretWriter) CreateOrUpdate(
 		return fmt.Errorf("kvsynk8s: secret %s/%s: %w", namespace, name, ErrTargetConflict)
 	}
 
+	return w.update(ctx, owner, existing, dataKey, value, version)
+}
+
+// update rewrites an existing managed Secret in place (labels, annotations,
+// owner reference, data) and persists it. Shared by CreateOrUpdate's normal
+// found-and-labeled path and by the AlreadyExists recovery in create, so the
+// two paths cannot drift.
+func (w *SecretWriter) update(
+	ctx context.Context,
+	owner *kvsynk8sv1alpha1.SecretSync,
+	existing *corev1.Secret,
+	dataKey, value, version string,
+) error {
+	namespace, name := existing.Namespace, existing.Name
+
 	populateManagedSecret(existing, owner, dataKey, value, version)
 	if err := controllerutil.SetControllerReference(owner, existing, w.Client.Scheme()); err != nil {
 		var alreadyOwned *controllerutil.AlreadyOwnedError
@@ -135,8 +167,9 @@ func (w *SecretWriter) CreateOrUpdate(
 }
 
 // create builds and persists a brand new managed Secret. Only reached when
-// the earlier Get in CreateOrUpdate confirmed nothing exists at this
-// namespace/name yet, so there is no unmanaged resource to conflict with.
+// the earlier Get in CreateOrUpdate reported nothing at this namespace/name —
+// which, with the label-filtered cache, may still be stale or incomplete: an
+// AlreadyExists from the API server is resolved by recoverAlreadyExists.
 func (w *SecretWriter) create(
 	ctx context.Context,
 	owner *kvsynk8sv1alpha1.SecretSync,
@@ -155,17 +188,49 @@ func (w *SecretWriter) create(
 	}
 	if err := w.Client.Create(ctx, secret); err != nil {
 		if apierrors.IsAlreadyExists(err) {
-			// Another actor created a Secret at this name between the Get in
-			// CreateOrUpdate and this Create (TOCTOU): treat it the same as
-			// any other pre-existing unmanaged Secret rather than a generic
-			// error, so callers can classify it as TargetConflict (FR-012)
-			// instead of the status update being skipped entirely.
-			return fmt.Errorf("kvsynk8s: create secret %s/%s: %w", namespace, name, ErrTargetConflict)
+			return w.recoverAlreadyExists(ctx, owner, namespace, name, dataKey, value, version)
 		}
 		return fmt.Errorf("kvsynk8s: create secret %s/%s: %w", namespace, name, err)
 	}
 	logf.FromContext(ctx).V(1).Info("created managed secret", "namespace", namespace, "name", name, "vault", owner.Spec.Vault.Name, "secret", owner.Spec.Vault.Secret, "version", version)
 	return nil
+}
+
+// recoverAlreadyExists decides what a Create that failed with AlreadyExists
+// actually means. Two very different situations produce it:
+//
+//   - a genuinely foreign Secret at the target name — unmanaged, or managed
+//     by a different SecretSync — that the label-filtered cache could not
+//     see. First-writer-wins (FR-012) classifies that as ErrTargetConflict.
+//   - this operator's OWN managed Secret, created moments ago, that the
+//     cached Get in CreateOrUpdate has not observed yet (a queue-triggered
+//     reconcile racing the informer). That is not a conflict: falling
+//     through to the update path converges immediately instead of flapping
+//     the CR to a false Failing/TargetConflict with a spurious SyncFailed
+//     event until a later reconcile self-heals it.
+//
+// The re-read goes through reader() — the uncached APIReader when wired — so
+// it cannot repeat the very cache staleness being recovered from. Only a
+// Secret that carries BOTH the managed-by label AND a controller
+// ownerReference to this owner is treated as our own; anything else stays a
+// conflict.
+func (w *SecretWriter) recoverAlreadyExists(
+	ctx context.Context,
+	owner *kvsynk8sv1alpha1.SecretSync,
+	namespace, name, dataKey, value, version string,
+) error {
+	current := &corev1.Secret{}
+	if getErr := w.reader().Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, current); getErr != nil {
+		// Whatever occupies the name cannot be identified: return the error
+		// for backoff retry rather than misclassifying. A NotFound here means
+		// the occupant is already gone again, and the retry's Create will
+		// simply succeed.
+		return fmt.Errorf("kvsynk8s: re-read secret %s/%s after AlreadyExists: %w", namespace, name, getErr)
+	}
+	if current.Labels[LabelManagedBy] == LabelManagedByValue && ControllerOwnedBy(current, owner) {
+		return w.update(ctx, owner, current, dataKey, value, version)
+	}
+	return fmt.Errorf("kvsynk8s: create secret %s/%s: %w", namespace, name, ErrTargetConflict)
 }
 
 // populateManagedSecret sets the type, managed-by label, vault/secret/version

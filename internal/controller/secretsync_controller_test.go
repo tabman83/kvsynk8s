@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"testing"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -955,6 +956,286 @@ var _ = Describe("SecretSync Controller", func() {
 		})
 	})
 
+	// FR-012 precedence machinery (findConflictingOwner/takesPrecedence):
+	// deterministic ordering between two live claims regardless of reconcile
+	// order, the defeated-claim exemption, and loser recovery once the winner
+	// is gone. Each spec builds the winner's name lexically smaller than the
+	// loser's and creates it first, so takesPrecedence is deterministic even
+	// at envtest's one-second CreationTimestamp resolution (ties break on
+	// Name).
+	Context("FR-012: precedence between competing SecretSyncs", func() {
+		It("fails the losing declaration even when it reconciles first, before any Secret exists", func() {
+			ctx := context.Background()
+
+			suffix := shortUID()
+			targetName := "shared-prec-" + suffix
+			targetKey := types.NamespacedName{Name: targetName, Namespace: namespace}
+			nameA := "ss-prec-a-" + suffix // winner: created first, lexically smaller
+			nameB := "ss-prec-b-" + suffix
+			secretA := "prec-secret-a-" + suffix
+			secretB := "prec-secret-b-" + suffix
+			const valueA = "SENTINEL-fake-value-prec-winner-not-real"
+			const valueB = "SENTINEL-fake-value-prec-loser-not-real"
+			reader.set(fakeVaultName, secretA, valueA, "v1")
+			reader.set(fakeVaultName, secretB, valueB, "v1")
+
+			ssA := newTestSecretSync(namespace, nameA, fakeVaultName, secretA, targetName, fakeDataKey)
+			Expect(k8sClient.Create(ctx, ssA)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), ssA)
+			})
+			ssB := newTestSecretSync(namespace, nameB, fakeVaultName, secretB, targetName, fakeDataKey)
+			Expect(k8sClient.Create(ctx, ssB)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), ssB)
+			})
+
+			r := reconcilerFor(reader)
+			reqA := reconcile.Request{NamespacedName: types.NamespacedName{Name: nameA, Namespace: namespace}}
+			reqB := reconcile.Request{NamespacedName: types.NamespacedName{Name: nameB, Namespace: namespace}}
+
+			// The LOSER reconciles first. Reconcile order must not decide
+			// ownership: the CR-level precedence check has to fail B here,
+			// before any Secret exists for the Create race to decide instead.
+			_, err := r.Reconcile(ctx, reqB)
+			Expect(err).NotTo(HaveOccurred())
+
+			var afterB kvsynk8sv1alpha1.SecretSync
+			Expect(k8sClient.Get(ctx, reqB.NamespacedName, &afterB)).To(Succeed())
+			Expect(afterB.Status.State).To(Equal(kvsynk8sv1alpha1.SecretSyncStateFailing))
+			Expect(afterB.Status.Reason).To(Equal(reasonTargetConflict))
+			// B must never have written anything: the precedence check runs
+			// before any vault read or Secret write.
+			err = k8sClient.Get(ctx, targetKey, &corev1.Secret{})
+			Expect(apierrors.IsNotFound(err)).To(BeTrue(),
+				"the losing declaration must not create the target Secret just because it reconciled first")
+
+			// The winner then reconciles and takes the target.
+			_, err = r.Reconcile(ctx, reqA)
+			Expect(err).NotTo(HaveOccurred())
+
+			var afterA kvsynk8sv1alpha1.SecretSync
+			Expect(k8sClient.Get(ctx, reqA.NamespacedName, &afterA)).To(Succeed())
+			Expect(afterA.Status.State).To(Equal(kvsynk8sv1alpha1.SecretSyncStateInSync))
+
+			var secret corev1.Secret
+			Expect(k8sClient.Get(ctx, targetKey, &secret)).To(Succeed())
+			Expect(string(secret.Data[fakeDataKey])).To(Equal(valueA))
+			Expect(secret.OwnerReferences).To(ContainElement(HaveField("Name", nameA)))
+
+			// B reconciling again changes nothing.
+			_, err = r.Reconcile(ctx, reqB)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, reqB.NamespacedName, &afterB)).To(Succeed())
+			Expect(afterB.Status.State).To(Equal(kvsynk8sv1alpha1.SecretSyncStateFailing))
+			Expect(afterB.Status.Reason).To(Equal(reasonTargetConflict))
+			Expect(k8sClient.Get(ctx, targetKey, &secret)).To(Succeed())
+			Expect(string(secret.Data[fakeDataKey])).To(Equal(valueA))
+		})
+
+		It("ignores a defeated Failing/TargetConflict claim when deciding precedence", func() {
+			ctx := context.Background()
+
+			suffix := shortUID()
+			targetName := "shared-defeated-" + suffix
+			targetKey := types.NamespacedName{Name: targetName, Namespace: namespace}
+			nameA := "ss-defeated-a-" + suffix // would take precedence, but is already defeated
+			nameB := "ss-defeated-b-" + suffix
+			secretB := "defeated-secret-b-" + suffix
+			const valueB = "SENTINEL-fake-value-defeated-live-not-real"
+			reader.set(fakeVaultName, secretB, valueB, "v1")
+
+			ssA := newTestSecretSync(namespace, nameA, fakeVaultName, "defeated-secret-a-"+suffix, targetName, fakeDataKey)
+			Expect(k8sClient.Create(ctx, ssA)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), ssA)
+			})
+			ssB := newTestSecretSync(namespace, nameB, fakeVaultName, secretB, targetName, fakeDataKey)
+			Expect(k8sClient.Create(ctx, ssB)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), ssB)
+			})
+
+			// A already lost its claim (e.g. to a since-removed unmanaged
+			// Secret): a defeated claim must not veto anyone else, or two
+			// losers could deadlock each other forever.
+			var defeated kvsynk8sv1alpha1.SecretSync
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nameA, Namespace: namespace}, &defeated)).To(Succeed())
+			defeated.Status = kvsynk8sv1alpha1.SecretSyncStatus{
+				State:              kvsynk8sv1alpha1.SecretSyncStateFailing,
+				Reason:             reasonTargetConflict,
+				Message:            "defeated claim, set up by the test",
+				ObservedGeneration: defeated.Generation,
+			}
+			Expect(k8sClient.Status().Update(ctx, &defeated)).To(Succeed())
+
+			r := reconcilerFor(reader)
+			reqB := reconcile.Request{NamespacedName: types.NamespacedName{Name: nameB, Namespace: namespace}}
+			_, err := r.Reconcile(ctx, reqB)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Without the defeated-claim exemption, A (older, lexically
+			// smaller) would take precedence and B would go Failing here.
+			var afterB kvsynk8sv1alpha1.SecretSync
+			Expect(k8sClient.Get(ctx, reqB.NamespacedName, &afterB)).To(Succeed())
+			Expect(afterB.Status.State).To(Equal(kvsynk8sv1alpha1.SecretSyncStateInSync))
+
+			var secret corev1.Secret
+			Expect(k8sClient.Get(ctx, targetKey, &secret)).To(Succeed())
+			Expect(string(secret.Data[fakeDataKey])).To(Equal(valueB))
+			Expect(secret.OwnerReferences).To(ContainElement(HaveField("Name", nameB)))
+		})
+
+		It("lets the loser recover to InSync after the winning SecretSync is deleted", func() {
+			ctx := context.Background()
+
+			suffix := shortUID()
+			targetName := "shared-recover-" + suffix
+			targetKey := types.NamespacedName{Name: targetName, Namespace: namespace}
+			nameA := "ss-recover-a-" + suffix // winner
+			nameB := "ss-recover-b-" + suffix // loser, recovers
+			secretA := "recover-secret-a-" + suffix
+			secretB := "recover-secret-b-" + suffix
+			const valueA = "SENTINEL-fake-value-recover-winner-not-real"
+			const valueB = "SENTINEL-fake-value-recover-loser-not-real"
+			reader.set(fakeVaultName, secretA, valueA, "v1")
+			reader.set(fakeVaultName, secretB, valueB, "v1")
+
+			ssA := newTestSecretSync(namespace, nameA, fakeVaultName, secretA, targetName, fakeDataKey)
+			Expect(k8sClient.Create(ctx, ssA)).To(Succeed())
+			ssB := newTestSecretSync(namespace, nameB, fakeVaultName, secretB, targetName, fakeDataKey)
+			Expect(k8sClient.Create(ctx, ssB)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), ssB)
+			})
+
+			r := reconcilerFor(reader)
+			reqA := reconcile.Request{NamespacedName: types.NamespacedName{Name: nameA, Namespace: namespace}}
+			reqB := reconcile.Request{NamespacedName: types.NamespacedName{Name: nameB, Namespace: namespace}}
+
+			// Winner takes the target; loser goes Failing/TargetConflict.
+			_, err := r.Reconcile(ctx, reqA)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = r.Reconcile(ctx, reqB)
+			Expect(err).NotTo(HaveOccurred())
+
+			var afterB kvsynk8sv1alpha1.SecretSync
+			Expect(k8sClient.Get(ctx, reqB.NamespacedName, &afterB)).To(Succeed())
+			Expect(afterB.Status.State).To(Equal(kvsynk8sv1alpha1.SecretSyncStateFailing))
+			Expect(afterB.Status.Reason).To(Equal(reasonTargetConflict))
+
+			// The winner is deleted: its finalizer removes the managed Secret
+			// and then the CR itself goes away.
+			var winner kvsynk8sv1alpha1.SecretSync
+			Expect(k8sClient.Get(ctx, reqA.NamespacedName, &winner)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, &winner)).To(Succeed())
+			_, err = r.Reconcile(ctx, reqA)
+			Expect(err).NotTo(HaveOccurred())
+
+			Eventually(func() bool {
+				err := k8sClient.Get(ctx, reqA.NamespacedName, &kvsynk8sv1alpha1.SecretSync{})
+				return apierrors.IsNotFound(err)
+			}).Should(BeTrue(), "the winning SecretSync should be fully removed")
+			err = k8sClient.Get(ctx, targetKey, &corev1.Secret{})
+			Expect(apierrors.IsNotFound(err)).To(BeTrue(), "the winner's managed Secret should be gone")
+
+			// The loser's next reconcile finds no live competitor and no
+			// occupied target: it must claim the name and reach InSync.
+			_, err = r.Reconcile(ctx, reqB)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, reqB.NamespacedName, &afterB)).To(Succeed())
+			Expect(afterB.Status.State).To(Equal(kvsynk8sv1alpha1.SecretSyncStateInSync))
+			Expect(afterB.Status.SyncedVersion).To(Equal("v1"))
+
+			var secret corev1.Secret
+			Expect(k8sClient.Get(ctx, targetKey, &secret)).To(Succeed())
+			Expect(string(secret.Data[fakeDataKey])).To(Equal(valueB))
+			Expect(secret.OwnerReferences).To(ContainElement(HaveField("Name", nameB)))
+		})
+	})
+
+	// FR-012, the other half of the ownership rule: a Secret carrying the
+	// managed-by label but NO controller ownerReference. It is not a conflict
+	// — nothing claims it — so the SecretSync adopts it. What matters is that
+	// adoption really reaches the API server even when the value and the
+	// version already match: that case makes every content-based idempotency
+	// check false, and only the ownership check in the write gate still forces
+	// the write.
+	Context("FR-012: a labeled Secret with no controller owner", func() {
+		It("adopts it on the first reconcile even when version and data already match", func() {
+			ctx := context.Background()
+
+			suffix := shortUID()
+			name := "ss-adopt-" + suffix
+			targetName := "target-adopt-" + suffix
+			targetKey := types.NamespacedName{Name: targetName, Namespace: namespace}
+			vaultSecret := "adopt-secret-" + suffix
+			const value = "SENTINEL-fake-value-adopt-not-real"
+			reader.set(fakeVaultName, vaultSecret, value, "v1")
+
+			// Exactly what `kubectl delete secretsync --cascade=orphan`, a
+			// restore from backup, or a hand-applied manifest leaves behind:
+			// the managed-by label and the right content, but no
+			// ownerReferences at all.
+			orphan := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      targetName,
+					Namespace: namespace,
+					Labels:    map[string]string{managedByLabelKey: managedByLabelValue},
+					Annotations: map[string]string{
+						vaultAnnotationKey:   fakeVaultName,
+						secretAnnotationKey:  vaultSecret,
+						versionAnnotationKey: "v1",
+					},
+				},
+				Type: corev1.SecretTypeOpaque,
+				Data: map[string][]byte{fakeDataKey: []byte(value)},
+			}
+			Expect(k8sClient.Create(ctx, orphan)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), orphan)
+			})
+
+			ss := newTestSecretSync(namespace, name, fakeVaultName, vaultSecret, targetName, fakeDataKey)
+			Expect(k8sClient.Create(ctx, ss)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), ss)
+			})
+
+			r := reconcilerFor(reader)
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: namespace}}
+			_, err := r.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			var after kvsynk8sv1alpha1.SecretSync
+			Expect(k8sClient.Get(ctx, req.NamespacedName, &after)).To(Succeed())
+			Expect(after.Status.State).To(Equal(kvsynk8sv1alpha1.SecretSyncStateInSync))
+
+			// The point of the spec: the ownerReference must be PERSISTED, not
+			// merely stamped on the in-memory copy the engine returned. Without
+			// it, Owns(&corev1.Secret{}) cannot map edits of this Secret back to
+			// any SecretSync, and deleting the CR would leave it behind.
+			var secret corev1.Secret
+			Expect(k8sClient.Get(ctx, targetKey, &secret)).To(Succeed())
+			Expect(secret.OwnerReferences).To(HaveLen(1))
+			Expect(secret.OwnerReferences[0].UID).To(Equal(after.UID))
+			Expect(secret.OwnerReferences[0].Controller).NotTo(BeNil())
+			Expect(*secret.OwnerReferences[0].Controller).To(BeTrue())
+			Expect(string(secret.Data[fakeDataKey])).To(Equal(value))
+
+			// And the adopting write happens exactly once: with ownership now
+			// on record, the next reconcile is write-free (a resourceVersion
+			// bump here would mean the gate writes on every pass and, with
+			// Owns(), retriggers itself forever).
+			settled := secret.ResourceVersion
+			_, err = r.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, targetKey, &secret)).To(Succeed())
+			Expect(secret.ResourceVersion).To(Equal(settled))
+		})
+	})
+
 	// T027 (US4, FR-009/FR-010): a "Synced" Normal event on success and a
 	// "SyncFailed" Warning event on failure, referencing only vault/secret/
 	// version identifiers -- never a secret value.
@@ -1042,3 +1323,42 @@ var _ = Describe("SecretSync Controller", func() {
 		})
 	})
 })
+
+// TestTakesPrecedence pins the deterministic ordering rule between two live
+// claims on the same target name: earlier CreationTimestamp wins; ties (down
+// to envtest's one-second timestamp resolution) break on Name. A plain unit
+// test, no cluster needed — the envtest specs above exercise the same rule
+// end-to-end through Reconcile.
+func TestTakesPrecedence(t *testing.T) {
+	at := func(name string, created time.Time) *kvsynk8sv1alpha1.SecretSync {
+		return &kvsynk8sv1alpha1.SecretSync{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              name,
+				Namespace:         "default",
+				CreationTimestamp: metav1.NewTime(created),
+			},
+		}
+	}
+	t0 := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	t1 := t0.Add(time.Second)
+
+	tests := []struct {
+		name string
+		a, b *kvsynk8sv1alpha1.SecretSync
+		want bool
+	}{
+		{"earlier timestamp wins", at("zzz", t0), at("aaa", t1), true},
+		{"later timestamp loses", at("aaa", t1), at("zzz", t0), false},
+		{"equal timestamps: smaller name wins", at("aaa", t0), at("bbb", t0), true},
+		{"equal timestamps: larger name loses", at("bbb", t0), at("aaa", t0), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := takesPrecedence(tt.a, tt.b); got != tt.want {
+				t.Fatalf("takesPrecedence(%s@%s, %s@%s) = %v, want %v",
+					tt.a.Name, tt.a.CreationTimestamp, tt.b.Name, tt.b.CreationTimestamp, got, tt.want)
+			}
+		})
+	}
+}
