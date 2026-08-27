@@ -46,9 +46,11 @@ package events
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -56,6 +58,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	kvsynk8sv1alpha1 "github.com/tabman83/kvsynk8s/api/v1alpha1"
@@ -70,8 +73,12 @@ import (
 type fakeQueueSource struct {
 	mu       sync.Mutex
 	batches  [][]azure.QueueMessage
-	deleted  []string // message IDs deleted, in order
+	deleted  []string // message IDs Delete was called for, in order
 	receives int
+	// deleteErr, when non-nil, is returned by every Delete call (the call is
+	// still recorded in deleted first, so tests can assert the delete was
+	// attempted). Exercises listener.go's deleteMessage error branch.
+	deleteErr error
 }
 
 func newFakeQueueSource(batches ...[]azure.QueueMessage) *fakeQueueSource {
@@ -94,7 +101,13 @@ func (f *fakeQueueSource) Delete(_ context.Context, messageID, _ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.deleted = append(f.deleted, messageID)
-	return nil
+	return f.deleteErr
+}
+
+func (f *fakeQueueSource) receiveCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.receives
 }
 
 func (f *fakeQueueSource) deletedIDs() []string {
@@ -335,5 +348,251 @@ func TestListener_BurstAcrossMultipleBatches_NoneLost(t *testing.T) {
 
 	if deleted := queue.deletedIDs(); len(deleted) != total {
 		t.Errorf("deleted %d messages, want %d (SC-005: none lost across a burst)", len(deleted), total)
+	}
+}
+
+// failFirstQueueSource wraps a fakeQueueSource and fails the first `failures`
+// Receive calls with a fixed, static error before delegating. It simulates a
+// transient Azure-side outage for the Start loop tests below.
+type failFirstQueueSource struct {
+	mu       sync.Mutex
+	inner    *fakeQueueSource
+	failures int
+	receives int
+}
+
+func (f *failFirstQueueSource) Receive(ctx context.Context, batch int32) ([]azure.QueueMessage, error) {
+	f.mu.Lock()
+	f.receives++
+	fail := f.failures > 0
+	if fail {
+		f.failures--
+	}
+	f.mu.Unlock()
+	if fail {
+		return nil, errors.New("kvsynk8s: fake transient queue outage")
+	}
+	return f.inner.Receive(ctx, batch)
+}
+
+func (f *failFirstQueueSource) Delete(ctx context.Context, messageID, popReceipt string) error {
+	return f.inner.Delete(ctx, messageID, popReceipt)
+}
+
+func (f *failFirstQueueSource) receiveCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.receives
+}
+
+var _ azure.QueueSource = (*failFirstQueueSource)(nil)
+
+// TestListener_Start_ReceiveErrorBacksOffAndKeepsRunning pins the
+// load-bearing branch of Start (constitution II): a Receive error is logged
+// and followed by an idle backoff and another poll -- NOT a returned error,
+// which would stop the whole manager on the first transient Azure blip. The
+// first Receive fails, the second delivers a matched message; if a refactor
+// ever turns that branch into `return err`, no event arrives and this test
+// fails.
+func TestListener_Start_ReceiveErrorBacksOffAndKeepsRunning(t *testing.T) {
+	match := newSecretSync("ns-a", "sync-a", testVault, testObject)
+	cli := fakeClientWith(t, match)
+
+	body := encodedBody(eventPayload(testEventID, newVersionET, testVault, secretType, testObject, testVersion))
+	msg := azure.QueueMessage{ID: "start-msg-1", PopReceipt: "pop-start-1", Text: string(body), DequeueCount: 1}
+	queue := &failFirstQueueSource{inner: newFakeQueueSource([]azure.QueueMessage{msg}), failures: 1}
+
+	events := make(chan event.GenericEvent, 1)
+	l := NewListener(queue, cli, events)
+	// Tiny intervals so the error backoff and the follow-up poll happen
+	// within milliseconds instead of the production 30s.
+	l.BusyPollInterval = time.Millisecond
+	l.IdlePollInterval = time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- l.Start(ctx) }()
+
+	select {
+	case <-events:
+		// Start survived the failed first Receive and processed the message
+		// from the retried one.
+	case <-time.After(10 * time.Second):
+		t.Fatal("Start did not keep polling after a Receive error: no event was ever delivered")
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Start() = %v, want nil on context cancellation", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Start did not return after context cancellation")
+	}
+
+	if got := queue.receiveCount(); got < 2 {
+		t.Errorf("Receive was called %d times, want at least 2 (one failed, one retried)", got)
+	}
+	if deleted := queue.inner.deletedIDs(); len(deleted) != 1 || deleted[0] != "start-msg-1" {
+		t.Errorf("deleted = %v, want [start-msg-1]", deleted)
+	}
+}
+
+// TestListener_Start_AlreadyCancelledContext_ReturnsNilWithoutPolling covers
+// Start's clean-shutdown contract: a context that is already done means
+// return nil (a normal manager stop), not an error and not a Receive call.
+func TestListener_Start_AlreadyCancelledContext_ReturnsNilWithoutPolling(t *testing.T) {
+	queue := newFakeQueueSource()
+	cli := fakeClientWith(t)
+	l := NewListener(queue, cli, make(chan event.GenericEvent, 1))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := l.Start(ctx); err != nil {
+		t.Fatalf("Start() = %v, want nil for an already-cancelled context", err)
+	}
+	if got := queue.receiveCount(); got != 0 {
+		t.Errorf("Receive was called %d times, want 0 (the queue must not be polled after shutdown)", got)
+	}
+}
+
+// TestListener_ApplyDefaults covers applyDefaults: zero-valued tuning fields
+// on a hand-assembled Listener are filled with the package defaults, and
+// explicitly-set fields are left alone.
+func TestListener_ApplyDefaults(t *testing.T) {
+	zeroed := &Listener{}
+	zeroed.applyDefaults()
+	if zeroed.BatchSize != DefaultBatchSize {
+		t.Errorf("BatchSize = %d, want %d", zeroed.BatchSize, DefaultBatchSize)
+	}
+	if zeroed.PoisonThreshold != DefaultPoisonThreshold {
+		t.Errorf("PoisonThreshold = %d, want %d", zeroed.PoisonThreshold, DefaultPoisonThreshold)
+	}
+	if zeroed.BusyPollInterval != DefaultBusyPollInterval {
+		t.Errorf("BusyPollInterval = %v, want %v", zeroed.BusyPollInterval, DefaultBusyPollInterval)
+	}
+	if zeroed.IdlePollInterval != DefaultIdlePollInterval {
+		t.Errorf("IdlePollInterval = %v, want %v", zeroed.IdlePollInterval, DefaultIdlePollInterval)
+	}
+
+	overridden := &Listener{
+		BatchSize:        7,
+		PoisonThreshold:  2,
+		BusyPollInterval: 5 * time.Millisecond,
+		IdlePollInterval: 7 * time.Millisecond,
+	}
+	overridden.applyDefaults()
+	if overridden.BatchSize != 7 || overridden.PoisonThreshold != 2 ||
+		overridden.BusyPollInterval != 5*time.Millisecond || overridden.IdlePollInterval != 7*time.Millisecond {
+		t.Errorf("applyDefaults() overwrote explicitly-set fields: %+v", overridden)
+	}
+}
+
+// TestListener_CacheListFailure_KeepsMessageForRetry pins the
+// keep-message-on-cache-list-failure contract (listener.go handleMessage): if
+// listing SecretSyncs from the cache fails, the message must NOT be deleted --
+// it stays on the queue and reappears after its visibility timeout, so the
+// event is retried instead of lost.
+func TestListener_CacheListFailure_KeepsMessageForRetry(t *testing.T) {
+	listErr := errors.New("kvsynk8s: fake cache list failure")
+	cli := fake.NewClientBuilder().
+		WithScheme(fakeScheme(t)).
+		WithObjects(newSecretSync("ns-a", "sync-a", testVault, testObject)).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(_ context.Context, _ client.WithWatch, _ client.ObjectList, _ ...client.ListOption) error {
+				return listErr
+			},
+		}).
+		Build()
+
+	body := encodedBody(eventPayload(testEventID, newVersionET, testVault, secretType, testObject, testVersion))
+	msg := azure.QueueMessage{ID: "keep-msg-1", PopReceipt: "pop-keep-1", Text: string(body), DequeueCount: 1}
+	queue := newFakeQueueSource([]azure.QueueMessage{msg})
+
+	events := make(chan event.GenericEvent, 1)
+	l := NewListener(queue, cli, events)
+
+	n, err := l.pollOnce(context.Background())
+	if err != nil {
+		t.Fatalf("pollOnce() error = %v, want nil (a per-message failure must not fail the poll)", err)
+	}
+	if n != 1 {
+		t.Fatalf("pollOnce() returned %d messages, want 1", n)
+	}
+
+	select {
+	case evt := <-events:
+		t.Fatalf("no event must be emitted when matching failed, but got %+v", evt)
+	default:
+	}
+
+	if deleted := queue.deletedIDs(); len(deleted) != 0 {
+		t.Errorf("deleted = %v, want none: the message must stay queued for a later retry", deleted)
+	}
+}
+
+// TestListener_DeleteFailure_LoggedAndProcessingContinues covers
+// deleteMessage's error branch: a failed Delete is logged and swallowed --
+// the message simply reappears after its visibility timeout -- rather than
+// failing the poll or losing the already-emitted events.
+func TestListener_DeleteFailure_LoggedAndProcessingContinues(t *testing.T) {
+	match := newSecretSync("ns-a", "sync-a", testVault, testObject)
+	cli := fakeClientWith(t, match)
+
+	body := encodedBody(eventPayload(testEventID, newVersionET, testVault, secretType, testObject, testVersion))
+	msg := azure.QueueMessage{ID: "msg-delete-fails", PopReceipt: "pop-df", Text: string(body), DequeueCount: 1}
+	queue := newFakeQueueSource([]azure.QueueMessage{msg})
+	queue.deleteErr = errors.New("kvsynk8s: fake delete failure")
+
+	events := make(chan event.GenericEvent, 1)
+	l := NewListener(queue, cli, events)
+
+	n, err := l.pollOnce(context.Background())
+	if err != nil {
+		t.Fatalf("pollOnce() error = %v, want nil (a failed delete must be swallowed)", err)
+	}
+	if n != 1 {
+		t.Fatalf("pollOnce() returned %d messages, want 1", n)
+	}
+
+	// The event was still dispatched before the delete failed.
+	drainEvents(t, events, 1)
+
+	// And the delete was genuinely attempted (then its error swallowed).
+	if deleted := queue.deletedIDs(); len(deleted) != 1 || deleted[0] != "msg-delete-fails" {
+		t.Errorf("delete attempts = %v, want [msg-delete-fails]", deleted)
+	}
+}
+
+// TestListener_NonActionableEvent_DeletedWithoutEmit drives a message with a
+// valid envelope but an event type this operator does not act on
+// (SecretNearExpiry: Parse returns nil, nil) through pollOnce, pinning
+// handleMessage's clean-discard branch: deleted, nothing emitted.
+func TestListener_NonActionableEvent_DeletedWithoutEmit(t *testing.T) {
+	match := newSecretSync("ns-a", "sync-a", testVault, testObject)
+	cli := fakeClientWith(t, match)
+
+	body := encodedBody(eventPayload(testEventID, nearExpiryET, testVault, secretType, testObject, testVersion))
+	msg := azure.QueueMessage{ID: "msg-near-expiry", PopReceipt: "pop-ne", Text: string(body), DequeueCount: 1}
+	queue := newFakeQueueSource([]azure.QueueMessage{msg})
+
+	events := make(chan event.GenericEvent, 1)
+	l := NewListener(queue, cli, events)
+
+	if _, err := l.pollOnce(context.Background()); err != nil {
+		t.Fatalf("pollOnce() error = %v, want nil", err)
+	}
+
+	select {
+	case evt := <-events:
+		t.Fatalf("a non-actionable event must not be dispatched, but got %+v", evt)
+	default:
+	}
+
+	if deleted := queue.deletedIDs(); len(deleted) != 1 || deleted[0] != "msg-near-expiry" {
+		t.Errorf("deleted = %v, want [msg-near-expiry] (non-actionable events are still consumed)", deleted)
 	}
 }

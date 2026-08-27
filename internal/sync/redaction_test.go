@@ -24,11 +24,13 @@ package sync
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -60,19 +62,43 @@ func capturingLogger() (logr.Logger, *bytes.Buffer) {
 	return zapr.NewLogger(zap.New(core)), buf
 }
 
-// assertNoLeak fails t if sentinel appears anywhere in haystacks or in the
-// captured log buffer. label identifies which scenario is being checked, for
-// a useful failure message.
+// leakForms returns every textual shape the sentinel can take in structured
+// log output. The plain string is the obvious one; the base64 form is the
+// non-obvious one and the reason this helper exists: zapr hands a []byte (and
+// a map[string][]byte, such as Secret.Data) to zap.Any, which encodes it as
+// base64 in JSON. A leak of the raw bytes of a secret value therefore does
+// NOT contain the sentinel as plain text, and a naive ContainSubstring check
+// would pass while the operator log holds a trivially decodable copy of the
+// value.
+func leakForms(sentinel string) []string {
+	return []string{sentinel, base64.StdEncoding.EncodeToString([]byte(sentinel))}
+}
+
+// assertNoLeakInLog fails t if any form of sentinel (see leakForms) appears in
+// the captured log buffer.
+func assertNoLeakInLog(t *testing.T, label, sentinel string, logBuf *bytes.Buffer) {
+	t.Helper()
+	logs := logBuf.String()
+	for _, form := range leakForms(sentinel) {
+		if strings.Contains(logs, form) {
+			t.Fatalf("%s: sentinel leaked into captured log output (as %q): %s", label, form, logs)
+		}
+	}
+}
+
+// assertNoLeak fails t if any form of sentinel appears anywhere in haystacks
+// or in the captured log buffer. label identifies which scenario is being
+// checked, for a useful failure message.
 func assertNoLeak(t *testing.T, label, sentinel string, logBuf *bytes.Buffer, haystacks ...string) {
 	t.Helper()
 	for i, h := range haystacks {
-		if strings.Contains(h, sentinel) {
-			t.Fatalf("%s: sentinel leaked into output[%d]: %q", label, i, h)
+		for _, form := range leakForms(sentinel) {
+			if strings.Contains(h, form) {
+				t.Fatalf("%s: sentinel leaked into output[%d] (as %q): %q", label, i, form, h)
+			}
 		}
 	}
-	if strings.Contains(logBuf.String(), sentinel) {
-		t.Fatalf("%s: sentinel leaked into captured log output: %s", label, logBuf.String())
-	}
+	assertNoLeakInLog(t, label, sentinel, logBuf)
 }
 
 // dumpStatus renders every field of status as text, the same way a human or
@@ -241,9 +267,7 @@ func TestRedaction_Writer_CreateOrUpdate_Success_ValueOnlyInSecretData(t *testin
 		t.Fatalf("CreateOrUpdate() error = %v, want nil", err)
 	}
 
-	if strings.Contains(logBuf.String(), sentinel) {
-		t.Fatalf("sentinel leaked into captured log output: %s", logBuf.String())
-	}
+	assertNoLeakInLog(t, "writer-create", sentinel, logBuf)
 
 	var got corev1.Secret
 	if err := cli.Get(ctx, client.ObjectKey{Namespace: owner.Namespace, Name: owner.Name}, &got); err != nil {
@@ -293,9 +317,7 @@ func TestRedaction_Writer_CreateOrUpdate_Update_ValueOnlyInSecretData(t *testing
 		t.Fatalf("update CreateOrUpdate() error = %v, want nil", err)
 	}
 
-	if strings.Contains(logBuf.String(), sentinel) {
-		t.Fatalf("sentinel leaked into captured log output from the Update branch: %s", logBuf.String())
-	}
+	assertNoLeakInLog(t, "writer-update", sentinel, logBuf)
 
 	var got corev1.Secret
 	if err := cli.Get(ctx, client.ObjectKey{Namespace: owner.Namespace, Name: owner.Name}, &got); err != nil {
@@ -340,79 +362,160 @@ func TestRedaction_Writer_CreateOrUpdate_TargetConflict_NoValueInError(t *testin
 	}
 }
 
-// TestWriterSource_NeverLogsValueParameter is a static check (T028): it
-// parses writer.go's own source into an AST and inspects every call whose
-// selector is Info or Error (the .Info(/.Error(/.V(n).Info() log call
-// shapes used in this file) for an argument that references the local
-// identifier `value` -- the parameter CreateOrUpdate/create take that holds
-// the secret value. A future PR that adds, say,
-// `log.Info("wrote secret", "value", value)` to writer.go will fail this
-// test the moment it's added, which is the point.
+// TestValueCarryingSources_NeverLogValueIdentifiers is a static check (T028):
+// it parses each value-carrying source file into an AST and inspects every
+// call whose selector is Info, Error, or WithValues (the
+// .Info(/.Error(/.V(n).Info()/.WithValues() log call shapes used in these
+// files) for an argument that references one of that file's value-carrying
+// local identifiers -- the ones that hold, or contain, the plaintext secret
+// value. A future PR that adds, say, `log.Info("wrote secret", "value",
+// value)` to writer.go, or `log.WithValues("data", desired.Data)` to the
+// controller, will fail this test the moment it's added, which is the point.
 //
-// This is AST-based rather than a line-by-line string scan specifically so
-// it cannot be defeated by ordinary Go formatting: a call whose arguments
-// are wrapped across multiple lines (gofmt does this once a call has enough
-// key/value pairs, or an editor auto-wraps a long line) is parsed as the
-// same single *ast.CallExpr regardless of how its tokens are laid out on
-// screen, so every argument is still inspected.
-func TestWriterSource_NeverLogsValueParameter(t *testing.T) {
-	src, err := readSourceFile(t, "writer.go")
-	if err != nil {
-		t.Fatalf("read writer.go: %v", err)
+// Covered files: writer.go (the only code path allowed to place a value into
+// a Kubernetes object) and internal/controller/secretsync_controller.go
+// (which materializes the plaintext value -- `value :=
+// string(desired.Data[dataKey])` -- right next to live log calls).
+//
+// A value-carrying identifier may still be logged through a field that
+// provably cannot carry a value (`secret.Name`, `secret.Namespace`): those
+// are listed per identifier as safeFields, and only those exact field
+// selections are allowed. Anything else off the identifier -- the bare
+// identifier, `secret.Data`, an index expression -- fails.
+//
+// Honest scope: this is AST-based rather than a line-by-line string scan, so
+// a call whose arguments are wrapped across multiple lines (gofmt does this
+// once a call has enough key/value pairs) is still parsed as one
+// *ast.CallExpr and every argument is inspected. It is NOT a proof of
+// non-leakage: it only inspects Info/Error/WithValues selector calls for the
+// listed identifiers, so a value copied into a differently-named variable
+// first, or smuggled through a helper such as fmt.Sprintf into an error that
+// is logged later, would not be caught here. The runtime log-capture tests in
+// this file and in the controller package are the complementary check for
+// those shapes -- and they scan for both the plain and the base64 form of the
+// sentinel, because zapr encodes a []byte or a map[string][]byte as base64.
+func TestValueCarryingSources_NeverLogValueIdentifiers(t *testing.T) {
+	logSelectors := map[string]bool{"Info": true, "Error": true, "WithValues": true}
+
+	// noSafeFields means every use of that identifier inside a log call
+	// argument is a violation.
+	noSafeFields := map[string]bool(nil)
+
+	cases := []struct {
+		path string
+		// valueIdents maps each identifier in that file that holds or
+		// contains a plaintext secret value to the field selections off it
+		// that are allowed to reach a log call. Everything else fails.
+		valueIdents map[string]map[string]bool
+	}{
+		{
+			path: "writer.go",
+			valueIdents: map[string]map[string]bool{
+				"value": noSafeFields, "existing": noSafeFields, "secret": noSafeFields,
+			},
+		},
+		{
+			path: filepath.Join("..", "controller", "secretsync_controller.go"),
+			// `value` and `desired` hold the plaintext directly; `existing`,
+			// `fetched`, and `priorData` hold the target Secret's data. The
+			// loop variable `secret` in deleteStaleManagedSecrets is a whole
+			// managed Secret, so it carries the value in .Data -- it is
+			// listed too, with only the identity fields it legitimately logs
+			// today allowed through.
+			valueIdents: map[string]map[string]bool{
+				"value": noSafeFields, "desired": noSafeFields, "existing": noSafeFields,
+				"fetched": noSafeFields, "priorData": noSafeFields,
+				"secret": {"Name": true, "Namespace": true},
+			},
+		},
 	}
 
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "writer.go", src, 0)
-	if err != nil {
-		t.Fatalf("parse writer.go: %v", err)
-	}
-
-	logCall := false
-	ast.Inspect(file, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		sel, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok || (sel.Sel.Name != "Info" && sel.Sel.Name != "Error") {
-			return true
-		}
-		logCall = true
-		for _, arg := range call.Args {
-			if referencesValueIdent(arg) {
-				pos := fset.Position(call.Pos())
-				t.Fatalf("writer.go:%d: %s(...) call has an argument that references the `value` identifier", pos.Line, sel.Sel.Name)
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			src, err := readSourceFile(t, tc.path)
+			if err != nil {
+				t.Fatalf("read %s: %v", tc.path, err)
 			}
-		}
-		return true
-	})
-	if !logCall {
-		t.Skip("writer.go currently has no log calls at all; this check has nothing to verify yet but stays in place for when T028 adds one")
+
+			fset := token.NewFileSet()
+			file, err := parser.ParseFile(fset, tc.path, src, 0)
+			if err != nil {
+				t.Fatalf("parse %s: %v", tc.path, err)
+			}
+
+			logCall := false
+			ast.Inspect(file, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				sel, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok || !logSelectors[sel.Sel.Name] {
+					return true
+				}
+				logCall = true
+				for _, arg := range call.Args {
+					if ident, found := referencesIdent(arg, tc.valueIdents); found {
+						pos := fset.Position(call.Pos())
+						t.Fatalf("%s:%d: %s(...) call has an argument that references the value-carrying identifier %q",
+							tc.path, pos.Line, sel.Sel.Name, ident)
+					}
+				}
+				return true
+			})
+			if !logCall {
+				t.Fatalf("%s: no Info/Error/WithValues calls found at all -- if logging moved elsewhere, this check must follow it", tc.path)
+			}
+		})
 	}
 }
 
-// referencesValueIdent reports whether expr is, or contains as a
-// sub-expression anywhere within it, an *ast.Ident named "value". Walking
-// the whole sub-expression (rather than only checking whether expr itself is
-// a bare identifier) means it also catches `value` wrapped in a conversion,
-// a call, or any other expression built from it. Matching on the parsed
+// referencesIdent reports whether expr is, or contains as a sub-expression
+// anywhere within it, a reference to one of the value-carrying identifiers in
+// idents, returning the first such reference. Walking the whole
+// sub-expression (rather than only checking whether expr itself is a bare
+// identifier) means it also catches an identifier wrapped in a conversion, a
+// call, or any other expression built from it. Matching on the parsed
 // identifier name -- not a substring of the source text -- means it doesn't
 // false-positive on unrelated identifiers that merely contain the same
 // letters, like "dataValue" or "valueFoo".
-func referencesValueIdent(expr ast.Expr) bool {
-	found := false
+//
+// A selection listed in that identifier's safe-field set (`secret.Name`) is
+// skipped, and so is anything below it; every other shape -- the bare
+// identifier, `secret.Data`, `secret.Data[k]` -- is reported.
+func referencesIdent(expr ast.Expr, idents map[string]map[string]bool) (string, bool) {
+	var found string
 	ast.Inspect(expr, func(n ast.Node) bool {
-		if ident, ok := n.(*ast.Ident); ok && ident.Name == "value" {
-			found = true
+		if found != "" {
+			return false
+		}
+		if sel, ok := n.(*ast.SelectorExpr); ok {
+			if base, ok := sel.X.(*ast.Ident); ok {
+				if safeFields, listed := idents[base.Name]; listed {
+					if safeFields[sel.Sel.Name] {
+						return false
+					}
+					found = base.Name + "." + sel.Sel.Name
+					return false
+				}
+			}
+			return true
+		}
+		if ident, ok := n.(*ast.Ident); ok {
+			if _, listed := idents[ident.Name]; listed {
+				found = ident.Name
+			}
+			return false
 		}
 		return true
 	})
-	return found
+	return found, found != ""
 }
 
-// readSourceFile reads a source file from this package's own directory
-// (tests run with the package directory as their working directory, so a
-// bare relative name is enough).
+// readSourceFile reads a source file by a path relative to this package's
+// own directory (tests run with the package directory as their working
+// directory, so a bare relative name -- or a ../sibling-package path -- is
+// enough).
 func readSourceFile(t *testing.T, name string) (string, error) {
 	t.Helper()
 	b, err := os.ReadFile(name)

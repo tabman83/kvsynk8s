@@ -65,10 +65,12 @@ var ErrTargetConflict = errors.New("kvsynk8s: target secret exists and is not ma
 // call in this file uses only identifier keys — "namespace", "name",
 // "vault", "secret", "version" — read off owner/namespace/name/version.
 // internal/sync/redaction_test.go's static check
-// (TestWriterSource_NeverLogsValueParameter) parses this file's AST and
-// inspects every .Info(/.Error( call's arguments for a reference to the
-// `value` identifier, so it catches a future violation regardless of how the
-// call is formatted (single line or wrapped across several).
+// (TestValueCarryingSources_NeverLogValueIdentifiers) parses this file's AST
+// and inspects every .Info(/.Error(/.WithValues( call's arguments for a
+// reference to a value-carrying identifier (`value`, `existing`, `secret`).
+// That catches a violation whether the call is on one line or wrapped across
+// several — but only for those call shapes and identifiers; the runtime
+// log-capture tests in the same file cover what actually gets emitted.
 type SecretWriter struct {
 	// Client is used to read the current state of the target Secret and to
 	// create or update it. Required.

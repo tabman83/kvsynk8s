@@ -814,10 +814,13 @@ func registerSecretSyncEmulatorTests() {
 			By("creating the notification queue in azurite")
 			queueClient, err = newAzuriteQueueClient("127.0.0.1:" + azuritePort)
 			Expect(err).NotTo(HaveOccurred())
+			// Unsetenv runs before the error assertion (same ordering as the
+			// SC-001 enqueue below): a failed Create must not leave
+			// SSL_CERT_FILE leaked into every later spec in this process.
 			Expect(os.Setenv("SSL_CERT_FILE", filepath.Join(certDir, "cert.pem"))).To(Succeed())
 			_, err = queueClient.Create(context.Background(), nil)
-			Expect(err).NotTo(HaveOccurred())
 			Expect(os.Unsetenv("SSL_CERT_FILE")).To(Succeed())
+			Expect(err).NotTo(HaveOccurred())
 
 			By("writing the combined CA bundle the operator will trust")
 			bundle := append(append([]byte{}, certPEM...), lowkeyCertPEM...)
@@ -1041,7 +1044,10 @@ func registerSecretSyncEmulatorTests() {
 			waitForSecretDataValue(namespace, secretName, secretName, sentinel, 90*time.Second)
 
 			By("scanning operator logs for the sentinel value")
-			cmd := exec.Command("kubectl", "-n", namespace, "logs", "-l", "control-plane=controller-manager")
+			// --tail=-1 fetches the whole log: kubectl defaults to --tail=10
+			// when a label selector is used, which would scan only the last
+			// ten lines and let a leak earlier in the log pass unnoticed.
+			cmd := exec.Command("kubectl", "-n", namespace, "logs", "-l", "control-plane=controller-manager", "--tail=-1")
 			logs, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(logs).NotTo(ContainSubstring(sentinel))
