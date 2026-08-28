@@ -486,9 +486,12 @@ Two guards run before anything is published. `hack/check-latest-eligible.sh`
 decides whether this version may move `:latest` and be marked "Latest release",
 so releasing an older version as a backport leaves both pointing at the newer
 one. `hack/check-release-overwrite.sh` refuses to rebuild an already published
-version from a different commit. If a release fails after the image is pushed,
-re-run that failed run instead of starting a new release of the same version —
-the re-run converges, a fresh dispatch is what the guard has to refuse.
+version from a different commit. Re-running a dispatched release is settled by
+the git tag the pipeline itself wrote; a tag push is always checked against the
+registry, because there the tag is what started the run and proves nothing. If a
+release fails after the image is pushed, re-run that failed run instead of
+starting a new release of the same version — the re-run converges, a fresh
+dispatch or a hand-pushed tag is what the guard has to refuse.
 
 Pick the number by hand. There is no version file to edit anywhere:
 

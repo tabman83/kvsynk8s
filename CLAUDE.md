@@ -235,9 +235,14 @@ Two guards gate every stable release, both driven by
 `hack/release-guards_test.sh` in CI. `hack/check-latest-eligible.sh` answers
 whether this version may move `:latest` and be marked "Latest release", so a
 backport cannot steal either from a newer version. `hack/check-release-overwrite.sh`
-refuses to rebuild an already published version from a different commit. When a
-release fails after the image is pushed, the remedy is re-running that failed
-run, not dispatching the same version again.
+refuses to rebuild an already published version from a different commit. How it
+decides depends on the trigger: on a `workflow_dispatch` re-run the existing git
+tag is the pipeline's own receipt that a release of that commit completed, so it
+passes on the tag alone, while on a tag push the tag is only the trigger and the
+guard always asks the registry instead. When a release fails after the image is
+pushed, the remedy is re-running that failed run, not dispatching the same
+version again — and not pushing the tag by hand, which is the case the registry
+check exists to catch.
 
 Once a branch is pushed and its PR is open, watch its checks
 (`gh pr checks <PR#> --watch`) and fix forward on any failure — see the "PR
