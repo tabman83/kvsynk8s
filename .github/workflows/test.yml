@@ -45,3 +45,10 @@ jobs:
 
       - name: Exercise the release guards
         run: hack/release-guards_test.sh
+
+      # Same reasoning one level down: a stale install command in the README
+      # sends users at an old release, and a diff review does not catch it —
+      # PR #47 rewrote both docs a day after v0.2.0 shipped and left every
+      # install command on v0.1.0.
+      - name: Exercise the docs guard
+        run: hack/doc-guards_test.sh

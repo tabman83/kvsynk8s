@@ -41,11 +41,14 @@ Needs Helm 3.8 or newer (that is where OCI support went GA).
 
 ```bash
 helm install kvsynk8s oci://ghcr.io/tabman83/charts/kvsynk8s \
-  --version 0.1.0 \
   --namespace kvsynk8s --create-namespace \
   --set azure.clientID=<managed-identity-client-id> \
   --set operator.queueURL=https://<storage>.queue.core.windows.net/<queue>
 ```
+
+Without `--version` Helm installs the newest stable chart version. The dev
+builds published on every merge are prereleases, so they are skipped. Add
+`--version X.Y.Z` when you want to pin one instead.
 
 The chart version is always the release version, and the image tag defaults to
 it, so you never have to line up two versions by hand. You still need the
@@ -88,8 +91,8 @@ manifest install fails on the existing objects. Remove the manifest install
 first:
 
 ```bash
-# use whichever version you installed
-kubectl delete -f https://github.com/tabman83/kvsynk8s/releases/download/v0.1.0/install.yaml
+# the version you installed, not necessarily the newest one
+kubectl delete -f https://github.com/tabman83/kvsynk8s/releases/download/v<version-you-installed>/install.yaml
 ```
 
 That deletes the CRD too, and with it every SecretSync object. If you want to
@@ -137,12 +140,14 @@ uninstall.
 ### Option B — release manifest
 
 ```bash
-kubectl apply -f https://github.com/tabman83/kvsynk8s/releases/download/v0.1.0/install.yaml
+kubectl apply -f https://github.com/tabman83/kvsynk8s/releases/latest/download/install.yaml
 ```
 
 This is the file `.github/workflows/release.yml` builds and attaches to each
 GitHub Release: the CRD, RBAC, and the operator Deployment, with the image
-already pinned to that release's tag.
+already pinned to that release's tag. The `latest/download` link always serves
+the newest stable release. To pin one, replace `latest/download` with
+`download/v0.2.0`.
 
 ### Option C — from source
 
@@ -306,6 +311,11 @@ kubectl -n demo get secret demo-password -o jsonpath='{.data.password}' | base64
   reports the secret gone or disabled, the `SecretSync` goes `Failing` with
   reason `SourceDeleted`/`SourceDisabled`, but the last synced value stays in
   the Kubernetes Secret untouched — workloads keep the last known good value.
+- **Renaming `spec.target.secretName` cleans up the old Secret.** The operator
+  deletes the Secret it had written under the previous name. The sweep only
+  runs once the new target is verifiably `InSync`, so a failed or conflicted
+  sync never deletes anything, and a Secret the operator did not create is
+  never touched.
 - **Latest always wins.** A queue notification is only ever a trigger; the
   operator always re-reads the current value from Key Vault rather than
   trusting a version number carried in the notification. Duplicate or
@@ -398,7 +408,7 @@ There are two kinds of release.
 You decide the version and start the release yourself:
 
 ```bash
-gh workflow run Release -f version=0.2.0
+gh workflow run Release -f version=0.3.0
 ```
 
 No `v` in front of the number, the workflow adds it. It creates the tag itself
@@ -406,10 +416,18 @@ at the end, pointing at the commit it built. Pushing a tag by hand still works
 too:
 
 ```bash
-git tag v0.2.0 && git push origin v0.2.0
+git tag v0.3.0 && git push origin v0.3.0
 ```
 
 A stable release is the only thing that moves the `:latest` image tag.
+
+Two guards run before anything is published. `hack/check-latest-eligible.sh`
+decides whether this version may move `:latest` and be marked "Latest release",
+so releasing an older version as a backport leaves both pointing at the newer
+one. `hack/check-release-overwrite.sh` refuses to rebuild an already published
+version from a different commit. If a release fails after the image is pushed,
+re-run that failed run instead of starting a new release of the same version —
+the re-run converges, a fresh dispatch is what the guard has to refuse.
 
 Pick the number by hand. There is no version file to edit anywhere:
 
@@ -424,7 +442,7 @@ clusters, and `helm upgrade` applies the new schema to them, so a breaking
 schema change is a major bump even if the Go code barely changed.
 
 You can also cut a release candidate. Use a version with a suffix, like
-`0.2.0-rc1`. It publishes everything, but leaves `:latest` alone and shows as a
+`0.3.0-rc1`. It publishes everything, but leaves `:latest` alone and shows as a
 prerelease.
 
 ### Dev builds (automatic, every merge)
@@ -438,12 +456,14 @@ exactly like any other version:
 
 ```bash
 helm install kvsynk8s oci://ghcr.io/tabman83/charts/kvsynk8s \
-  --version 0.1.1-dev.42 --namespace kvsynk8s --create-namespace
+  --version 0.2.1-dev.42 --namespace kvsynk8s --create-namespace
 ```
 
-The version is the next patch plus the run number, so `0.1.1-dev.42` comes
-after `v0.1.0`. It sorts below the real `0.1.1`, so it can never look newer
-than the release it is heading towards. Dev builds never move `:latest`.
+The version is the next patch plus the run number, so `0.2.1-dev.42` comes
+after `v0.2.0`. It sorts below the real `0.2.1`, so it can never look newer
+than the release it is heading towards. The base is worked out at release time
+from the newest stable tag, so the number above is only an example. Dev builds
+never move `:latest`.
 
 To find the version to install, look at the Actions run for the merge. The
 version is printed in the run summary. Or list what has been published:

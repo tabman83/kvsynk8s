@@ -17,18 +17,26 @@ A working kubebuilder operator. All of Phases 1-8 in
 Feature `002-helm-chart` is complete and merged, with no open tasks: the chart
 lives at `charts/kvsynk8s/` and is a second first-class install method. T024's
 follow-up — the part of the release contract a dev build cannot exercise — was
-confirmed on `v0.1.0`, which carries both `install.yaml` and
+confirmed back on `v0.1.0`, which carried both `install.yaml` and
 `kvsynk8s-0.1.0.tgz` as release assets.
 
 So T038 is the only outstanding item in the whole repo.
 
-**The project has shipped.** `v0.1.0` is released, and both install methods are
+**The project has shipped.** The newest release is `v0.2.0` (2026-08-26),
+carrying both `install.yaml` and `kvsynk8s-0.2.0.tgz`. Both install methods are
 live and verified working anonymously:
-`helm install kvsynk8s oci://ghcr.io/tabman83/charts/kvsynk8s --version 0.1.0`
-and the `install.yaml` asset on the GitHub Release. Both GHCR packages are
-public. Every merge to `master` also publishes a dev build
+`helm install kvsynk8s oci://ghcr.io/tabman83/charts/kvsynk8s` (no `--version`
+resolves the newest stable chart and skips the dev prereleases) and the
+`install.yaml` asset on the GitHub Release, reachable at the stable
+`releases/latest/download/install.yaml` URL. Both GHCR packages are public.
+Every merge to `master` also publishes a dev build
 (`<next patch>-dev.<run number>`) to the registry only — no tag, no GitHub
 Release — so the releases page stays clean. See "Cutting a release" below.
+
+**`master` runs ahead of the newest tag**, so this file and the README describe
+`master`, not the released version. Anything documented here may not be in
+`v0.2.0` yet. Check with `git describe --tags HEAD` before assuming a behaviour
+is in a user's hands.
 
 T032 is done: the E2E suite in `test/e2e/secretsync_test.go` exercises the
 actual sync loop (create, SC-001 queue propagation, drift repair, deletion,
@@ -54,7 +62,17 @@ Standard kubebuilder layout, one Go module, one controller.
   detection (first writer wins), periodic `RequeueAfter` (default 4h) as the
   drift/missed-event safety net, `Owns(&corev1.Secret{})` so in-cluster
   edits/deletes of the managed Secret re-trigger a reconcile, and an optional
-  `WatchesRawSource(source.Channel(...))` fed by the queue listener.
+  `WatchesRawSource(source.Channel(...))` fed by the queue listener. It also
+  runs `MaxConcurrentReconciles: 2`, a 1m per-reconcile timeout with terminal
+  status writes detached onto their own 5s budget (so a reconcile that ran out
+  of budget still reports that it did), a stale-target sweep that deletes the
+  old Secret after a `spec.target.secretName` rename, and Kubernetes Events
+  through the manager's `Recorder` (`Synced` / `SyncFailed`). The Secret
+  informer is restricted by label selector to kvsynk8s-managed Secrets
+  (`ManagedSecretCacheOptions`), with one deliberate consequence worth
+  remembering: an *unmanaged* Secret sitting at the target name is invisible to
+  every cached Get, so first-writer-wins is actually enforced by
+  `SecretWriter`'s Create coming back `AlreadyExists`, not by the read.
 - **`internal/sync/engine.go`** — the sync engine: resolves target
   name/dataKey defaults, calls the `SecretReader`, decides the resulting
   status (`Pending`/`InSync`/`Failing` + reason). No Kubernetes API I/O of its
@@ -85,7 +103,9 @@ Standard kubebuilder layout, one Go module, one controller.
   Namespace by `hack/compare-helm-kustomize.sh`.
 - **`internal/events/`** — the Event Grid → Storage Queue path: `parser.go`
   decodes a queue message into a `(vault, secret, version)` tuple or a clean
-  discard (wrong event type, wrong object type, malformed body);
+  discard (wrong event type, wrong object type, malformed body). It accepts
+  both delivery envelopes — the Event Grid schema and CloudEvents v1.0 —
+  reading the event type from `eventType` or `type` accordingly;
   `listener.go` is a `manager.Runnable` that polls the queue with an adaptive
   delay (2s busy / 30s idle), matches events against `SecretSync` objects via
   the manager's cached client, and injects matches into the controller
@@ -155,7 +175,10 @@ go test -tags integration ./internal/azure/... -run TestStorageQueueSource_Batch
 ```
 
 CI runs `make test`, `make lint`, and `make test-integration` on every PR
-(`.github/workflows/test.yml`, `lint.yml`, `test-integration.yml`); `helm.yml`
+(`.github/workflows/test.yml`, `lint.yml`, `test-integration.yml`); `test.yml`
+has a second job that runs `hack/release-guards_test.sh` (both release guards,
+over their decision table) and `hack/doc-guards_test.sh` (the docs guard, which
+refuses a pinned release version in a copy-paste install command); `helm.yml`
 lints and renders the chart, fails on `make helm-sync` drift, and runs the
 equivalence check; `test-e2e` runs there too (`test-e2e.yml`) and additionally
 on release runs as part of `release.yml`, which then builds and pushes the
@@ -190,9 +213,9 @@ deliberately, and say which bump you picked and why when you propose one:**
   picking anything less.
 
 Dev builds need no decision: a merge to `master` publishes
-`<next patch>-dev.<run number>` (so `0.1.1-dev.42` after `v0.1.0`), derived
-from the newest stable tag. They are pushed to GHCR and nothing else — no git
-tag, no GitHub Release — so they are installable by version but never clutter
+`<next patch>-dev.<run number>` (so `0.2.1-dev.42` after `v0.2.0`), derived
+from the newest stable tag at release time. They are pushed to GHCR and
+nothing else — no git tag, no GitHub Release — so they are installable by version but never clutter
 the releases page or get mistaken for a release. They never move `:latest`.
 `install.yaml` is still rendered for them and kept as a workflow artifact on
 the run.
@@ -200,6 +223,14 @@ the run.
 Only a stable release moves `:latest`. Stable releases are serialised by the
 `release-stable` concurrency group so two cannot race on it; dev builds use
 `release-dev` and supersede each other.
+
+Two guards gate every stable release, both driven by
+`hack/release-guards_test.sh` in CI. `hack/check-latest-eligible.sh` answers
+whether this version may move `:latest` and be marked "Latest release", so a
+backport cannot steal either from a newer version. `hack/check-release-overwrite.sh`
+refuses to rebuild an already published version from a different commit. When a
+release fails after the image is pushed, the remedy is re-running that failed
+run, not dispatching the same version again.
 
 Once a branch is pushed and its PR is open, watch its checks
 (`gh pr checks <PR#> --watch`) and fix forward on any failure — see the "PR
