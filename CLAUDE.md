@@ -73,6 +73,13 @@ Standard kubebuilder layout, one Go module, one controller.
   remembering: an *unmanaged* Secret sitting at the target name is invisible to
   every cached Get, so first-writer-wins is actually enforced by
   `SecretWriter`'s Create coming back `AlreadyExists`, not by the read.
+- **`internal/controller/metrics.go`** — the sync-path Prometheus metrics
+  (`kvsynk8s_sync_total`, plus the per-state and oldest-successful-sync
+  gauges). The state gauges are produced by a *collector* that Lists at scrape
+  time, not a `GaugeVec` written per reconcile: a GaugeVec cannot decrement
+  another object's contribution and leaves a stale series behind on every
+  deletion. Every label value comes from a closed, compile-time vocabulary —
+  never an object name, a namespace, a vault name or a secret name.
 - **`internal/sync/engine.go`** — the sync engine: resolves target
   name/dataKey defaults, calls the `SecretReader`, decides the resulting
   status (`Pending`/`InSync`/`Failing` + reason). No Kubernetes API I/O of its

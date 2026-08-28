@@ -362,6 +362,55 @@ func TestRedaction_Writer_CreateOrUpdate_TargetConflict_NoValueInError(t *testin
 	}
 }
 
+// TestRedaction_Writer_CreateOrUpdate_TargetImmutable_NoValueInError is the
+// TargetConflict test above, for the other terminal error path: the target is
+// a managed but frozen Secret, so CreateOrUpdate refuses the write and returns
+// ErrTargetImmutable. Every error path this package can return has to be in
+// this suite or the redaction contract has a hole — the writer holds the
+// plaintext in a local when it builds that error, and the caller may well log
+// it verbatim, unlike status.Message.
+func TestRedaction_Writer_CreateOrUpdate_TargetImmutable_NoValueInError(t *testing.T) {
+	const sentinel = "SENTINEL-redaction-writer-immutable-4c86b3"
+	owner := newOwner("redact-writer-immutable", "default", "redact-vault", "redact-secret")
+
+	frozen := true
+	managed := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      owner.Name,
+			Namespace: owner.Namespace,
+			Labels:    map[string]string{LabelManagedBy: LabelManagedByValue},
+			Annotations: map[string]string{
+				AnnotationVault:   owner.Spec.Vault.Name,
+				AnnotationSecret:  owner.Spec.Vault.Secret,
+				AnnotationVersion: "v1",
+			},
+		},
+		Type:      corev1.SecretTypeOpaque,
+		Immutable: &frozen,
+		Data:      map[string][]byte{"value": []byte("non-sentinel-frozen-value")},
+	}
+	cli := fake.NewClientBuilder().WithScheme(redactionScheme(t)).WithObjects(managed).Build()
+	w := &SecretWriter{Client: cli, Reader: cli}
+
+	logger, logBuf := capturingLogger()
+	ctx := logf.IntoContext(context.Background(), logger)
+
+	err := w.CreateOrUpdate(ctx, owner, owner.Namespace, owner.Name, "value", sentinel, "v2")
+	if err == nil {
+		t.Fatal("CreateOrUpdate() error = nil, want ErrTargetImmutable")
+	}
+
+	assertNoLeak(t, "writer-immutable", sentinel, logBuf, err.Error())
+
+	var got corev1.Secret
+	if getErr := cli.Get(ctx, client.ObjectKey{Namespace: owner.Namespace, Name: owner.Name}, &got); getErr != nil {
+		t.Fatalf("get immutable secret: %v", getErr)
+	}
+	if string(got.Data["value"]) != "non-sentinel-frozen-value" {
+		t.Fatalf("frozen Secret's data must not have been rewritten: %+v", got.Data)
+	}
+}
+
 // TestValueCarryingSources_NeverLogValueIdentifiers is a static check (T028):
 // it parses each value-carrying source file into an AST and inspects every
 // call whose selector is Info, Error, or WithValues (the

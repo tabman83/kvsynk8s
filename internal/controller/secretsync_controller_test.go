@@ -27,8 +27,10 @@ import (
 	. "github.com/onsi/gomega"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -753,7 +755,7 @@ var _ = Describe("SecretSync Controller", func() {
 	// lastSyncTime and no Event, for as long as the write kept failing —
 	// exactly what an operator would be alerting on to catch this.
 	Context("persistent Secret write failure", func() {
-		It("persists Failing/TransientError and emits SyncFailed when the Secret write keeps failing", func() {
+		It("persists Failing/SecretWriteFailed and emits SyncFailed when the Secret write keeps failing", func() {
 			ctx := context.Background()
 
 			suffix := shortUID()
@@ -811,7 +813,8 @@ var _ = Describe("SecretSync Controller", func() {
 			Expect(k8sClient.Get(ctx, req.NamespacedName, &after)).To(Succeed())
 			Expect(after.Status.State).To(Equal(kvsynk8sv1alpha1.SecretSyncStateFailing),
 				"a CR whose Secret cannot be written must not keep reporting InSync")
-			Expect(after.Status.Reason).To(Equal(syncpkg.ReasonTransientError))
+			Expect(after.Status.Reason).To(Equal(syncpkg.ReasonSecretWriteFailed),
+				"a Kubernetes write the operator could not complete must not look like a vault failure")
 			Expect(after.Status.Message).NotTo(ContainSubstring(sentinelV2))
 			// FR-013: the failed sync advances neither the recorded version nor
 			// the last-known-good sync time.
@@ -821,7 +824,7 @@ var _ = Describe("SecretSync Controller", func() {
 			var evt string
 			Eventually(recorder.Events).Should(Receive(&evt))
 			Expect(evt).To(ContainSubstring("SyncFailed"))
-			Expect(evt).To(ContainSubstring(syncpkg.ReasonTransientError))
+			Expect(evt).To(ContainSubstring(syncpkg.ReasonSecretWriteFailed))
 			Expect(evt).NotTo(ContainSubstring(sentinelV2))
 
 			// The Secret itself keeps its last synced value: a rejected write
@@ -829,6 +832,215 @@ var _ = Describe("SecretSync Controller", func() {
 			var secret corev1.Secret
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: targetName, Namespace: namespace}, &secret)).To(Succeed())
 			Expect(string(secret.Data[fakeDataKey])).To(Equal(sentinelV1))
+		})
+	})
+
+	// The other flavour of write failure: one no retry can ever clear.
+	// Kubernetes offers no way to unset immutable on an existing Secret, so
+	// only a human deleting it can make the write succeed again. That is what
+	// makes it terminal, and what these specs pin.
+	Context("immutable target Secret", func() {
+		// The heart of the fix: this must NOT go on the backoff path. Returning
+		// an error here would have the rate-limited workqueue retry a permanent
+		// condition forever, paying one Key Vault read per attempt for a state
+		// only a human can clear.
+		It("reports Failing/TargetImmutable with no error and keeps the last synced value", func() {
+			ctx := context.Background()
+
+			suffix := shortUID()
+			name := "ss-immutable-" + suffix
+			vaultSecret := "immutable-secret-" + suffix
+			targetName := "target-immutable-" + suffix
+			targetKey := types.NamespacedName{Name: targetName, Namespace: namespace}
+			const sentinelV1 = "SENTINEL-fake-value-immutable-v1-not-real"
+			const sentinelV2 = "SENTINEL-fake-value-immutable-v2-not-real"
+
+			reader.set(fakeVaultName, vaultSecret, sentinelV1, "v1")
+
+			ss := newTestSecretSync(namespace, name, fakeVaultName, vaultSecret, targetName, fakeDataKey)
+			Expect(k8sClient.Create(ctx, ss)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), ss)
+			})
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{Name: targetName, Namespace: namespace},
+				})
+			})
+
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: namespace}}
+
+			// A healthy sync first: the value the frozen Secret must keep has to
+			// be a real synced value.
+			_, err := reconcilerFor(reader).Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			var seeded kvsynk8sv1alpha1.SecretSync
+			Expect(k8sClient.Get(ctx, req.NamespacedName, &seeded)).To(Succeed())
+			Expect(seeded.Status.State).To(Equal(kvsynk8sv1alpha1.SecretSyncStateInSync))
+			Expect(seeded.Status.SyncedVersion).To(Equal("v1"))
+
+			// Freeze the managed Secret, the way a user hardening a mounted
+			// Secret would. Setting immutable on an existing Secret is allowed;
+			// unsetting it is not, which is what makes this terminal.
+			var frozen corev1.Secret
+			Expect(k8sClient.Get(ctx, targetKey, &frozen)).To(Succeed())
+			immutable := true
+			frozen.Immutable = &immutable
+			Expect(k8sClient.Update(ctx, &frozen)).To(Succeed())
+
+			// The vault rotates, so the next reconcile has a real data change to
+			// write — and the API server will refuse it.
+			reader.set(fakeVaultName, vaultSecret, sentinelV2, "v2")
+
+			recorder := events.NewFakeRecorder(10)
+			const configuredInterval = 250 * time.Millisecond
+			blocked := reconcilerFor(reader)
+			blocked.ReconcileInterval = configuredInterval
+			blocked.Recorder = recorder
+
+			result, err := blocked.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred(),
+				"an immutable Secret is permanent: handing it to the workqueue would retry it forever")
+			Expect(result.RequeueAfter).To(Equal(configuredInterval),
+				"a terminal write failure still falls back to the ordinary periodic cadence")
+
+			var after kvsynk8sv1alpha1.SecretSync
+			Expect(k8sClient.Get(ctx, req.NamespacedName, &after)).To(Succeed())
+			Expect(after.Status.State).To(Equal(kvsynk8sv1alpha1.SecretSyncStateFailing))
+			Expect(after.Status.Reason).To(Equal(syncpkg.ReasonTargetImmutable),
+				"a frozen target must not be reported as a plain write failure: the fix is different")
+			for _, sentinel := range []string{sentinelV1, sentinelV2} {
+				Expect(after.Status.Message).NotTo(ContainSubstring(sentinel))
+			}
+			// FR-013: the refused write advances neither the recorded version nor
+			// the last-known-good sync time.
+			Expect(after.Status.SyncedVersion).To(Equal("v1"))
+			Expect(after.Status.LastSyncTime).To(Equal(seeded.Status.LastSyncTime))
+
+			var evt string
+			Eventually(recorder.Events).Should(Receive(&evt))
+			Expect(evt).To(ContainSubstring("SyncFailed"))
+			Expect(evt).To(ContainSubstring(syncpkg.ReasonTargetImmutable))
+			for _, sentinel := range []string{sentinelV1, sentinelV2} {
+				Expect(evt).NotTo(ContainSubstring(sentinel))
+			}
+
+			// FR-013 again, on the Secret itself: a refused write never blanks
+			// what was already there.
+			var secret corev1.Secret
+			Expect(k8sClient.Get(ctx, targetKey, &secret)).To(Succeed())
+			Expect(string(secret.Data[fakeDataKey])).To(Equal(sentinelV1))
+		})
+
+		// The assumption immutableBlocksWrite rests on, checked against the real
+		// API server rather than against a reading of the docs: Kubernetes
+		// freezes .data, not the whole object, so a rotation that only advances
+		// the version annotation is still legal on an immutable Secret. If that
+		// were not true, the pre-check would have to refuse metadata-only writes
+		// too and every such rotation would wedge in TargetImmutable.
+		It("still syncs an unchanged value at a new version, advancing the version annotation", func() {
+			ctx := context.Background()
+
+			suffix := shortUID()
+			name := "ss-immutable-meta-" + suffix
+			vaultSecret := "immutable-meta-secret-" + suffix
+			targetName := "target-immutable-meta-" + suffix
+			targetKey := types.NamespacedName{Name: targetName, Namespace: namespace}
+			const sentinel = "SENTINEL-fake-value-immutable-meta-not-real"
+
+			reader.set(fakeVaultName, vaultSecret, sentinel, "v1")
+
+			ss := newTestSecretSync(namespace, name, fakeVaultName, vaultSecret, targetName, fakeDataKey)
+			Expect(k8sClient.Create(ctx, ss)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), ss)
+			})
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{Name: targetName, Namespace: namespace},
+				})
+			})
+
+			r := reconcilerFor(reader)
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: namespace}}
+
+			_, err := r.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			var frozen corev1.Secret
+			Expect(k8sClient.Get(ctx, targetKey, &frozen)).To(Succeed())
+			immutable := true
+			frozen.Immutable = &immutable
+			Expect(k8sClient.Update(ctx, &frozen)).To(Succeed())
+
+			// A new version carrying the SAME value: Key Vault does this on any
+			// re-set of an unchanged secret.
+			reader.set(fakeVaultName, vaultSecret, sentinel, "v2")
+
+			_, err = r.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			var after kvsynk8sv1alpha1.SecretSync
+			Expect(k8sClient.Get(ctx, req.NamespacedName, &after)).To(Succeed())
+			Expect(after.Status.State).To(Equal(kvsynk8sv1alpha1.SecretSyncStateInSync))
+			Expect(after.Status.SyncedVersion).To(Equal("v2"))
+
+			var secret corev1.Secret
+			Expect(k8sClient.Get(ctx, targetKey, &secret)).To(Succeed())
+			Expect(secret.Annotations[versionAnnotationKey]).To(Equal("v2"),
+				"a metadata-only update of an immutable Secret must go through")
+			Expect(string(secret.Data[fakeDataKey])).To(Equal(sentinel))
+		})
+
+		// Immutability blocks updates, not deletes. The new terminal state must
+		// not wedge cleanup: a CR whose Secret was frozen still has to remove it
+		// and let go of its finalizer, or deleting the SecretSync would hang
+		// forever.
+		It("still deletes the managed Secret and finishes the finalizer when it is immutable", func() {
+			ctx := context.Background()
+
+			suffix := shortUID()
+			name := "ss-immutable-delete-" + suffix
+			vaultSecret := "immutable-delete-secret-" + suffix
+			targetName := "target-immutable-delete-" + suffix
+			targetKey := types.NamespacedName{Name: targetName, Namespace: namespace}
+
+			reader.set(fakeVaultName, vaultSecret, "SENTINEL-fake-value-immutable-delete-not-real", "v1")
+
+			ss := newTestSecretSync(namespace, name, fakeVaultName, vaultSecret, targetName, fakeDataKey)
+			Expect(k8sClient.Create(ctx, ss)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{Name: targetName, Namespace: namespace},
+				})
+			})
+
+			r := reconcilerFor(reader)
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: namespace}}
+
+			_, err := r.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			var frozen corev1.Secret
+			Expect(k8sClient.Get(ctx, targetKey, &frozen)).To(Succeed())
+			immutable := true
+			frozen.Immutable = &immutable
+			Expect(k8sClient.Update(ctx, &frozen)).To(Succeed())
+
+			var created kvsynk8sv1alpha1.SecretSync
+			Expect(k8sClient.Get(ctx, req.NamespacedName, &created)).To(Succeed())
+			Expect(created.Finalizers).To(ContainElement(secretSyncFinalizer))
+			Expect(k8sClient.Delete(ctx, &created)).To(Succeed())
+
+			_, err = r.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			Eventually(func() bool {
+				return apierrors.IsNotFound(k8sClient.Get(ctx, targetKey, &corev1.Secret{}))
+			}).Should(BeTrue(), "an immutable Secret can still be deleted, so cleanup must not skip it")
+			Eventually(func() bool {
+				return apierrors.IsNotFound(k8sClient.Get(ctx, req.NamespacedName, &kvsynk8sv1alpha1.SecretSync{}))
+			}).Should(BeTrue(), "the finalizer must be released, or deleting the CR would hang forever")
 		})
 	})
 
@@ -1532,6 +1744,155 @@ var _ = Describe("SecretSync Controller", func() {
 
 			_, err := r.Reconcile(ctx, req)
 			Expect(err).NotTo(HaveOccurred(), "a nil Recorder must never cause Reconcile to fail or panic")
+		})
+	})
+
+	// The standard Ready condition, so `kubectl wait --for=condition=Ready`,
+	// Argo CD and Flux have something to key on instead of parsing
+	// status.state.
+	Context("Ready condition", func() {
+		readyCondition := func(name string) *metav1.Condition {
+			var latest kvsynk8sv1alpha1.SecretSync
+			ExpectWithOffset(1, k8sClient.Get(
+				context.Background(),
+				types.NamespacedName{Name: name, Namespace: namespace},
+				&latest)).To(Succeed())
+			return meta.FindStatusCondition(latest.Status.Conditions, kvsynk8sv1alpha1.ConditionReady)
+		}
+
+		It("tracks the sync state and only moves lastTransitionTime on a real transition", func() {
+			ctx := context.Background()
+
+			suffix := shortUID()
+			name := "ss-ready-" + suffix
+			vaultSecret := "ready-secret-" + suffix
+			targetName := "target-ready-" + suffix
+
+			reader.set(fakeVaultName, vaultSecret, "SENTINEL-fake-value-ready-not-real", "v1")
+
+			ss := newTestSecretSync(namespace, name, fakeVaultName, vaultSecret, targetName, fakeDataKey)
+			Expect(k8sClient.Create(ctx, ss)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), ss)
+			})
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{Name: targetName, Namespace: namespace},
+				})
+			})
+
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: namespace}}
+
+			_, err := reconcilerFor(reader).Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			synced := readyCondition(name)
+			Expect(synced).NotTo(BeNil(), "every reconcile must leave a Ready condition behind")
+			Expect(synced.Status).To(Equal(metav1.ConditionTrue))
+			Expect(synced.Reason).To(Equal("Synced"))
+			var afterCreate kvsynk8sv1alpha1.SecretSync
+			Expect(k8sClient.Get(ctx, req.NamespacedName, &afterCreate)).To(Succeed())
+			Expect(synced.ObservedGeneration).To(Equal(afterCreate.Generation))
+
+			// metav1.Time is second-resolution, so every "did the transition
+			// time move?" assertion below needs more than a second of real
+			// distance to mean anything at all.
+			time.Sleep(1100 * time.Millisecond)
+
+			// Break the vault read. An empty reader answers SecretNotFound, and
+			// since the managed Secret exists this classifies as SourceDeleted —
+			// whatever the reason is, the condition must carry that same one.
+			broken := reconcilerFor(newFakeSecretReader())
+			_, err = broken.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			var failing kvsynk8sv1alpha1.SecretSync
+			Expect(k8sClient.Get(ctx, req.NamespacedName, &failing)).To(Succeed())
+			Expect(failing.Status.State).To(Equal(kvsynk8sv1alpha1.SecretSyncStateFailing))
+			failed := readyCondition(name)
+			Expect(failed.Status).To(Equal(metav1.ConditionFalse))
+			Expect(failed.Reason).To(Equal(failing.Status.Reason),
+				"the condition reason must be the same machine-readable reason status.reason carries")
+			Expect(failed.LastTransitionTime.Time).To(BeTemporally(">", synced.LastTransitionTime.Time))
+
+			time.Sleep(1100 * time.Millisecond)
+
+			// The regression this whole spec exists for: Reconcile assigns
+			// ss.Status = <fresh struct> wholesale, so a version that does not
+			// carry the existing conditions forward would hand
+			// meta.SetStatusCondition an empty slice every time and re-stamp
+			// lastTransitionTime on every single reconcile — destroying the one
+			// thing a condition tells you that status.state does not.
+			_, err = broken.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(readyCondition(name).LastTransitionTime).To(Equal(failed.LastTransitionTime),
+				"an unchanged condition must keep the timestamp of the transition that produced it")
+
+			time.Sleep(1100 * time.Millisecond)
+
+			// Repair: the original reader still holds the value.
+			_, err = reconcilerFor(reader).Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			recovered := readyCondition(name)
+			Expect(recovered.Status).To(Equal(metav1.ConditionTrue))
+			Expect(recovered.Reason).To(Equal("Synced"))
+			Expect(recovered.LastTransitionTime.Time).To(BeTemporally(">", failed.LastTransitionTime.Time))
+		})
+	})
+
+	// kvsynk8s_sync_total is what an operator alerts on: controller-runtime's
+	// own reconcile_total cannot report this controller, because every
+	// classified failure returns err == nil and is counted there as a success.
+	Context("sync-path metrics", func() {
+		It("counts one success and one failure under the right labels", func() {
+			ctx := context.Background()
+
+			// The counter is process-global and every other spec in this suite
+			// feeds it too, so the assertions below are on deltas, never on
+			// absolute values.
+			success := syncTotal.WithLabelValues("success", noFailureReason)
+			failure := syncTotal.WithLabelValues("failure", syncpkg.ReasonSecretNotFound)
+			successBefore := testutil.ToFloat64(success)
+			failureBefore := testutil.ToFloat64(failure)
+
+			suffix := shortUID()
+			okName := "ss-metric-ok-" + suffix
+			okSecret := "metric-ok-secret-" + suffix
+			okTarget := "target-metric-ok-" + suffix
+			reader.set(fakeVaultName, okSecret, "SENTINEL-fake-value-metric-not-real", "v1")
+
+			okSS := newTestSecretSync(namespace, okName, fakeVaultName, okSecret, okTarget, fakeDataKey)
+			Expect(k8sClient.Create(ctx, okSS)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), okSS)
+			})
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{Name: okTarget, Namespace: namespace},
+				})
+			})
+
+			// Never reader.set -> the vault answers SecretNotFound.
+			failName := "ss-metric-fail-" + suffix
+			failSecret := "metric-fail-secret-" + suffix
+			failSS := newTestSecretSync(
+				namespace, failName, fakeVaultName, failSecret, "target-metric-fail-"+suffix, fakeDataKey)
+			Expect(k8sClient.Create(ctx, failSS)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(context.Background(), failSS)
+			})
+
+			r := reconcilerFor(reader)
+			_, err := r.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: okName, Namespace: namespace}})
+			Expect(err).NotTo(HaveOccurred())
+			_, err = r.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: failName, Namespace: namespace}})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(testutil.ToFloat64(success) - successBefore).To(Equal(1.0))
+			Expect(testutil.ToFloat64(failure)-failureBefore).To(Equal(1.0),
+				"a classified failure must be counted under its own reason, not lumped in with the successes")
 		})
 	})
 })

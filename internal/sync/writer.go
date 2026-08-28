@@ -45,6 +45,19 @@ const (
 	// ReasonTargetConflict is the SecretSync status.reason to use when
 	// ErrTargetConflict is returned (data-model.md).
 	ReasonTargetConflict = "TargetConflict"
+
+	// ReasonTargetImmutable is the SecretSync status.reason to use when
+	// ErrTargetImmutable is returned: the target Secret carries
+	// immutable: true, so its data can no longer be rewritten.
+	ReasonTargetImmutable = "TargetImmutable"
+
+	// ReasonSecretWriteFailed is the SecretSync status.reason for a
+	// Kubernetes write this operator could not complete for any other reason
+	// — an admission policy, a ResourceQuota, RBAC drift. It used to share
+	// TransientError with vault-side failures, which meant the two most
+	// differently-fixed problems in the whole operator were indistinguishable
+	// from kubectl, from the Event, and from any metric.
+	ReasonSecretWriteFailed = "SecretWriteFailed"
 )
 
 // ErrTargetConflict is returned by SecretWriter when the target Secret
@@ -53,6 +66,21 @@ const (
 // the caller maps this to SecretSync status {State: Failing, Reason:
 // ReasonTargetConflict}.
 var ErrTargetConflict = errors.New("kvsynk8s: target secret exists and is not managed by kvsynk8s")
+
+// ErrTargetImmutable is returned when the managed target Secret has
+// immutable: true set and the write would change its data. The Kubernetes API
+// server refuses that update permanently: immutability cannot be unset on an
+// existing Secret, so no amount of retrying clears it. Treating it as
+// retryable — which is what happened before this existed — costs a Key Vault
+// read per backoff attempt for a state only a human can fix, and reports the
+// condition as transient when it is anything but. The caller maps this to
+// {State: Failing, Reason: ReasonTargetImmutable}.
+//
+// The writer never clears or flips Immutable itself. Silently unfreezing a
+// Secret a user deliberately froze is the same class of act FR-012 forbids,
+// and a data-shaped one: workloads may be mounting it precisely because it
+// cannot change.
+var ErrTargetImmutable = errors.New("kvsynk8s: target secret is immutable and its data cannot be updated")
 
 // SecretWriter is the ONLY code path in the whole codebase allowed to write
 // a secret value into a Kubernetes object (constitution principle I). Every
@@ -159,17 +187,57 @@ func writable(secret *corev1.Secret, owner *kvsynk8sv1alpha1.SecretSync) bool {
 	return secret.Labels[LabelManagedBy] == LabelManagedByValue || ControllerOwnedBy(secret, owner)
 }
 
-// update rewrites an existing managed Secret in place (labels, annotations,
-// owner reference, data) and persists it. Shared by CreateOrUpdate's normal
-// found-and-labeled path and by the AlreadyExists recovery in create, so the
-// two paths cannot drift.
+// update rewrites an existing managed Secret in place and answers the two
+// ways that write can fail because the copy it was built from is behind the
+// API server.
+//
+// The Secret handed to applyUpdate came from the CACHED Get in CreateOrUpdate.
+// A 409 Conflict means its resourceVersion is stale; an Invalid can mean the
+// cached copy had not yet observed someone setting immutable: true. Both are
+// answered by re-reading through the uncached reader() — the same move
+// recoverAlreadyExists makes for the NotFound flavour of this race. Wrapping
+// in applyUpdate does not hide either one: apierrors.IsConflict/IsInvalid
+// unwrap through fmt.Errorf's %w.
 func (w *SecretWriter) update(
 	ctx context.Context,
 	owner *kvsynk8sv1alpha1.SecretSync,
 	existing *corev1.Secret,
 	dataKey, value, version string,
 ) error {
+	err := w.applyUpdate(ctx, owner, existing, dataKey, value, version)
+	switch {
+	case err == nil:
+		return nil
+	case apierrors.IsConflict(err):
+		return w.recoverConflict(ctx, owner, existing.Namespace, existing.Name, dataKey, value, version)
+	case apierrors.IsInvalid(err):
+		return w.classifyInvalid(ctx, existing.Namespace, existing.Name, dataKey, value, err)
+	}
+	return err
+}
+
+// applyUpdate rewrites an existing managed Secret in place (labels,
+// annotations, owner reference, data) and persists it. Shared by
+// CreateOrUpdate's normal found-and-labeled path and by the AlreadyExists
+// recovery in create, so the two paths cannot drift.
+func (w *SecretWriter) applyUpdate(
+	ctx context.Context,
+	owner *kvsynk8sv1alpha1.SecretSync,
+	existing *corev1.Secret,
+	dataKey, value, version string,
+) error {
 	namespace, name := existing.Namespace, existing.Name
+
+	// An immutable Secret still accepts metadata-only updates — Kubernetes
+	// freezes .data, not the object — so a rotation that only advances the
+	// version annotation is legal and must go through. Only a write that
+	// would actually change the data is refused, which is exactly what
+	// immutableBlocksWrite asks. Checked here, before populateManagedSecret
+	// overwrites existing.Data, because afterwards the pre-write data is gone
+	// and the comparison would always say "nothing changed".
+	if immutableBlocksWrite(existing, dataKey, value) {
+		return fmt.Errorf("kvsynk8s: secret %s/%s: %w", namespace, name, ErrTargetImmutable)
+	}
 
 	populateManagedSecret(existing, owner, dataKey, value, version)
 	if err := controllerutil.SetControllerReference(owner, existing, w.Client.Scheme()); err != nil {
@@ -262,6 +330,78 @@ func (w *SecretWriter) recoverAlreadyExists(
 	return fmt.Errorf("kvsynk8s: create secret %s/%s: %w", namespace, name, ErrTargetConflict)
 }
 
+// freshCopy re-reads the target straight through reader() — the uncached
+// APIReader when wired — so the caller is looking at what the API server
+// actually holds, not at the cached copy whose staleness caused the failure
+// being recovered from.
+func (w *SecretWriter) freshCopy(ctx context.Context, namespace, name string) (*corev1.Secret, error) {
+	current := &corev1.Secret{}
+	if err := w.reader().Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, current); err != nil {
+		return nil, err
+	}
+	return current, nil
+}
+
+// recoverConflict answers a 409 on the Update. The Secret this write was built
+// from came from the cached Get in CreateOrUpdate, and a duplicate
+// at-least-once queue message arriving inside the informer-lag window after
+// this operator's OWN write hands the reconciler a stale resourceVersion. That
+// is not a failure worth reporting: the value in the cluster is already
+// correct, or about to be. Re-read uncached, re-check ownership with the same
+// writable predicate every other path uses, and apply the write once more —
+// the same shape recoverAlreadyExists uses for the NotFound flavour of this
+// race, and for the same stated reason: not flapping the CR to a false Failing
+// with a spurious SyncFailed event that a later reconcile silently heals.
+//
+// Deliberately ONE retry, through applyUpdate rather than update, so this
+// cannot recurse. A second conflict means something else is actively rewriting
+// the Secret, which is a real condition the workqueue should back off on.
+func (w *SecretWriter) recoverConflict(
+	ctx context.Context,
+	owner *kvsynk8sv1alpha1.SecretSync,
+	namespace, name, dataKey, value, version string,
+) error {
+	current, err := w.freshCopy(ctx, namespace, name)
+	if err != nil {
+		return fmt.Errorf("kvsynk8s: re-read secret %s/%s after Conflict: %w", namespace, name, err)
+	}
+	if !writable(current, owner) {
+		return fmt.Errorf("kvsynk8s: secret %s/%s: %w", namespace, name, ErrTargetConflict)
+	}
+	return w.applyUpdate(ctx, owner, current, dataKey, value, version)
+}
+
+// classifyInvalid decides whether an Invalid rejection of the Update was the
+// API server refusing to change an immutable Secret's data. It never writes
+// and never retries.
+//
+// It answers that by re-reading the object and asking the same deterministic
+// question applyUpdate's pre-check asks — NOT by parsing invalidErr's
+// StatusError details. Matching on a field path and cause type would couple
+// this operator to wording owned by k8s.io/kubernetes, which is not even a
+// dependency of this module, and would start misclassifying silently if that
+// wording ever moved. The object itself is the ground truth and costs one Get
+// on a path that has already failed.
+//
+// Anything else Invalid can mean — an admission webhook, a validating policy —
+// falls through with invalidErr unchanged, so the caller keeps classifying it
+// as a write failure exactly as before. A failed re-read does the same: never
+// upgrade a guess into a terminal state.
+func (w *SecretWriter) classifyInvalid(
+	ctx context.Context,
+	namespace, name, dataKey, value string,
+	invalidErr error,
+) error {
+	current, err := w.freshCopy(ctx, namespace, name)
+	if err != nil {
+		return invalidErr
+	}
+	if immutableBlocksWrite(current, dataKey, value) {
+		return fmt.Errorf("kvsynk8s: secret %s/%s: %w", namespace, name, ErrTargetImmutable)
+	}
+	return invalidErr
+}
+
 // populateManagedSecret sets the type, managed-by label, vault/secret/version
 // annotations, and data[dataKey] on secret in place. It is the single
 // function, in the single file allowed to do so, that places a secret value
@@ -299,6 +439,18 @@ func populateManagedSecret(secret *corev1.Secret, owner *kvsynk8sv1alpha1.Secret
 // definition of the desired data shape stays in the one file allowed to
 // handle secret values (constitution I); nothing here logs or returns the
 // value.
+// immutableBlocksWrite reports whether the API server will refuse the write
+// this writer is about to make because secret carries immutable: true.
+// Immutability freezes .data only — object metadata stays editable — so a
+// write is blocked precisely when the desired data differs from what is
+// already there, which is what managedSecretDataMatches decides. Reusing it
+// means this check and the engine's idempotency check can never disagree
+// about whether a write changes anything.
+func immutableBlocksWrite(secret *corev1.Secret, dataKey, value string) bool {
+	return secret.Immutable != nil && *secret.Immutable &&
+		!managedSecretDataMatches(secret, dataKey, value)
+}
+
 func managedSecretDataMatches(secret *corev1.Secret, dataKey, value string) bool {
 	if len(secret.Data) != 1 {
 		return false

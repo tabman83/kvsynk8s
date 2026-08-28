@@ -271,6 +271,7 @@ There is no cross-namespace targeting: the target namespace is always the
 | `status.reason` | string | Machine-readable failure reason (see Troubleshooting below). Empty while `InSync`/`Pending`. |
 | `status.message` | string | Human-readable detail — always built from vault name, secret name, namespace/name, and version only; never a secret value. |
 | `status.observedGeneration` | int64 | Which `spec` generation this status describes. |
+| `status.conditions` | `[]metav1.Condition` | Standard Kubernetes conditions. One type is set, `Ready`: `True` while the Secret holds the current vault value, `False` with the failure reason otherwise, `Unknown` before the first sync attempt finishes. This is what `kubectl wait --for=condition=Ready secretsync/<name>` and Argo CD / Flux health checks read. |
 
 ### Example
 
@@ -291,8 +292,10 @@ spec:
 
 ```bash
 kubectl -n demo get secretsync demo-password
-# NAME            VAULT      SECRET          STATE    VERSION   LAST SYNC
-# demo-password   my-vault   demo-password   InSync   a1b2c3…   2026-08-22T10:00:00Z
+# NAME            VAULT      STATE    REASON   VERSION   LAST SYNC              AGE
+# demo-password   my-vault   InSync            a1b2c3…   2026-08-22T10:00:00Z   3d
+
+# -o wide also shows the source secret name inside the vault
 
 kubectl -n demo get secret demo-password -o jsonpath='{.data.password}' | base64 -d
 ```
@@ -311,6 +314,11 @@ kubectl -n demo get secret demo-password -o jsonpath='{.data.password}' | base64
   reports the secret gone or disabled, the `SecretSync` goes `Failing` with
   reason `SourceDeleted`/`SourceDisabled`, but the last synced value stays in
   the Kubernetes Secret untouched — workloads keep the last known good value.
+- **An immutable target Secret stops rotating.** If you set `immutable: true`
+  on a Secret kvsynk8s manages, Kubernetes refuses every later change to its
+  data. The operator does not fight that and never clears the flag: the
+  `SecretSync` goes `Failing` / `TargetImmutable` and the Secret keeps the
+  value it was frozen at. Delete the Secret to resume syncing.
 - **Renaming `spec.target.secretName` cleans up the old Secret.** The operator
   deletes the Secret it had written under the previous name. The sweep only
   runs once the new target is verifiably `InSync`, so a failed or conflicted
@@ -352,11 +360,14 @@ are the starting point for everything below.
 | `status.reason` | Meaning | What to check |
 |---|---|---|
 | `SecretNotFound` | The vault secret does not exist (and this `SecretSync` never had a prior successful sync). | Vault name and secret name in `spec.vault`; that the secret actually exists in that vault. |
-| `AccessDenied` | The operator's identity cannot read the secret. | The `Key Vault Secrets User` role assignment on the vault; the workload identity federation (issuer, subject, namespace/ServiceAccount name all matching); the ServiceAccount's `azure.workload.identity/client-id` annotation. |
+| `AccessDenied` | The operator got an Azure token, but that identity is not allowed to read this secret. | The `Key Vault Secrets User` role assignment on the vault, and that it is on the right vault and the right identity. |
+| `AuthenticationFailed` | The operator could not get an Azure token at all, so the request never reached Key Vault. Workload identity is not wired up. Different from `AccessDenied`, where the token was fine and the role assignment was not. | The ServiceAccount's `azure.workload.identity/client-id` annotation; the federated credential's issuer and subject matching the namespace and ServiceAccount name; that the pod actually gets a projected token. The operator log carries the Azure SDK's own diagnostic, which names the specific problem. |
 | `TargetConflict` | The target Kubernetes Secret already exists and was not created by kvsynk8s, or another `SecretSync` already claims the same namespace + `target.secretName`. | Whether the Secret name collides with something you did not intend it to; if two `SecretSync` objects are meant to target the same Secret, that is not supported — use one `SecretSync`. |
 | `SourceDeleted` | The vault secret used to exist (this `SecretSync` had a prior synced version) and Key Vault now reports it missing. The Kubernetes Secret is left at its last synced value. | Whether the secret was deleted/purged in Key Vault on purpose; restore it there if not. |
 | `SourceDisabled` | The vault secret exists but is administratively disabled. Same keep-last-known-good behavior as `SourceDeleted`. | Whether it was disabled on purpose; re-enable it in Key Vault if not. |
-| `TransientError` | A retryable failure: network error, Key Vault throttling, an unclassified upstream error, or the operator could not write the Kubernetes Secret itself (an admission policy, a `ResourceQuota`, RBAC drift). The Kubernetes Secret is left at its last synced value either way. | Usually nothing — the controller retries with exponential backoff on its own. Persisting for a long time can mean a networking problem (outbound access to `*.vault.azure.net` from the cluster), sustained throttling, or — if it started right after a cluster policy change — something now rejecting the operator's writes to the target Secret. |
+| `TargetImmutable` | The managed Kubernetes Secret has `immutable: true` set, so its data can no longer be rewritten. The Secret keeps the value it was frozen at and the vault value stops reaching it. | Whether the Secret was meant to be immutable. Kubernetes cannot unset `immutable` on an existing Secret, so to resume syncing you delete it and let the operator recreate it (`kubectl -n NS delete secret NAME`), then restart anything that mounted it. Only writes that would change the data are refused: a new Key Vault version carrying an identical value still goes through. |
+| `SecretWriteFailed` | The vault read worked, but writing the Kubernetes Secret did not. | An admission policy or validating webhook rejecting the Secret, a `ResourceQuota` on the namespace, or RBAC drift on the operator's ServiceAccount. The last synced value stays in place. Retried with backoff. |
+| `TransientError` | A retryable failure on the vault side: network error, Key Vault throttling, or an unclassified upstream error. The Kubernetes Secret is left at its last synced value. | Usually nothing — the controller retries with exponential backoff on its own. Persisting for a long time usually means a networking problem (outbound access to `*.vault.azure.net` from the cluster) or sustained throttling. The operator log carries the HTTP status code Key Vault returned, which tells the two apart. |
 
 **Queue events not arriving / rotations not propagating within seconds:**
 check that the Event Grid subscription still exists and points at the right
@@ -369,29 +380,64 @@ vault value on its own — you lose the near-realtime property, not
 correctness. Check `status.lastSyncTime` per `SecretSync` to see whether
 reconciliation is still happening on schedule.
 
-**Queue health metrics.** When a queue URL is configured, the operator
-exposes two gauges on the standard metrics endpoint. Both install methods
-serve that endpoint by default, over authenticated HTTPS on `:8443`: the
-chart defaults `metrics.enabled` to `true` and `install.yaml` passes the same
-`--metrics-bind-address=:8443`. It is off only if you set
-`metrics.enabled=false`, or run the binary directly without the flag (the
-bare flag default is `0`, see the table above).
+**Metrics.** The operator serves Prometheus metrics on the standard endpoint.
+Both install methods turn it on by default, over authenticated HTTPS on
+`:8443`: the chart defaults `metrics.enabled` to `true` and `install.yaml`
+passes the same `--metrics-bind-address=:8443`. It is off only if you set
+`metrics.enabled=false`, or run the binary directly without the flag (the bare
+flag default is `0`, see the table above).
+
+The sync path, always present:
+
+| Metric | Meaning |
+|---|---|
+| `kvsynk8s_sync_total{result,reason}` | Terminal sync outcomes. `result` is `success` or `failure`; `reason` is the `status.reason` on a failure and `None` on success. A rising rate on one reason is the thing to alert on. |
+| `kvsynk8s_secretsync_state{state}` | How many `SecretSync` objects are currently `Pending`, `InSync` or `Failing`. Counted at scrape time from the operator's cache, so a deleted object leaves nothing behind. |
+| `kvsynk8s_secretsync_oldest_successful_sync_timestamp_seconds` | Unix time of the oldest `lastSyncTime` among objects that are currently `InSync`. If this stops moving forward, reconciliation has stalled somewhere even though nothing is reporting `Failing`. |
+
+The queue path, only when a queue URL is configured:
 
 | Metric | Meaning |
 |---|---|
 | `kvsynk8s_queue_last_successful_receive_timestamp_seconds` | Unix time of the last successful queue receive (empty receives count). If this stops moving, the operator cannot reach the queue. |
 | `kvsynk8s_queue_consecutive_receive_failures` | Failed receive calls in a row since the last success. 0 while healthy; a growing value means the queue path is down (network, auth, queue URL). |
+| `kvsynk8s_queue_messages_total{outcome}` | Messages handled, by outcome: `dispatched`, `unmatched`, `nonactionable`, `malformed`, `poison`. |
 
-These never affect `/healthz` or `/readyz`: a broken queue path degrades
-propagation speed, not correctness, so the operator keeps running and
-periodic reconciliation keeps converging secrets. Without a queue URL the
-metrics do not exist at all.
+No metric carries a per-object, vault or secret-name label. Every label value
+comes from a fixed list. That keeps the series count flat as the fleet grows,
+stops a deleted `SecretSync` leaving a series behind forever, and keeps names
+like `prod-stripe-live-key` off an endpoint with a much wider audience than the
+CR itself. When you need to know *which* object is failing, that is a
+`kubectl get secretsync -A` question.
 
-One honest limit: the gauges cover the queue-receive path only. A broken or
-deleted Event Grid subscription still produces successful empty receives, so
-both metrics look healthy while no events ever arrive. If rotations only
-propagate at the reconcile interval despite healthy receive metrics, check
-the Event Grid subscription configuration (previous paragraph).
+Metrics never affect `/healthz` or `/readyz`: a broken queue path degrades
+propagation speed, not correctness, so the operator keeps running and periodic
+reconciliation keeps converging secrets.
+
+One honest limit remains. A broken or deleted Event Grid subscription still
+produces successful empty receives, so the receive metrics look healthy while
+no event ever arrives. `kvsynk8s_queue_messages_total` catches the other half
+of that problem — a steady `unmatched` count means events are arriving for a
+vault secret no `SecretSync` declares, which is almost always a typo in a
+`spec.vault` — but nothing on the operator side can see a subscription that
+was deleted upstream. If rotations only propagate at the reconcile interval
+while the receive metrics look fine, check the Event Grid subscription
+configuration (previous paragraph).
+
+**Events.** The operator also records Kubernetes Events on each `SecretSync`:
+`Normal` `Synced` after a successful sync, `Warning` `SyncFailed` carrying
+`<reason>: <message>`. `kubectl -n <ns> describe secretsync <name>` shows the
+recent history without going near the operator logs.
+
+**Reading the logs.** A `SecretSync` entering `Failing` logs one line at
+default verbosity with its reason and message, and a single line when it
+recovers, so a normal (non-debug) log level shows both the break and the fix.
+Failed Key Vault reads additionally log the HTTP status code Key Vault
+returned, and a failed Azure token acquisition logs the SDK's own diagnostic,
+which is what actually names a broken federated credential. That detail is
+deliberately in the log and not in `status.message`: anyone with read access to
+the CR can see the status, and upstream error text is not something this
+project has audited for what it might echo back.
 
 **No secret value ever appears in logs, status, or events, by design.**
 Every message references a `SecretSync` only by vault name, secret name,

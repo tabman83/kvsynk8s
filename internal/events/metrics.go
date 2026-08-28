@@ -44,6 +44,26 @@ var (
 			"secrets still converge via periodic reconciliation.",
 	})
 
+	// queueMessagesTotal closes the one gap the two gauges above honestly
+	// cannot see. They prove the operator can reach the queue; they say
+	// nothing about whether the messages arriving are the ones anyone wanted.
+	// An "unmatched" message in particular is the exact signature of a
+	// vault-name typo or a spec.vault.secret that names nothing real -- the
+	// realtime path is then dead for that declaration while both gauges look
+	// perfectly healthy.
+	//
+	// One label, drawn from a closed five-value vocabulary, so this is five
+	// series forever. Nothing derived from a message body, a vault name or a
+	// secret name ever becomes a label (constitution I, and cardinality).
+	queueMessagesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "kvsynk8s_queue_messages_total",
+		Help: "Queue messages handled, by outcome: dispatched (matched at least one " +
+			"SecretSync and triggered a reconcile), unmatched (no SecretSync declares " +
+			"that vault secret), nonactionable (an event type this operator ignores), " +
+			"malformed (undecodable body), poison (exceeded the dequeue threshold and " +
+			"was dropped unparsed).",
+	}, []string{"outcome"})
+
 	registerQueueMetricsOnce sync.Once
 )
 
@@ -56,6 +76,7 @@ func registerQueueMetrics() {
 		metrics.Registry.MustRegister(
 			queueLastSuccessfulReceiveTimestamp,
 			queueConsecutiveReceiveFailures,
+			queueMessagesTotal,
 		)
 	})
 }
@@ -82,4 +103,10 @@ func (l *Listener) recordReceiveFailure() {
 	defer l.healthMu.Unlock()
 	l.consecutiveReceiveFailures++
 	queueConsecutiveReceiveFailures.Set(float64(l.consecutiveReceiveFailures))
+}
+
+// recordMessageOutcome counts one handled queue message. outcome is always one
+// of the five fixed literals named in queueMessagesTotal's help text.
+func recordMessageOutcome(outcome string) {
+	queueMessagesTotal.WithLabelValues(outcome).Inc()
 }

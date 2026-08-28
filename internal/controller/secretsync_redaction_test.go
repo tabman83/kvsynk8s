@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -29,12 +30,17 @@ import (
 	"github.com/go-logr/zapr"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	kvsynk8sv1alpha1 "github.com/tabman83/kvsynk8s/api/v1alpha1"
 	"github.com/tabman83/kvsynk8s/internal/azure"
+	syncpkg "github.com/tabman83/kvsynk8s/internal/sync"
 )
 
 // capturingReconcileLogger builds a real logr.Logger backed by zap at
@@ -45,8 +51,17 @@ import (
 // double, so what the buffer holds is exactly what a production zap sink
 // would have emitted.
 func capturingReconcileLogger() (logr.Logger, *bytes.Buffer) {
+	return capturingReconcileLoggerAt(zapcore.DebugLevel)
+}
+
+// capturingReconcileLoggerAt is the same sink at a caller-chosen level.
+// InfoLevel is what production zap actually runs at, and a spec asserting that
+// an operator can SEE something must capture at that level: at DebugLevel
+// everything is captured, so such an assertion would pass even for a line
+// nobody in production would ever get.
+func capturingReconcileLoggerAt(level zapcore.Level) (logr.Logger, *bytes.Buffer) {
 	buf := &bytes.Buffer{}
-	core := zapcore.NewCore(zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig()), zapcore.AddSync(buf), zapcore.DebugLevel)
+	core := zapcore.NewCore(zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig()), zapcore.AddSync(buf), level)
 	return zapr.NewLogger(zap.New(core)), buf
 }
 
@@ -210,6 +225,17 @@ var _ = Describe("SecretSync Controller: log redaction and Pending state", func(
 		}, 5*time.Second, 50*time.Millisecond).Should(Equal(kvsynk8sv1alpha1.SecretSyncStatePending),
 			"a freshly-created SecretSync must report Pending while its first sync is still in flight")
 
+		// The Ready condition has to be readable in this window too: a tool
+		// waiting on it (kubectl wait, Argo CD, Flux) must see Unknown, not the
+		// absence of a condition, before the first attempt finishes. The read
+		// is safe here because the reconcile is still parked on the gate.
+		var pending kvsynk8sv1alpha1.SecretSync
+		Expect(k8sClient.Get(baseCtx, req.NamespacedName, &pending)).To(Succeed())
+		notYet := meta.FindStatusCondition(pending.Status.Conditions, kvsynk8sv1alpha1.ConditionReady)
+		Expect(notYet).NotTo(BeNil())
+		Expect(notYet.Status).To(Equal(metav1.ConditionUnknown))
+		Expect(notYet.Reason).To(Equal("Pending"))
+
 		close(gate.release)
 
 		select {
@@ -223,5 +249,158 @@ var _ = Describe("SecretSync Controller: log redaction and Pending state", func(
 		Expect(k8sClient.Get(baseCtx, req.NamespacedName, &updated)).To(Succeed())
 		Expect(updated.Status.State).To(Equal(kvsynk8sv1alpha1.SecretSyncStateInSync),
 			"Pending is transient: the completed first sync must overwrite it")
+	})
+
+	// The runtime counterpart to the static AST check in
+	// internal/sync/redaction_test.go, for a surface that check cannot cover:
+	// metrics.go contains no log call at all, so it is deliberately absent
+	// from TestValueCarryingSources_NeverLogValueIdentifiers. What matters
+	// here is the label VALUES a real sync actually produces. A /metrics
+	// endpoint is scraped by anything on the cluster network and retained for
+	// months, so it must carry neither the value nor the identifiers that say
+	// which vault secret this is -- the closed, compile-time label vocabulary
+	// in metrics.go is what guarantees that, and this spec is what notices if
+	// someone ever adds a per-object label to it.
+	It("never puts a value or an object identifier into a metric label (constitution I)", func() {
+		ctx := context.Background()
+
+		suffix := shortUID()
+		okName := "ss-metric-redact-" + suffix
+		okSecret := "metric-redact-secret-" + suffix
+		okTarget := "target-metric-redact-" + suffix
+		failName := "ss-metric-redact-fail-" + suffix
+		failSecret := "metric-redact-fail-secret-" + suffix
+		const sentinel = "SENTINEL-controller-metric-redaction-not-real"
+
+		reader := newFakeSecretReader()
+		reader.set(fakeVaultName, okSecret, sentinel, "v1")
+
+		okSS := newTestSecretSync(namespace, okName, fakeVaultName, okSecret, okTarget, fakeDataKey)
+		Expect(k8sClient.Create(ctx, okSS)).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(context.Background(), okSS)
+		})
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: okTarget, Namespace: namespace},
+			})
+		})
+
+		// Never registered with the reader, so this one fails with
+		// SecretNotFound and drives the failure labels too.
+		failSS := newTestSecretSync(
+			namespace, failName, fakeVaultName, failSecret, "target-metric-redact-fail-"+suffix, fakeDataKey)
+		Expect(k8sClient.Create(ctx, failSS)).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(context.Background(), failSS)
+		})
+
+		// SetupWithManager is what does this in production. Called directly so
+		// the spec does not depend on some other container having started a
+		// manager first: Ginkgo randomises the order of top-level containers.
+		registerSyncMetrics(k8sClient)
+
+		r := &SecretSyncReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Reader: reader}
+		_, err := r.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: okName, Namespace: namespace}})
+		Expect(err).NotTo(HaveOccurred())
+		_, err = r.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: failName, Namespace: namespace}})
+		Expect(err).NotTo(HaveOccurred())
+
+		families, err := metrics.Registry.Gather()
+		Expect(err).NotTo(HaveOccurred())
+
+		// The value in both of its encodings, plus every identifier that would
+		// say WHICH secret a series is about.
+		forbidden := append(leakForms(sentinel),
+			fakeVaultName, okSecret, failSecret, namespace, okName, failName, okTarget)
+
+		seen := map[string]bool{}
+		for _, mf := range families {
+			if !strings.HasPrefix(mf.GetName(), "kvsynk8s_") {
+				continue
+			}
+			seen[mf.GetName()] = true
+			for _, m := range mf.GetMetric() {
+				for _, label := range m.GetLabel() {
+					for _, leak := range forbidden {
+						Expect(label.GetName()).NotTo(ContainSubstring(leak),
+							"metric %q carries a forbidden label name", mf.GetName())
+						Expect(label.GetValue()).NotTo(ContainSubstring(leak),
+							"metric %q label %q carries a forbidden value", mf.GetName(), label.GetName())
+					}
+				}
+			}
+		}
+		// Non-vacuity: the walk above proves nothing if the reconciles left no
+		// kvsynk8s series behind to walk.
+		Expect(seen).To(HaveKey("kvsynk8s_sync_total"))
+		Expect(seen).To(HaveKey("kvsynk8s_secretsync_state"))
+	})
+
+	// A classified failure returns err == nil, so controller-runtime logs
+	// nothing for it and the V(1) trace at the end of Reconcile is invisible at
+	// production verbosity. Before recordSyncOutcome logged, that left an
+	// operator tailing logs with no sign at all that a SecretSync was broken --
+	// everything lived in status and in an Event. Captured at InfoLevel on
+	// purpose: at DebugLevel this spec would pass even if the lines went back
+	// to being V(1).
+	It("logs the failure and the recovery at production verbosity, the recovery exactly once", func() {
+		baseCtx := context.Background()
+
+		suffix := shortUID()
+		name := "ss-failing-log-" + suffix
+		vaultSecret := "failing-log-secret-" + suffix
+		targetName := "target-failing-log-" + suffix
+		const sentinel = "SENTINEL-controller-recovery-log-not-real"
+
+		// Empty to begin with: the first reconcile cannot read the vault.
+		reader := newFakeSecretReader()
+
+		ss := newTestSecretSync(namespace, name, fakeVaultName, vaultSecret, targetName, fakeDataKey)
+		Expect(k8sClient.Create(baseCtx, ss)).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(context.Background(), ss)
+		})
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: targetName, Namespace: namespace},
+			})
+		})
+
+		logger, logBuf := capturingReconcileLoggerAt(zapcore.InfoLevel)
+		logCtx := logf.IntoContext(baseCtx, logger)
+
+		r := &SecretSyncReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Reader: reader}
+		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: namespace}}
+
+		_, err := r.Reconcile(logCtx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(logBuf.String()).To(ContainSubstring("SecretSync is failing"))
+		Expect(logBuf.String()).To(ContainSubstring(syncpkg.ReasonSecretNotFound),
+			"the log line has to say WHY, or it sends the operator to kubectl anyway")
+		// Proof the capture really is at production level: the per-reconcile
+		// V(1) trace must not be in this buffer.
+		Expect(logBuf.String()).NotTo(ContainSubstring("reconciled SecretSync"))
+
+		// The vault answers again.
+		reader.set(fakeVaultName, vaultSecret, sentinel, "v1")
+		_, err = r.Reconcile(logCtx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(strings.Count(logBuf.String(), "SecretSync recovered")).To(Equal(1))
+
+		// The recovery is a transition, not a state: a healthy SecretSync must
+		// not re-announce it on every periodic reconcile for the rest of its
+		// life.
+		_, err = r.Reconcile(logCtx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(strings.Count(logBuf.String(), "SecretSync recovered")).To(Equal(1),
+			"only the transition out of Failing is a recovery")
+
+		for _, form := range leakForms(sentinel) {
+			Expect(logBuf.String()).NotTo(ContainSubstring(form),
+				"the secret value must not reach the operator log in any encoding")
+		}
 	})
 })

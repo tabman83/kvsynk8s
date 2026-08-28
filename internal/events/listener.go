@@ -248,6 +248,7 @@ func (l *Listener) handleMessage(ctx context.Context, m azure.QueueMessage) {
 	if m.DequeueCount > l.PoisonThreshold {
 		log.Info("discarding poison message",
 			"messageID", m.ID, "dequeueCount", m.DequeueCount)
+		recordMessageOutcome("poison")
 		l.deleteMessage(ctx, m)
 		return
 	}
@@ -258,6 +259,7 @@ func (l *Listener) handleMessage(ctx context.Context, m azure.QueueMessage) {
 		// err itself is guaranteed to carry only fixed, static text (parser.go).
 		log.Info("discarding malformed message",
 			"messageID", m.ID, "dequeueCount", m.DequeueCount, "reason", err.Error())
+		recordMessageOutcome("malformed")
 		l.deleteMessage(ctx, m)
 		return
 	}
@@ -265,6 +267,7 @@ func (l *Listener) handleMessage(ctx context.Context, m azure.QueueMessage) {
 		// Rule 2: an event type/object type this operator does not act on.
 		// A clean, expected discard -- not worth logging at normal verbosity.
 		log.V(1).Info("discarding non-actionable event", "messageID", m.ID)
+		recordMessageOutcome("nonactionable")
 		l.deleteMessage(ctx, m)
 		return
 	}
@@ -278,9 +281,15 @@ func (l *Listener) handleMessage(ctx context.Context, m azure.QueueMessage) {
 		return
 	}
 	if len(matches) == 0 {
-		// Rule 3: no declaration cares about this vault+secret.
-		log.V(1).Info("discarding unmatched event",
+		// Rule 3: no declaration cares about this vault+secret. Logged at
+		// default verbosity, unlike the non-actionable discard above: other
+		// event types on a shared queue are routine traffic, but a Key Vault
+		// secret event nothing declares usually means a typo in a spec.vault,
+		// and that leaves the realtime path dead for that declaration with
+		// nothing else to show for it.
+		log.Info("discarding unmatched event",
 			"messageID", m.ID, "eventID", parsed.ID, "vault", parsed.VaultName, "secret", parsed.SecretName)
+		recordMessageOutcome("unmatched")
 		l.deleteMessage(ctx, m)
 		return
 	}
@@ -300,6 +309,7 @@ func (l *Listener) handleMessage(ctx context.Context, m azure.QueueMessage) {
 	log.Info("dispatched reconcile requests for event",
 		"messageID", m.ID, "eventID", parsed.ID, "vault", parsed.VaultName, "secret", parsed.SecretName,
 		"version", parsed.Version, "matches", len(matches))
+	recordMessageOutcome("dispatched")
 
 	// Rule 5: delete only after every matching sync has been accepted for
 	// processing (sent into Events above); sync failures are retried via
