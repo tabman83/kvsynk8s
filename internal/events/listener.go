@@ -248,7 +248,7 @@ func (l *Listener) handleMessage(ctx context.Context, m azure.QueueMessage) {
 	if m.DequeueCount > l.PoisonThreshold {
 		log.Info("discarding poison message",
 			"messageID", m.ID, "dequeueCount", m.DequeueCount)
-		recordMessageOutcome("poison")
+		recordMessageOutcome(outcomePoison)
 		l.deleteMessage(ctx, m)
 		return
 	}
@@ -259,7 +259,7 @@ func (l *Listener) handleMessage(ctx context.Context, m azure.QueueMessage) {
 		// err itself is guaranteed to carry only fixed, static text (parser.go).
 		log.Info("discarding malformed message",
 			"messageID", m.ID, "dequeueCount", m.DequeueCount, "reason", err.Error())
-		recordMessageOutcome("malformed")
+		recordMessageOutcome(outcomeMalformed)
 		l.deleteMessage(ctx, m)
 		return
 	}
@@ -267,7 +267,7 @@ func (l *Listener) handleMessage(ctx context.Context, m azure.QueueMessage) {
 		// Rule 2: an event type/object type this operator does not act on.
 		// A clean, expected discard -- not worth logging at normal verbosity.
 		log.V(1).Info("discarding non-actionable event", "messageID", m.ID)
-		recordMessageOutcome("nonactionable")
+		recordMessageOutcome(outcomeNonActionable)
 		l.deleteMessage(ctx, m)
 		return
 	}
@@ -293,7 +293,7 @@ func (l *Listener) handleMessage(ctx context.Context, m azure.QueueMessage) {
 		// spec.vault. Turn on V(1) to see which secret.
 		log.V(1).Info("discarding unmatched event",
 			"messageID", m.ID, "eventID", parsed.ID, "vault", parsed.VaultName, "secret", parsed.SecretName)
-		recordMessageOutcome("unmatched")
+		recordMessageOutcome(outcomeUnmatched)
 		l.deleteMessage(ctx, m)
 		return
 	}
@@ -313,7 +313,7 @@ func (l *Listener) handleMessage(ctx context.Context, m azure.QueueMessage) {
 	log.Info("dispatched reconcile requests for event",
 		"messageID", m.ID, "eventID", parsed.ID, "vault", parsed.VaultName, "secret", parsed.SecretName,
 		"version", parsed.Version, "matches", len(matches))
-	recordMessageOutcome("dispatched")
+	recordMessageOutcome(outcomeDispatched)
 
 	// Rule 5: delete only after every matching sync has been accepted for
 	// processing (sent into Events above); sync failures are retried via

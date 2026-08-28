@@ -223,7 +223,7 @@ func secretIsDisabled(attrs *azsecrets.SecretAttributes) bool {
 //     status.Message, which is bound by the identifiers-and-fixed-text rule
 //     because anyone with read access to the CR can see it.
 func classifyGetSecretError(ctx context.Context, vaultName, secretName string, err error) error {
-	sentinel, statusCode := classifySentinel(err)
+	statusCode, sentinel := classifySentinel(err)
 
 	keys := []any{
 		"vault", vaultName, "secret", secretName,
@@ -244,28 +244,39 @@ func classifyGetSecretError(ctx context.Context, vaultName, secretName string, e
 	return fmt.Errorf("vault %q secret %q: %w", vaultName, secretName, sentinel)
 }
 
+// The status.reason each sentinel maps to. Declared here rather than written
+// inline so the log line cannot drift from internal/sync's own reason
+// constants, which are the ones that reach status and the README.
+const (
+	classSecretNotFound       = "SecretNotFound"
+	classAccessDenied         = "AccessDenied"
+	classAuthenticationFailed = "AuthenticationFailed"
+	classSourceDisabled       = "SourceDisabled"
+	classTransientError       = "TransientError"
+)
+
 // classificationName renders a sentinel as the status.reason a caller will end
 // up with, so the log line and `kubectl get secretsync` agree on what happened.
 func classificationName(sentinel error) string {
 	switch {
 	case errors.Is(sentinel, ErrSecretNotFound):
-		return "SecretNotFound"
+		return classSecretNotFound
 	case errors.Is(sentinel, ErrAccessDenied):
-		return "AccessDenied"
+		return classAccessDenied
 	case errors.Is(sentinel, ErrAuthFailure):
-		return "AuthenticationFailed"
+		return classAuthenticationFailed
 	case errors.Is(sentinel, ErrSecretDisabled):
-		return "SourceDisabled"
+		return classSourceDisabled
 	default:
-		return "TransientError"
+		return classTransientError
 	}
 }
 
-// classifySentinel picks the sentinel for a GetSecret failure and reports the
-// HTTP status code that decided it, or 0 when the request never got an answer.
+// classifySentinel reports the HTTP status code that decided the failure (0
+// when the request never got an answer) and the sentinel it maps to.
 // Split out from classifyGetSecretError so the classification and the logging
 // of it cannot drift apart.
-func classifySentinel(err error) (sentinel error, statusCode int) {
+func classifySentinel(err error) (statusCode int, sentinel error) {
 	var respErr *azcore.ResponseError
 	if errors.As(err, &respErr) {
 		// Key Vault refuses GetSecret outright on a disabled secret instead
@@ -280,20 +291,20 @@ func classifySentinel(err error) (sentinel error, statusCode int) {
 		// this function returns (constitution I): it is only ever used to
 		// pick which fixed sentinel applies.
 		if isDisabledSecretResponse(respErr) {
-			return ErrSecretDisabled, respErr.StatusCode
+			return respErr.StatusCode, ErrSecretDisabled
 		}
 		switch {
 		case respErr.StatusCode == http.StatusNotFound:
-			return ErrSecretNotFound, respErr.StatusCode
+			return respErr.StatusCode, ErrSecretNotFound
 		case respErr.StatusCode == http.StatusUnauthorized || respErr.StatusCode == http.StatusForbidden:
-			return ErrAccessDenied, respErr.StatusCode
+			return respErr.StatusCode, ErrAccessDenied
 		case respErr.StatusCode == http.StatusTooManyRequests || respErr.StatusCode >= http.StatusInternalServerError:
-			return ErrTransient, respErr.StatusCode
+			return respErr.StatusCode, ErrTransient
 		default:
 			// Any other HTTP status from Key Vault is not one of the known,
 			// actionable categories. Fail safe: treat it as retryable rather
 			// than surfacing a new, unhandled reason to callers.
-			return ErrTransient, respErr.StatusCode
+			return respErr.StatusCode, ErrTransient
 		}
 	}
 
@@ -303,11 +314,11 @@ func classifySentinel(err error) (sentinel error, statusCode int) {
 	// happen. Checked only after the ResponseError branch above, so a real
 	// answer from the vault always wins.
 	if isAuthFailure(err) {
-		return ErrAuthFailure, 0
+		return 0, ErrAuthFailure
 	}
 
 	// Genuinely no answer: network failure, timeout, DNS, TLS, etc.
-	return ErrTransient, 0
+	return 0, ErrTransient
 }
 
 // keyVaultErrorBody is the JSON error shape Key Vault (and Key-Vault-

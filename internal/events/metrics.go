@@ -61,7 +61,7 @@ var (
 	// series forever. Nothing derived from a message body, a vault name or a
 	// secret name ever becomes a label (constitution I, and cardinality).
 	queueMessagesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "kvsynk8s_queue_messages_total",
+		Name: queueMessagesMetric,
 		Help: "Queue messages handled, by outcome: dispatched (matched at least one " +
 			"SecretSync and triggered a reconcile), unmatched (no SecretSync declares " +
 			"that vault secret; expected traffic when the Event Grid subscription covers " +
@@ -110,6 +110,19 @@ func (l *Listener) recordReceiveFailure() {
 	l.consecutiveReceiveFailures++
 	queueConsecutiveReceiveFailures.Set(float64(l.consecutiveReceiveFailures))
 }
+
+// The queue-message counter's name and its closed outcome vocabulary. Named
+// constants rather than literals so the listener's call sites, the Help text
+// and the tests cannot drift apart.
+const (
+	queueMessagesMetric = "kvsynk8s_queue_messages_total"
+
+	outcomeDispatched    = "dispatched"
+	outcomeUnmatched     = "unmatched"
+	outcomeNonActionable = "nonactionable"
+	outcomeMalformed     = "malformed"
+	outcomePoison        = "poison"
+)
 
 // recordMessageOutcome counts one handled queue message. outcome is always one
 // of the five fixed literals named in queueMessagesTotal's help text.

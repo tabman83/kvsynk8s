@@ -147,14 +147,14 @@ func TestQueueMetrics_RegisteredWithControllerRuntimeRegistry(t *testing.T) {
 	want := map[string]bool{
 		"kvsynk8s_queue_last_successful_receive_timestamp_seconds": false,
 		"kvsynk8s_queue_consecutive_receive_failures":              false,
-		"kvsynk8s_queue_messages_total":                            false,
+		queueMessagesMetric: false,
 	}
 	var outcomeSeries []string
 	for _, mf := range families {
 		if _, ok := want[mf.GetName()]; ok {
 			want[mf.GetName()] = true
 		}
-		if mf.GetName() != "kvsynk8s_queue_messages_total" {
+		if mf.GetName() != queueMessagesMetric {
 			continue
 		}
 		for _, m := range mf.GetMetric() {
@@ -203,7 +203,7 @@ func TestQueueMetrics_RegisteredWithControllerRuntimeRegistry(t *testing.T) {
 // (metrics.go). Kept here rather than exported from production code so the test
 // pins the contract independently of whatever the implementation happens to
 // pass to recordMessageOutcome.
-var queueOutcomes = []string{"dispatched", "unmatched", "nonactionable", "malformed", "poison"}
+var queueOutcomes = []string{outcomeDispatched, outcomeUnmatched, outcomeNonActionable, outcomeMalformed, outcomePoison}
 
 // queueOutcomeCounts snapshots the current value of every outcome series. The
 // counter is a package-global shared by every test in this package, so the
@@ -277,13 +277,13 @@ func TestListener_MessageOutcome_CountedExactlyOnce(t *testing.T) {
 			outcome: "unmatched",
 		},
 		{
-			name:     "dispatched",
+			name:     outcomeDispatched,
 			declared: true,
 			msg: azure.QueueMessage{
 				ID: "outcome-dispatched", PopReceipt: "pop-outcome-dispatched",
 				Text: matchingBody, DequeueCount: 1,
 			},
-			outcome: "dispatched",
+			outcome: outcomeDispatched,
 		},
 	}
 

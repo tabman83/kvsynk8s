@@ -92,7 +92,7 @@ func TestIsAuthFailure_CredentialChainShapes(t *testing.T) {
 				t.Fatalf("isAuthFailure() = false, want true for %T", tt.err)
 			}
 
-			sentinel, statusCode := classifySentinel(tt.err)
+			statusCode, sentinel := classifySentinel(tt.err)
 			if !errors.Is(sentinel, ErrAuthFailure) {
 				t.Fatalf("classifySentinel() = %v, want %v", sentinel, ErrAuthFailure)
 			}
@@ -116,8 +116,8 @@ func TestIsAuthFailure_DoesNotOverMatch(t *testing.T) {
 		err  error
 	}{
 		{"plain error", errors.New("something went wrong")},
-		{"network dial failure", &net.OpError{Op: "dial", Err: errors.New("connection refused")}},
-		{"wrapped network failure", fmt.Errorf("get secret: %w", &net.OpError{Op: "dial", Err: errors.New("i/o timeout")})},
+		{"network dial failure", &net.OpError{Op: opDial, Err: errors.New("connection refused")}},
+		{"wrapped network failure", fmt.Errorf("get secret: %w", &net.OpError{Op: opDial, Err: errors.New("i/o timeout")})},
 		{"http response error with no status", &azcore.ResponseError{}},
 	}
 
@@ -127,7 +127,7 @@ func TestIsAuthFailure_DoesNotOverMatch(t *testing.T) {
 				t.Fatalf("isAuthFailure() = true, want false for %T", tt.err)
 			}
 
-			sentinel, _ := classifySentinel(tt.err)
+			_, sentinel := classifySentinel(tt.err)
 			if errors.Is(sentinel, ErrAuthFailure) {
 				t.Fatalf("classifySentinel() = %v, want anything but %v", sentinel, ErrAuthFailure)
 			}
@@ -164,7 +164,7 @@ func TestClassifySentinel_ResponseErrorWinsOverAuthShape(t *testing.T) {
 			// Both errors in one chain, the way fmt.Errorf's multi-%w builds it.
 			err := fmt.Errorf("get secret: %w: %w", respErr, doubleWrapped(tt.authShape))
 
-			sentinel, statusCode := classifySentinel(err)
+			statusCode, sentinel := classifySentinel(err)
 			if !errors.Is(sentinel, tt.wantErr) {
 				t.Fatalf("classifySentinel() = %v, want %v", sentinel, tt.wantErr)
 			}
@@ -208,14 +208,14 @@ func TestClassificationName(t *testing.T) {
 		sentinel error
 		want     string
 	}{
-		{"secret not found", ErrSecretNotFound, "SecretNotFound"},
-		{"access denied", ErrAccessDenied, "AccessDenied"},
-		{"auth failure", ErrAuthFailure, "AuthenticationFailed"},
-		{"secret disabled", ErrSecretDisabled, "SourceDisabled"},
-		{"transient", ErrTransient, "TransientError"},
+		{"secret not found", ErrSecretNotFound, classSecretNotFound},
+		{"access denied", ErrAccessDenied, classAccessDenied},
+		{"auth failure", ErrAuthFailure, classAuthenticationFailed},
+		{"secret disabled", ErrSecretDisabled, classSourceDisabled},
+		{"transient", ErrTransient, classTransientError},
 		// An unrecognised sentinel must fall back to the retryable reason
 		// rather than surfacing a status.reason the CRD does not define.
-		{"unrecognised falls back to transient", errors.New("something unclassified"), "TransientError"},
+		{"unrecognised falls back to transient", errors.New("something unclassified"), classTransientError},
 	}
 
 	for _, tt := range tests {
@@ -259,7 +259,7 @@ func TestIsAuthFailure_TransientTokenEndpointAnswersStayTransient(t *testing.T) 
 			if tt.wantAuth {
 				wantSentinel = ErrAuthFailure
 			}
-			if sentinel, _ := classifySentinel(err); !errors.Is(sentinel, wantSentinel) {
+			if _, sentinel := classifySentinel(err); !errors.Is(sentinel, wantSentinel) {
 				t.Fatalf("classifySentinel(status %d) = %v, want %v", tt.statusCode, sentinel, wantSentinel)
 			}
 		})
@@ -293,7 +293,7 @@ func TestAuthFailureKind(t *testing.T) {
 		},
 		// Anything that is not an auth failure reports no kind at all, so the
 		// log line does not grow a field that would read as one.
-		{"a network error is not an auth failure", &net.OpError{Op: "dial", Err: errors.New("refused")}, ""},
+		{"a network error is not an auth failure", &net.OpError{Op: opDial, Err: errors.New("refused")}, ""},
 		{"an answered request is not an auth failure", &azcore.ResponseError{StatusCode: http.StatusForbidden}, ""},
 	}
 

@@ -32,6 +32,10 @@ import (
 // asserts this value is absent from it.
 const sentinelValue = "SENTINEL-do-not-log-me-9f3a"
 
+// opDial is net.OpError's Op for a failed connection attempt, shared by every
+// test in this package that builds one.
+const opDial = "dial"
+
 func TestClassifyGetSecretError_HTTPStatusCodes(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -63,7 +67,7 @@ func TestClassifyGetSecretError_HTTPStatusCodes(t *testing.T) {
 }
 
 func TestClassifyGetSecretError_NetworkErrorIsTransient(t *testing.T) {
-	netErr := &net.OpError{Op: "dial", Err: errors.New("connection refused")}
+	netErr := &net.OpError{Op: opDial, Err: errors.New("connection refused")}
 
 	got := classifyGetSecretError(context.Background(), "my-vault", "my-secret", netErr)
 
@@ -190,7 +194,7 @@ func TestClassifyGetSecretError_SecretNameContainingDisabled_NotMisclassified(t 
 		{
 			name:       "plain 404 for a poison-named secret is not found, not disabled",
 			statusCode: http.StatusNotFound,
-			body:       `{"error":{"code":"SecretNotFound","message":"A secret with (name/id) feature-disabled-flag was not found in this key vault."}}`,
+			body:       `{"error":{"code":classSecretNotFound,"message":"A secret with (name/id) feature-disabled-flag was not found in this key vault."}}`,
 			wantErr:    ErrSecretNotFound,
 		},
 		{
@@ -315,31 +319,31 @@ func TestClassifyGetSecretError_LogsStatusCodeAndClassification(t *testing.T) {
 	}{
 		{
 			name:               "not found",
-			err:                fmt.Errorf("%s: %w", messageSentinel, responseErrorWithBody(http.StatusNotFound, errorBody("SecretNotFound"))),
+			err:                fmt.Errorf("%s: %w", messageSentinel, responseErrorWithBody(http.StatusNotFound, errorBody(classSecretNotFound))),
 			wantErr:            ErrSecretNotFound,
 			wantStatusCode:     http.StatusNotFound,
-			wantClassification: "SecretNotFound",
+			wantClassification: classSecretNotFound,
 		},
 		{
 			name:               "forbidden",
 			err:                fmt.Errorf("%s: %w", messageSentinel, responseErrorWithBody(http.StatusForbidden, errorBody("Forbidden"))),
 			wantErr:            ErrAccessDenied,
 			wantStatusCode:     http.StatusForbidden,
-			wantClassification: "AccessDenied",
+			wantClassification: classAccessDenied,
 		},
 		{
 			name:               "throttled",
 			err:                fmt.Errorf("%s: %w", messageSentinel, responseErrorWithBody(http.StatusTooManyRequests, errorBody("Throttled"))),
 			wantErr:            ErrTransient,
 			wantStatusCode:     http.StatusTooManyRequests,
-			wantClassification: "TransientError",
+			wantClassification: classTransientError,
 		},
 		{
 			name:               "server error",
 			err:                fmt.Errorf("%s: %w", messageSentinel, responseErrorWithBody(http.StatusInternalServerError, errorBody("InternalError"))),
 			wantErr:            ErrTransient,
 			wantStatusCode:     http.StatusInternalServerError,
-			wantClassification: "TransientError",
+			wantClassification: classTransientError,
 		},
 		{
 			// An unrecognised status still has to reach the log with its real
@@ -349,23 +353,23 @@ func TestClassifyGetSecretError_LogsStatusCodeAndClassification(t *testing.T) {
 			err:                fmt.Errorf("%s: %w", messageSentinel, responseErrorWithBody(http.StatusTeapot, errorBody("Weird"))),
 			wantErr:            ErrTransient,
 			wantStatusCode:     http.StatusTeapot,
-			wantClassification: "TransientError",
+			wantClassification: classTransientError,
 		},
 		{
 			// No HTTP response at all: statusCode must be 0, not omitted and
 			// not invented.
 			name:               "no http response",
-			err:                fmt.Errorf("%s: %w", messageSentinel, &net.OpError{Op: "dial", Err: errors.New("connection refused")}),
+			err:                fmt.Errorf("%s: %w", messageSentinel, &net.OpError{Op: opDial, Err: errors.New("connection refused")}),
 			wantErr:            ErrTransient,
 			wantStatusCode:     0,
-			wantClassification: "TransientError",
+			wantClassification: classTransientError,
 		},
 		{
 			name:               "auth failure",
 			err:                fmt.Errorf("%s: %w", messageSentinel, azidentity.NewCredentialUnavailableError(bodySentinel)),
 			wantErr:            ErrAuthFailure,
 			wantStatusCode:     0,
-			wantClassification: "AuthenticationFailed",
+			wantClassification: classAuthenticationFailed,
 		},
 	}
 

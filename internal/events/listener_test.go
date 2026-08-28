@@ -49,6 +49,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -705,12 +706,7 @@ func (s *verbosityLogSink) WithValues(...any) logr.LogSink { return s }
 var _ logr.LogSink = (*verbosityLogSink)(nil)
 
 func containsMsg(msgs []string, want string) bool {
-	for _, m := range msgs {
-		if m == want {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(msgs, want)
 }
 
 // TestListener_CleanDiscards_StayAtV1 pins both clean-discard branches of

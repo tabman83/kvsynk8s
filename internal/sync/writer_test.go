@@ -64,7 +64,7 @@ func TestCreateOrUpdate_LabeledSecretOwnedByOtherController_TargetConflict(t *te
 	cli := fake.NewClientBuilder().WithScheme(redactionScheme(t)).WithObjects(conflicting).Build()
 	w := &SecretWriter{Client: cli}
 
-	err := w.CreateOrUpdate(context.Background(), owner, owner.Namespace, owner.Name, "my-app-password", "new-value", "v2")
+	err := w.CreateOrUpdate(context.Background(), owner, owner.Namespace, owner.Name, "my-app-password", newValue, "v2")
 	if err == nil {
 		t.Fatal("CreateOrUpdate() error = nil, want ErrTargetConflict")
 	}
@@ -126,7 +126,7 @@ func TestCreateOrUpdate_AlreadyExistsOnOwnSecret_FallsThroughToUpdate(t *testing
 	cli := staleCacheClient(t, own)
 	w := &SecretWriter{Client: cli, Reader: cli}
 
-	err := w.CreateOrUpdate(context.Background(), owner, owner.Namespace, owner.Name, "my-app-password", "new-value", "v2")
+	err := w.CreateOrUpdate(context.Background(), owner, owner.Namespace, owner.Name, "my-app-password", newValue, "v2")
 	if err != nil {
 		t.Fatalf("CreateOrUpdate() error = %v, want nil (own just-created Secret is not a conflict)", err)
 	}
@@ -135,7 +135,7 @@ func TestCreateOrUpdate_AlreadyExistsOnOwnSecret_FallsThroughToUpdate(t *testing
 	if getErr := cli.Get(context.Background(), client.ObjectKey{Namespace: owner.Namespace, Name: owner.Name}, &got); getErr != nil {
 		t.Fatalf("get secret after recovery: %v", getErr)
 	}
-	if string(got.Data["my-app-password"]) != "new-value" {
+	if string(got.Data["my-app-password"]) != newValue {
 		t.Fatalf("secret data = %q, want the new value written through the update path", got.Data["my-app-password"])
 	}
 	if got.Annotations[AnnotationVersion] != "v2" {
@@ -162,7 +162,7 @@ func TestCreateOrUpdate_AlreadyExistsOnForeignSecret_TargetConflict(t *testing.T
 			Labels:    map[string]string{"created-by": "some-other-tool"},
 		},
 		Type: corev1.SecretTypeOpaque,
-		Data: map[string][]byte{"unrelated-key": []byte("unrelated-value")},
+		Data: map[string][]byte{unrelatedKey: []byte(unrelatedValue)},
 	}
 
 	otherOwned := existingSyncedSecret(otherOwner, "v1", "owned-by-someone-else")
@@ -181,7 +181,7 @@ func TestCreateOrUpdate_AlreadyExistsOnForeignSecret_TargetConflict(t *testing.T
 			cli := staleCacheClient(t, tt.occupant)
 			w := &SecretWriter{Client: cli, Reader: cli}
 
-			err := w.CreateOrUpdate(context.Background(), owner, owner.Namespace, tt.occupant.Name, "my-app-password", "new-value", "v2")
+			err := w.CreateOrUpdate(context.Background(), owner, owner.Namespace, tt.occupant.Name, "my-app-password", newValue, "v2")
 			if !errors.Is(err, ErrTargetConflict) {
 				t.Fatalf("CreateOrUpdate() error = %v, want wrapped ErrTargetConflict", err)
 			}
@@ -246,7 +246,7 @@ func TestCreateOrUpdate_OwnSecretWithLabelStripped_RepairedNotConflicted(t *test
 			cli := tt.client(t, stripped)
 			w := &SecretWriter{Client: cli, Reader: cli}
 
-			err := w.CreateOrUpdate(context.Background(), owner, owner.Namespace, owner.Name, "my-app-password", "new-value", "v2")
+			err := w.CreateOrUpdate(context.Background(), owner, owner.Namespace, owner.Name, "my-app-password", newValue, "v2")
 			if err != nil {
 				t.Fatalf("CreateOrUpdate() error = %v, want nil (the owner's own Secret must be repaired, not conflicted)", err)
 			}
@@ -258,7 +258,7 @@ func TestCreateOrUpdate_OwnSecretWithLabelStripped_RepairedNotConflicted(t *test
 			if got.Labels[LabelManagedBy] != LabelManagedByValue {
 				t.Fatalf("labels = %v, want the managed-by label restored by the repairing write", got.Labels)
 			}
-			if string(got.Data["my-app-password"]) != "new-value" {
+			if string(got.Data["my-app-password"]) != newValue {
 				t.Fatalf("data was not updated: %v", got.Data)
 			}
 			if got.Annotations[AnnotationVersion] != "v2" {
@@ -274,8 +274,23 @@ func TestCreateOrUpdate_OwnSecretWithLabelStripped_RepairedNotConflicted(t *test
 // immutableSecret builds a managed Secret that looks like a prior successful
 // sync for owner and then freezes it, the way a user who wants a value pinned
 // (and the kubelet's watch dropped) would.
-func immutableSecret(owner *kvsynk8sv1alpha1.SecretSync, version, value string) *corev1.Secret {
-	secret := existingSyncedSecret(owner, version, value)
+// immutableSecret builds a managed Secret this SecretSync already wrote, then
+// freezes it the way a user would with `immutable: true`. Always at the seeded
+// version: the interesting axis is the value, since immutability blocks a data
+// change and permits a metadata-only one.
+// Values shared by the tests in this package. They are constants because the
+// same literal appearing in several files is what goconst flags, and because a
+// typo in one of them would silently weaken an assertion.
+const (
+	seededVersion  = "v1"
+	oldValue       = "old-value"
+	newValue       = "new-value"
+	unrelatedKey   = "unrelated-key"
+	unrelatedValue = "unrelated-value"
+)
+
+func immutableSecret(owner *kvsynk8sv1alpha1.SecretSync, value string) *corev1.Secret {
+	secret := existingSyncedSecret(owner, seededVersion, value)
 	frozen := true
 	secret.Immutable = &frozen
 	return secret
@@ -296,11 +311,11 @@ func immutableSecret(owner *kvsynk8sv1alpha1.SecretSync, version, value string) 
 func TestCreateOrUpdate_ImmutableSecretValueChanged_TargetImmutable(t *testing.T) {
 	owner := newOwner("my-sync", "default", "my-vault", "my-app-password")
 
-	frozen := immutableSecret(owner, "v1", "old-value")
+	frozen := immutableSecret(owner, oldValue)
 	cli := fake.NewClientBuilder().WithScheme(redactionScheme(t)).WithObjects(frozen).Build()
 	w := &SecretWriter{Client: cli, Reader: cli}
 
-	err := w.CreateOrUpdate(context.Background(), owner, owner.Namespace, owner.Name, "my-app-password", "new-value", "v2")
+	err := w.CreateOrUpdate(context.Background(), owner, owner.Namespace, owner.Name, "my-app-password", newValue, "v2")
 	if err == nil {
 		t.Fatal("CreateOrUpdate() error = nil, want ErrTargetImmutable")
 	}
@@ -333,7 +348,7 @@ func TestCreateOrUpdate_ImmutableSecretValueChanged_TargetImmutable(t *testing.T
 func TestCreateOrUpdate_ImmutableSecretSameValueNewVersion_Succeeds(t *testing.T) {
 	owner := newOwner("my-sync", "default", "my-vault", "my-app-password")
 
-	frozen := immutableSecret(owner, "v1", "same-value")
+	frozen := immutableSecret(owner, "same-value")
 	cli := fake.NewClientBuilder().WithScheme(redactionScheme(t)).WithObjects(frozen).Build()
 	w := &SecretWriter{Client: cli, Reader: cli}
 
@@ -398,7 +413,7 @@ func TestCreateOrUpdate_ConflictOnFirstUpdate_RetriesAndConverges(t *testing.T) 
 	cli := conflictingUpdateClient(t, 1, own)
 	w := &SecretWriter{Client: cli, Reader: cli}
 
-	err := w.CreateOrUpdate(context.Background(), owner, owner.Namespace, owner.Name, "my-app-password", "new-value", "v2")
+	err := w.CreateOrUpdate(context.Background(), owner, owner.Namespace, owner.Name, "my-app-password", newValue, "v2")
 	if err != nil {
 		t.Fatalf("CreateOrUpdate() error = %v, want nil (a single 409 is recovered, not reported)", err)
 	}
@@ -407,7 +422,7 @@ func TestCreateOrUpdate_ConflictOnFirstUpdate_RetriesAndConverges(t *testing.T) 
 	if getErr := cli.Get(context.Background(), client.ObjectKey{Namespace: owner.Namespace, Name: owner.Name}, &got); getErr != nil {
 		t.Fatalf("get secret after conflict recovery: %v", getErr)
 	}
-	if string(got.Data["my-app-password"]) != "new-value" {
+	if string(got.Data["my-app-password"]) != newValue {
 		t.Fatalf("secret data = %q, want the new value written by the retry", got.Data["my-app-password"])
 	}
 	if got.Annotations[AnnotationVersion] != "v2" {
@@ -432,7 +447,7 @@ func TestCreateOrUpdate_ConflictOnEveryUpdate_SurfacesConflict(t *testing.T) {
 	cli := conflictingUpdateClient(t, 100, own)
 	w := &SecretWriter{Client: cli, Reader: cli}
 
-	err := w.CreateOrUpdate(context.Background(), owner, owner.Namespace, owner.Name, "my-app-password", "new-value", "v2")
+	err := w.CreateOrUpdate(context.Background(), owner, owner.Namespace, owner.Name, "my-app-password", newValue, "v2")
 	if err == nil {
 		t.Fatal("CreateOrUpdate() error = nil, want the second conflict surfaced")
 	}
@@ -462,12 +477,12 @@ func TestCreateOrUpdate_ConflictThenForeignOccupant_TargetConflict(t *testing.T)
 			Namespace: owner.Namespace,
 			Labels:    map[string]string{"created-by": "some-other-tool"},
 		},
-		Data: map[string][]byte{"unrelated-key": []byte("unrelated-value")},
+		Data: map[string][]byte{unrelatedKey: []byte(unrelatedValue)},
 	}
 	truth := fake.NewClientBuilder().WithScheme(redactionScheme(t)).WithObjects(foreign).Build()
 	w := &SecretWriter{Client: cli, Reader: truth}
 
-	err := w.CreateOrUpdate(context.Background(), owner, owner.Namespace, owner.Name, "my-app-password", "new-value", "v2")
+	err := w.CreateOrUpdate(context.Background(), owner, owner.Namespace, owner.Name, "my-app-password", newValue, "v2")
 	if !errors.Is(err, ErrTargetConflict) {
 		t.Fatalf("CreateOrUpdate() error = %v, want wrapped ErrTargetConflict", err)
 	}
@@ -526,14 +541,14 @@ func TestCreateOrUpdate_InvalidFromStaleCache_TargetImmutable(t *testing.T) {
 
 	// The cached client answers Gets with Immutable stripped; the uncached
 	// reader holds the Secret as the API server actually has it.
-	cli := staleImmutableCacheClient(t, immutableSecret(owner, "v1", "old-value"))
+	cli := staleImmutableCacheClient(t, immutableSecret(owner, oldValue))
 	truth := fake.NewClientBuilder().
 		WithScheme(redactionScheme(t)).
-		WithObjects(immutableSecret(owner, "v1", "old-value")).
+		WithObjects(immutableSecret(owner, oldValue)).
 		Build()
 	w := &SecretWriter{Client: cli, Reader: truth}
 
-	err := w.CreateOrUpdate(context.Background(), owner, owner.Namespace, owner.Name, "my-app-password", "new-value", "v2")
+	err := w.CreateOrUpdate(context.Background(), owner, owner.Namespace, owner.Name, "my-app-password", newValue, "v2")
 	if !errors.Is(err, ErrTargetImmutable) {
 		t.Fatalf("CreateOrUpdate() error = %v, want wrapped ErrTargetImmutable", err)
 	}
@@ -564,7 +579,7 @@ func TestCreateOrUpdate_InvalidForOtherReason_ErrorUnchanged(t *testing.T) {
 		Build()
 	w := &SecretWriter{Client: cli, Reader: cli}
 
-	err := w.CreateOrUpdate(context.Background(), owner, owner.Namespace, owner.Name, "my-app-password", "new-value", "v2")
+	err := w.CreateOrUpdate(context.Background(), owner, owner.Namespace, owner.Name, "my-app-password", newValue, "v2")
 	if err == nil {
 		t.Fatal("CreateOrUpdate() error = nil, want the webhook's Invalid surfaced")
 	}
@@ -588,7 +603,7 @@ func TestCreateOrUpdate_InvalidWithFailedReRead_ErrorUnchanged(t *testing.T) {
 	// The Secret really IS immutable, so a re-read that worked would classify
 	// this as TargetImmutable. The reader below never lets that happen, which
 	// is what makes this test about the failed re-read and nothing else.
-	cli := staleImmutableCacheClient(t, immutableSecret(owner, "v1", "old-value"))
+	cli := staleImmutableCacheClient(t, immutableSecret(owner, oldValue))
 	unavailable := fake.NewClientBuilder().
 		WithScheme(redactionScheme(t)).
 		WithInterceptorFuncs(interceptor.Funcs{
@@ -599,7 +614,7 @@ func TestCreateOrUpdate_InvalidWithFailedReRead_ErrorUnchanged(t *testing.T) {
 		Build()
 	w := &SecretWriter{Client: cli, Reader: unavailable}
 
-	err := w.CreateOrUpdate(context.Background(), owner, owner.Namespace, owner.Name, "my-app-password", "new-value", "v2")
+	err := w.CreateOrUpdate(context.Background(), owner, owner.Namespace, owner.Name, "my-app-password", newValue, "v2")
 	if err == nil {
 		t.Fatal("CreateOrUpdate() error = nil, want the original Invalid surfaced")
 	}

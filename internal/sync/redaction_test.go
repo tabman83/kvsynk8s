@@ -89,6 +89,17 @@ func assertNoLeakInLog(t *testing.T, label, sentinel string, logBuf *bytes.Buffe
 // assertNoLeak fails t if any form of sentinel appears anywhere in haystacks
 // or in the captured log buffer. label identifies which scenario is being
 // checked, for a useful failure message.
+// redactionDataKey is the target data key every spec in this file writes
+// through. One constant, so the key a test writes and the key it reads back
+// cannot drift.
+const redactionDataKey = "value"
+
+// valueIdent is the Go identifier that holds a secret value in the files the
+// AST check below covers. Same spelling as redactionDataKey, different thing:
+// that one is a Secret data key, this one is a variable name in the source
+// being parsed.
+const valueIdent = "value"
+
 func assertNoLeak(t *testing.T, label, sentinel string, logBuf *bytes.Buffer, haystacks ...string) {
 	t.Helper()
 	for i, h := range haystacks {
@@ -263,7 +274,7 @@ func TestRedaction_Writer_CreateOrUpdate_Success_ValueOnlyInSecretData(t *testin
 	logger, logBuf := capturingLogger()
 	ctx := logf.IntoContext(context.Background(), logger)
 
-	if err := w.CreateOrUpdate(ctx, owner, owner.Namespace, owner.Name, "value", sentinel, "v1"); err != nil {
+	if err := w.CreateOrUpdate(ctx, owner, owner.Namespace, owner.Name, redactionDataKey, sentinel, "v1"); err != nil {
 		t.Fatalf("CreateOrUpdate() error = %v, want nil", err)
 	}
 
@@ -273,7 +284,7 @@ func TestRedaction_Writer_CreateOrUpdate_Success_ValueOnlyInSecretData(t *testin
 	if err := cli.Get(ctx, client.ObjectKey{Namespace: owner.Namespace, Name: owner.Name}, &got); err != nil {
 		t.Fatalf("get written secret: %v", err)
 	}
-	if string(got.Data["value"]) != sentinel {
+	if string(got.Data[redactionDataKey]) != sentinel {
 		t.Fatalf("expected the sentinel in the written Secret's Data; got %+v", got.Data)
 	}
 }
@@ -301,7 +312,7 @@ func TestRedaction_Writer_CreateOrUpdate_Update_ValueOnlyInSecretData(t *testing
 	// branch. This first call is not the one under test.
 	seedLogger, _ := capturingLogger()
 	seedCtx := logf.IntoContext(context.Background(), seedLogger)
-	if err := w.CreateOrUpdate(seedCtx, owner, owner.Namespace, owner.Name, "value", initialValue, "v1"); err != nil {
+	if err := w.CreateOrUpdate(seedCtx, owner, owner.Namespace, owner.Name, redactionDataKey, initialValue, "v1"); err != nil {
 		t.Fatalf("seed CreateOrUpdate() error = %v, want nil", err)
 	}
 
@@ -313,7 +324,7 @@ func TestRedaction_Writer_CreateOrUpdate_Update_ValueOnlyInSecretData(t *testing
 	logger, logBuf := capturingLogger()
 	ctx := logf.IntoContext(context.Background(), logger)
 
-	if err := w.CreateOrUpdate(ctx, owner, owner.Namespace, owner.Name, "value", sentinel, "v2"); err != nil {
+	if err := w.CreateOrUpdate(ctx, owner, owner.Namespace, owner.Name, redactionDataKey, sentinel, "v2"); err != nil {
 		t.Fatalf("update CreateOrUpdate() error = %v, want nil", err)
 	}
 
@@ -323,7 +334,7 @@ func TestRedaction_Writer_CreateOrUpdate_Update_ValueOnlyInSecretData(t *testing
 	if err := cli.Get(ctx, client.ObjectKey{Namespace: owner.Namespace, Name: owner.Name}, &got); err != nil {
 		t.Fatalf("get updated secret: %v", err)
 	}
-	if string(got.Data["value"]) != sentinel {
+	if string(got.Data[redactionDataKey]) != sentinel {
 		t.Fatalf("expected the sentinel in the updated Secret's Data; got %+v", got.Data)
 	}
 }
@@ -346,7 +357,7 @@ func TestRedaction_Writer_CreateOrUpdate_TargetConflict_NoValueInError(t *testin
 	logger, logBuf := capturingLogger()
 	ctx := logf.IntoContext(context.Background(), logger)
 
-	err := w.CreateOrUpdate(ctx, owner, owner.Namespace, owner.Name, "value", sentinel, "v1")
+	err := w.CreateOrUpdate(ctx, owner, owner.Namespace, owner.Name, redactionDataKey, sentinel, "v1")
 	if err == nil {
 		t.Fatal("CreateOrUpdate() error = nil, want ErrTargetConflict")
 	}
@@ -357,7 +368,7 @@ func TestRedaction_Writer_CreateOrUpdate_TargetConflict_NoValueInError(t *testin
 	if getErr := cli.Get(ctx, client.ObjectKey{Namespace: owner.Namespace, Name: owner.Name}, &got); getErr != nil {
 		t.Fatalf("get unmanaged secret: %v", getErr)
 	}
-	if _, ok := got.Data["value"]; ok {
+	if _, ok := got.Data[redactionDataKey]; ok {
 		t.Fatalf("unmanaged Secret must not have gained the vault's data key: %+v", got.Data)
 	}
 }
@@ -387,7 +398,7 @@ func TestRedaction_Writer_CreateOrUpdate_TargetImmutable_NoValueInError(t *testi
 		},
 		Type:      corev1.SecretTypeOpaque,
 		Immutable: &frozen,
-		Data:      map[string][]byte{"value": []byte("non-sentinel-frozen-value")},
+		Data:      map[string][]byte{redactionDataKey: []byte("non-sentinel-frozen-value")},
 	}
 	cli := fake.NewClientBuilder().WithScheme(redactionScheme(t)).WithObjects(managed).Build()
 	w := &SecretWriter{Client: cli, Reader: cli}
@@ -395,7 +406,7 @@ func TestRedaction_Writer_CreateOrUpdate_TargetImmutable_NoValueInError(t *testi
 	logger, logBuf := capturingLogger()
 	ctx := logf.IntoContext(context.Background(), logger)
 
-	err := w.CreateOrUpdate(ctx, owner, owner.Namespace, owner.Name, "value", sentinel, "v2")
+	err := w.CreateOrUpdate(ctx, owner, owner.Namespace, owner.Name, redactionDataKey, sentinel, "v2")
 	if err == nil {
 		t.Fatal("CreateOrUpdate() error = nil, want ErrTargetImmutable")
 	}
@@ -406,7 +417,7 @@ func TestRedaction_Writer_CreateOrUpdate_TargetImmutable_NoValueInError(t *testi
 	if getErr := cli.Get(ctx, client.ObjectKey{Namespace: owner.Namespace, Name: owner.Name}, &got); getErr != nil {
 		t.Fatalf("get immutable secret: %v", getErr)
 	}
-	if string(got.Data["value"]) != "non-sentinel-frozen-value" {
+	if string(got.Data[redactionDataKey]) != "non-sentinel-frozen-value" {
 		t.Fatalf("frozen Secret's data must not have been rewritten: %+v", got.Data)
 	}
 }
@@ -460,7 +471,7 @@ func TestValueCarryingSources_NeverLogValueIdentifiers(t *testing.T) {
 		{
 			path: "writer.go",
 			valueIdents: map[string]map[string]bool{
-				"value": noSafeFields, "existing": noSafeFields, "secret": noSafeFields,
+				valueIdent: noSafeFields, "existing": noSafeFields, "secret": noSafeFields,
 			},
 		},
 		{
@@ -472,7 +483,7 @@ func TestValueCarryingSources_NeverLogValueIdentifiers(t *testing.T) {
 			// listed too, with only the identity fields it legitimately logs
 			// today allowed through.
 			valueIdents: map[string]map[string]bool{
-				"value": noSafeFields, "desired": noSafeFields, "existing": noSafeFields,
+				valueIdent: noSafeFields, "desired": noSafeFields, "existing": noSafeFields,
 				"fetched": noSafeFields, "priorData": noSafeFields,
 				"secret": {"Name": true, "Namespace": true},
 			},
