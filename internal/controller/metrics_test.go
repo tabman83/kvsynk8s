@@ -142,7 +142,14 @@ func collectState(t *testing.T) (states map[string]float64, oldest float64, foun
 // registerSyncMetrics prevents, and it is load-bearing rather than tidiness,
 // so it gets a test of its own.
 func TestRegisterSyncMetrics_RegistersEveryFamily_AndIsIdempotent(t *testing.T) {
-	reader := fake.NewClientBuilder().WithScheme(metricsScheme(t)).Build()
+	// Seeded with one InSync object, because the oldest-successful-sync gauge
+	// is deliberately not emitted when nothing is InSync (0 is not a
+	// timestamp). Registration and emission are different things, and this
+	// test is about registration, so the fleet has to give the collector
+	// something true to say.
+	reader := fake.NewClientBuilder().WithScheme(metricsScheme(t)).WithObjects(
+		stateSync("registered-in-sync", kvsynk8sv1alpha1.SecretSyncStateInSync, time.Now()),
+	).Build()
 	useStateReader(t, reader)
 
 	// Twice, exactly as two managers in one process would.
@@ -225,12 +232,53 @@ func TestStateCollector_EmptyFleet_EmitsEveryStateAtZero(t *testing.T) {
 			t.Errorf("kvsynk8s_secretsync_state{state=%q} = %v, want 0", state, value)
 		}
 	}
-	if !found {
-		t.Error("oldest-successful-sync gauge missing for an empty fleet, want it present at 0")
+	// The timestamp gauge is the exception to the present-at-zero rule above.
+	// A count of 0 is a true count; 0 is not a time. Emitting it would make
+	// the obvious staleness alert, `time() - <gauge>`, report a sync in 1970
+	// and fire on a cluster that simply has no SecretSyncs yet.
+	if found {
+		t.Errorf("oldest-successful-sync gauge present (%v) with nothing InSync, want the series absent", oldest)
 	}
-	if oldest != 0 {
-		t.Errorf("oldest successful sync gauge = %v, want 0 when nothing is InSync", oldest)
+}
+
+// TestStateCollector_BlockingCache_DoesNotHangTheScrape pins the deadline on
+// the collector's List.
+//
+// The manager starts its metrics server before its caches, so a scrape can
+// land while the SecretSync informer has started but not synced. In that
+// window the cached client does not fail -- it BLOCKS in WaitForCacheSync
+// until its context is done, and an informer that can never sync (RBAC drift,
+// or the CRD removed) means never. Without the deadline this Collect would
+// hang, and with it the entire /metrics response, including controller-runtime's
+// own counters. The other failure test uses a reader that returns immediately,
+// which cannot catch that at all.
+func TestStateCollector_BlockingCache_DoesNotHangTheScrape(t *testing.T) {
+	useStateReader(t, blockingReader{})
+
+	done := make(chan struct{})
+	var found bool
+	go func() {
+		defer close(done)
+		_, _, found = collectState(t)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(collectTimeout + 5*time.Second):
+		t.Fatal("collector did not return: the scrape-path List has no deadline")
 	}
+	if found {
+		t.Error("collector reported a timestamp from a cache it never read")
+	}
+}
+
+// blockingReader models a started-but-unsynced informer: List does not fail,
+// it waits for the caller's context, exactly as the cached client does.
+type blockingReader struct{ client.Reader }
+
+func (blockingReader) List(ctx context.Context, _ client.ObjectList, _ ...client.ListOption) error {
+	<-ctx.Done()
+	return ctx.Err()
 }
 
 func TestStateCollector_NoReaderYet_EmitsNothing(t *testing.T) {

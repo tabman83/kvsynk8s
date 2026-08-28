@@ -226,3 +226,82 @@ func TestClassificationName(t *testing.T) {
 		})
 	}
 }
+
+// TestIsAuthFailure_TransientTokenEndpointAnswersStayTransient pins the one
+// exclusion in isAuthFailure. azidentity funnels an Entra ID 5xx and IMDS
+// throttling through the SAME *AuthenticationFailedError as a rejected
+// assertion, so without the RawResponse check an Azure outage would report as
+// AuthenticationFailed and send an operator auditing a federated credential
+// that is perfectly fine.
+func TestIsAuthFailure_TransientTokenEndpointAnswersStayTransient(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		wantAuth   bool
+	}{
+		{"entra 500 is transient", http.StatusInternalServerError, false},
+		{"entra 503 is transient", http.StatusServiceUnavailable, false},
+		{"imds throttling is transient", http.StatusTooManyRequests, false},
+		{"assertion rejected is an auth failure", http.StatusUnauthorized, true},
+		{"bad request is an auth failure", http.StatusBadRequest, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := &azidentity.AuthenticationFailedError{
+				RawResponse: &http.Response{StatusCode: tt.statusCode},
+			}
+			if got := isAuthFailure(err); got != tt.wantAuth {
+				t.Fatalf("isAuthFailure(status %d) = %v, want %v", tt.statusCode, got, tt.wantAuth)
+			}
+
+			wantSentinel := ErrTransient
+			if tt.wantAuth {
+				wantSentinel = ErrAuthFailure
+			}
+			if sentinel, _ := classifySentinel(err); !errors.Is(sentinel, wantSentinel) {
+				t.Fatalf("classifySentinel(status %d) = %v, want %v", tt.statusCode, sentinel, wantSentinel)
+			}
+		})
+	}
+}
+
+// TestAuthFailureKind covers the discriminator the log line reports. The two
+// kinds have completely different fixes -- nothing is wired up at all, versus
+// something tried and was refused -- and it is derived from the error's type,
+// never from its text, which is what makes it safe to log.
+func TestAuthFailureKind(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			"no credential could even try",
+			azidentity.NewCredentialUnavailableError("no client id and no projected token"),
+			authKindUnavailable,
+		},
+		{
+			"a credential tried and was refused",
+			&azidentity.AuthenticationFailedError{},
+			authKindRequestFailed,
+		},
+		{
+			"still classified through the bearer-policy wrapping",
+			doubleWrapped(&azidentity.AuthenticationFailedError{}),
+			authKindRequestFailed,
+		},
+		// Anything that is not an auth failure reports no kind at all, so the
+		// log line does not grow a field that would read as one.
+		{"a network error is not an auth failure", &net.OpError{Op: "dial", Err: errors.New("refused")}, ""},
+		{"an answered request is not an auth failure", &azcore.ResponseError{StatusCode: http.StatusForbidden}, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := authFailureKind(tt.err); got != tt.want {
+				t.Fatalf("authFailureKind() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

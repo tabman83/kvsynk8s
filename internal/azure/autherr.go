@@ -5,6 +5,7 @@ package azure
 
 import (
 	"errors"
+	"net/http"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 )
@@ -28,6 +29,42 @@ type nonRetriable interface {
 	NonRetriable()
 }
 
+// Auth-failure kinds, reported on the log line for an ErrAuthFailure. They are
+// derived from the error TYPE, never from its text, which is what makes them
+// safe to log: see authFailureKind.
+const (
+	// authKindUnavailable: no credential in the chain could even attempt a
+	// token request. In-cluster that means workload identity is not wired up
+	// at all -- no azure.workload.identity/client-id annotation, or no
+	// projected service-account token.
+	authKindUnavailable = "credential-unavailable"
+	// authKindRequestFailed: a credential tried and did not get a token. A
+	// wrong client ID, a federated credential whose subject or issuer does not
+	// match, or no egress to the Entra ID endpoint.
+	authKindRequestFailed = "token-request-failed"
+)
+
+// authFailureKind reports which half of the credential chain failed, or "" if
+// err is not an auth failure at all.
+//
+// The two kinds have completely different fixes, and this is as far as
+// classification can honestly go without rendering the SDK's own error text.
+// That text is deliberately never logged: an auth failure happens BEFORE any
+// response exists, which is exactly the class redact.go warns about -- a
+// transport error at that stage renders the full request URL, query string
+// included. Reporting the kind from the error's type carries no upstream
+// characters at all.
+func authFailureKind(err error) string {
+	if !isAuthFailure(err) {
+		return ""
+	}
+	var authFailed *azidentity.AuthenticationFailedError
+	if errors.As(err, &authFailed) {
+		return authKindRequestFailed
+	}
+	return authKindUnavailable
+}
+
 // isAuthFailure reports whether err is the Azure credential chain failing to
 // produce a token, rather than a service answering the request.
 //
@@ -42,6 +79,20 @@ type nonRetriable interface {
 func isAuthFailure(err error) bool {
 	var authFailed *azidentity.AuthenticationFailedError
 	if errors.As(err, &authFailed) {
+		// The token endpoint answered, and it answered with something that
+		// clears on its own: Entra ID having a bad day, or IMDS throttling.
+		// azidentity funnels those through the same error type as a rejected
+		// assertion, so without this check an Entra outage would be reported
+		// as broken federation and send an operator auditing a federated
+		// credential that is perfectly fine.
+		//
+		// Checked before the marker interface below, not instead of it:
+		// *AuthenticationFailedError implements NonRetriable() too, so simply
+		// falling through would match it there anyway.
+		if r := authFailed.RawResponse; r != nil &&
+			(r.StatusCode == http.StatusTooManyRequests || r.StatusCode >= http.StatusInternalServerError) {
+			return false
+		}
 		return true
 	}
 	var unavailable nonRetriable

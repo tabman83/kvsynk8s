@@ -215,18 +215,31 @@ func secretIsDisabled(attrs *azsecrets.SecretAttributes) bool {
 //     error's own string, and that string is the upstream text this package
 //     refuses to echo. cmd/main.go uses the same Error(nil, ...) idiom for
 //     the same reason.
-//   - Only the status code — an int — crosses the boundary. Nothing from the
-//     response body does, exactly as isDisabledSecretResponse below already
-//     reads the body to classify and never forwards it.
+//   - Only the status code — an int — and, for an auth failure, a fixed
+//     kind literal cross the boundary. Nothing from the response body or from
+//     the SDK error's own text does, exactly as isDisabledSecretResponse below
+//     already reads the body to classify and never forwards it.
 //   - This detail goes to the operator log and deliberately NOT into
 //     status.Message, which is bound by the identifiers-and-fixed-text rule
 //     because anyone with read access to the CR can see it.
 func classifyGetSecretError(ctx context.Context, vaultName, secretName string, err error) error {
 	sentinel, statusCode := classifySentinel(err)
 
-	logf.FromContext(ctx).Error(nil, "key vault read failed",
+	keys := []any{
 		"vault", vaultName, "secret", secretName,
-		"statusCode", statusCode, "classification", classificationName(sentinel))
+		"statusCode", statusCode, "classification", classificationName(sentinel),
+	}
+	// On an auth failure there is no status code to report (the request never
+	// went out), so the log would otherwise say only "AuthenticationFailed"
+	// and leave an operator to guess between a missing annotation and a
+	// mismatched federated credential. authFailureKind answers that from the
+	// error's TYPE, carrying no upstream characters -- see its comment for why
+	// the SDK's own text is not logged instead.
+	if kind := authFailureKind(err); kind != "" {
+		keys = append(keys, "authFailure", kind)
+	}
+
+	logf.FromContext(ctx).Error(nil, "key vault read failed", keys...)
 
 	return fmt.Errorf("vault %q secret %q: %w", vaultName, secretName, sentinel)
 }

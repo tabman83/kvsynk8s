@@ -47,10 +47,15 @@ var (
 	// queueMessagesTotal closes the one gap the two gauges above honestly
 	// cannot see. They prove the operator can reach the queue; they say
 	// nothing about whether the messages arriving are the ones anyone wanted.
-	// An "unmatched" message in particular is the exact signature of a
-	// vault-name typo or a spec.vault.secret that names nothing real -- the
-	// realtime path is then dead for that declaration while both gauges look
-	// perfectly healthy.
+	// An "unmatched" message is an event for a vault secret no SecretSync
+	// declares. With a vault-scoped Event Grid subscription -- the setup this
+	// project documents -- that is ordinary traffic, not a fault: every
+	// undeclared secret in the vault produces one on every rotation. It
+	// becomes a signal when read against "dispatched": unmatched moving while
+	// dispatched stays flat, right after a rotation that was supposed to
+	// propagate, means a typo in a spec.vault or spec.vault.secret. The
+	// realtime path is then dead for that declaration while both gauges above
+	// look perfectly healthy.
 	//
 	// One label, drawn from a closed five-value vocabulary, so this is five
 	// series forever. Nothing derived from a message body, a vault name or a
@@ -59,7 +64,8 @@ var (
 		Name: "kvsynk8s_queue_messages_total",
 		Help: "Queue messages handled, by outcome: dispatched (matched at least one " +
 			"SecretSync and triggered a reconcile), unmatched (no SecretSync declares " +
-			"that vault secret), nonactionable (an event type this operator ignores), " +
+			"that vault secret; expected traffic when the Event Grid subscription covers " +
+			"a whole vault), nonactionable (an event type this operator ignores), " +
 			"malformed (undecodable body), poison (exceeded the dequeue threshold and " +
 			"was dropped unparsed).",
 	}, []string{"outcome"})

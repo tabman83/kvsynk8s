@@ -281,13 +281,17 @@ func (l *Listener) handleMessage(ctx context.Context, m azure.QueueMessage) {
 		return
 	}
 	if len(matches) == 0 {
-		// Rule 3: no declaration cares about this vault+secret. Logged at
-		// default verbosity, unlike the non-actionable discard above: other
-		// event types on a shared queue are routine traffic, but a Key Vault
-		// secret event nothing declares usually means a typo in a spec.vault,
-		// and that leaves the realtime path dead for that declaration with
-		// nothing else to show for it.
-		log.Info("discarding unmatched event",
+		// Rule 3: no declaration cares about this vault+secret. Stays at V(1)
+		// like the non-actionable discard above, because with the vault-scoped
+		// Event Grid subscription this project documents it is ordinary
+		// traffic: every undeclared secret in the vault produces one of these
+		// on every rotation, so logging it at default verbosity would be pure
+		// noise on a busy vault. kvsynk8s_queue_messages_total{outcome=
+		// "unmatched"} is the signal instead -- it costs nothing per message,
+		// and it is the counter moving while "dispatched" stays flat, right
+		// after a rotation you expected to propagate, that means a typo in a
+		// spec.vault. Turn on V(1) to see which secret.
+		log.V(1).Info("discarding unmatched event",
 			"messageID", m.ID, "eventID", parsed.ID, "vault", parsed.VaultName, "secret", parsed.SecretName)
 		recordMessageOutcome("unmatched")
 		l.deleteMessage(ctx, m)

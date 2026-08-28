@@ -713,19 +713,21 @@ func containsMsg(msgs []string, want string) bool {
 	return false
 }
 
-// TestListener_UnmatchedEvent_LoggedAtDefaultVerbosity pins the split in
-// verbosity between the two clean-discard branches of handleMessage. Both used
-// to be V(1), which made them invisible in a normal deployment — and an
-// unmatched Key Vault secret event is almost always a typo in a spec.vault or
-// spec.vault.secret, which kills the realtime path for that SecretSync while
-// every queue health gauge stays green. So "discarding unmatched event" must
-// survive at default verbosity, while "discarding non-actionable event" must
-// not: other event types on a shared queue are routine traffic and would drown
-// the useful line.
+// TestListener_CleanDiscards_StayAtV1 pins both clean-discard branches of
+// handleMessage at V(1), i.e. invisible at a normal deployment's log level.
+//
+// It is tempting to promote the unmatched one, since an unmatched Key Vault
+// secret event can mean a typo in a spec.vault that kills the realtime path
+// for that SecretSync while every queue health gauge stays green. But with the
+// vault-scoped Event Grid subscription this project documents, an unmatched
+// event is ORDINARY traffic: every undeclared secret in the vault produces one
+// on every rotation, so at default verbosity a busy vault would drown the log
+// in lines that mean nothing is wrong. kvsynk8s_queue_messages_total{outcome}
+// carries that signal instead, for free, and is the thing to alert on.
 //
 // Only messages are asserted here, no log keys: redaction_test.go pins a closed
 // allow-list for this package's keys and nothing new may be introduced.
-func TestListener_UnmatchedEvent_LoggedAtDefaultVerbosity(t *testing.T) {
+func TestListener_CleanDiscards_StayAtV1(t *testing.T) {
 	// A SecretSync exists, but for another vault, so the secret event below
 	// matches nothing.
 	cli := fakeClientWith(t, newSecretSync("ns-a", "sync-a", "other-vault", testObject))
@@ -749,15 +751,16 @@ func TestListener_UnmatchedEvent_LoggedAtDefaultVerbosity(t *testing.T) {
 		t.Fatalf("pollOnce() error = %v, want nil", err)
 	}
 
-	if !containsMsg(*msgs, "discarding unmatched event") {
-		t.Errorf("no \"discarding unmatched event\" line at default verbosity; logged: %v", *msgs)
+	if containsMsg(*msgs, "discarding unmatched event") {
+		t.Errorf("\"discarding unmatched event\" logged at default verbosity, want V(1) only "+
+			"(it is ordinary traffic on a vault-scoped subscription); logged: %v", *msgs)
 	}
 	if containsMsg(*msgs, "discarding non-actionable event") {
 		t.Errorf("\"discarding non-actionable event\" logged at default verbosity, want V(1) only; logged: %v", *msgs)
 	}
 
-	// And at V(1) both are visible, so the non-actionable discard is still
-	// debuggable rather than silently gone.
+	// At V(1) both are visible, so an operator chasing a specific secret that
+	// is not propagating can still see exactly which events were discarded.
 	verbose, verboseMsgs := newVerbosityLogger(1)
 	queue = newFakeQueueSource([]azure.QueueMessage{unmatched, nonActionable})
 	l = NewListener(queue, cli, make(chan event.GenericEvent, 10))
@@ -766,6 +769,9 @@ func TestListener_UnmatchedEvent_LoggedAtDefaultVerbosity(t *testing.T) {
 	}
 	if !containsMsg(*verboseMsgs, "discarding non-actionable event") {
 		t.Errorf("no \"discarding non-actionable event\" line at V(1); logged: %v", *verboseMsgs)
+	}
+	if !containsMsg(*verboseMsgs, "discarding unmatched event") {
+		t.Errorf("no \"discarding unmatched event\" line at V(1); logged: %v", *verboseMsgs)
 	}
 }
 

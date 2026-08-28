@@ -361,7 +361,7 @@ are the starting point for everything below.
 |---|---|---|
 | `SecretNotFound` | The vault secret does not exist (and this `SecretSync` never had a prior successful sync). | Vault name and secret name in `spec.vault`; that the secret actually exists in that vault. |
 | `AccessDenied` | The operator got an Azure token, but that identity is not allowed to read this secret. | The `Key Vault Secrets User` role assignment on the vault, and that it is on the right vault and the right identity. |
-| `AuthenticationFailed` | The operator could not get an Azure token at all, so the request never reached Key Vault. Workload identity is not wired up. Different from `AccessDenied`, where the token was fine and the role assignment was not. | The ServiceAccount's `azure.workload.identity/client-id` annotation; the federated credential's issuer and subject matching the namespace and ServiceAccount name; that the pod actually gets a projected token. The operator log carries the Azure SDK's own diagnostic, which names the specific problem. |
+| `AuthenticationFailed` | The operator could not get an Azure token at all, so the request never reached Key Vault. Workload identity is not wired up. Different from `AccessDenied`, where the token was fine and the role assignment was not. | The ServiceAccount's `azure.workload.identity/client-id` annotation; the federated credential's issuer and subject matching the namespace and ServiceAccount name; that the pod actually gets a projected token. The operator log narrows it down: the `key vault read failed` line carries `authFailure=credential-unavailable` when nothing in the credential chain could even try (no annotation, no projected token) or `authFailure=token-request-failed` when something tried and Azure refused (wrong client ID, subject or issuer mismatch, or no egress to `login.microsoftonline.com`). The SDK's own error text is deliberately not logged, so check the three above in order. |
 | `TargetConflict` | The target Kubernetes Secret already exists and was not created by kvsynk8s, or another `SecretSync` already claims the same namespace + `target.secretName`. | Whether the Secret name collides with something you did not intend it to; if two `SecretSync` objects are meant to target the same Secret, that is not supported — use one `SecretSync`. |
 | `SourceDeleted` | The vault secret used to exist (this `SecretSync` had a prior synced version) and Key Vault now reports it missing. The Kubernetes Secret is left at its last synced value. | Whether the secret was deleted/purged in Key Vault on purpose; restore it there if not. |
 | `SourceDisabled` | The vault secret exists but is administratively disabled. Same keep-last-known-good behavior as `SourceDeleted`. | Whether it was disabled on purpose; re-enable it in Key Vault if not. |
@@ -401,7 +401,7 @@ The queue path, only when a queue URL is configured:
 |---|---|
 | `kvsynk8s_queue_last_successful_receive_timestamp_seconds` | Unix time of the last successful queue receive (empty receives count). If this stops moving, the operator cannot reach the queue. |
 | `kvsynk8s_queue_consecutive_receive_failures` | Failed receive calls in a row since the last success. 0 while healthy; a growing value means the queue path is down (network, auth, queue URL). |
-| `kvsynk8s_queue_messages_total{outcome}` | Messages handled, by outcome: `dispatched`, `unmatched`, `nonactionable`, `malformed`, `poison`. |
+| `kvsynk8s_queue_messages_total{outcome}` | Messages handled, by outcome: `dispatched`, `unmatched`, `nonactionable`, `malformed`, `poison`. `unmatched` is ordinary traffic when the Event Grid subscription covers a whole vault — every undeclared secret in it produces one on each rotation. Read it against `dispatched`, see below. |
 
 No metric carries a per-object, vault or secret-name label. Every label value
 comes from a fixed list. That keeps the series count flat as the fleet grows,
@@ -416,28 +416,43 @@ reconciliation keeps converging secrets.
 
 One honest limit remains. A broken or deleted Event Grid subscription still
 produces successful empty receives, so the receive metrics look healthy while
-no event ever arrives. `kvsynk8s_queue_messages_total` catches the other half
-of that problem — a steady `unmatched` count means events are arriving for a
-vault secret no `SecretSync` declares, which is almost always a typo in a
-`spec.vault` — but nothing on the operator side can see a subscription that
+no event ever arrives. Nothing on the operator side can see a subscription that
 was deleted upstream. If rotations only propagate at the reconcile interval
 while the receive metrics look fine, check the Event Grid subscription
 configuration (previous paragraph).
+
+`kvsynk8s_queue_messages_total` catches the other half of the problem, but it
+has to be read the right way. On a vault-scoped subscription an `unmatched`
+count is not a fault on its own — it just means the vault holds secrets nobody
+declared. What matters is `unmatched` moving while `dispatched` stays flat,
+right after a rotation you expected to propagate: that is a typo in a
+`spec.vault` or `spec.vault.secret`, and the realtime path is dead for that
+declaration while every health gauge stays green. Run the operator at `-v=1` to
+see which vault and secret each discarded event named.
 
 **Events.** The operator also records Kubernetes Events on each `SecretSync`:
 `Normal` `Synced` after a successful sync, `Warning` `SyncFailed` carrying
 `<reason>: <message>`. `kubectl -n <ns> describe secretsync <name>` shows the
 recent history without going near the operator logs.
 
-**Reading the logs.** A `SecretSync` entering `Failing` logs one line at
-default verbosity with its reason and message, and a single line when it
-recovers, so a normal (non-debug) log level shows both the break and the fix.
-Failed Key Vault reads additionally log the HTTP status code Key Vault
-returned, and a failed Azure token acquisition logs the SDK's own diagnostic,
-which is what actually names a broken federated credential. That detail is
-deliberately in the log and not in `status.message`: anyone with read access to
-the CR can see the status, and upstream error text is not something this
-project has audited for what it might echo back.
+**Reading the logs.** Every reconcile that ends in `Failing` logs a line at
+default verbosity with its reason and message, so a failure that keeps
+repeating keeps showing up: quickly at first for the reasons that retry with
+backoff, then once per reconcile interval for the ones only a human can clear.
+Recovery is logged once, on the way out of `Failing`, not on every healthy
+pass. So a normal (non-debug) log level shows both the break and the fix.
+
+Failed Key Vault reads add a `key vault read failed` line carrying the HTTP
+status code and the classification, which is what tells a 429 from a 500 from
+a DNS failure. A failed token acquisition has no status code to report (the
+request never went out), so it carries `authFailure=` instead, saying whether
+no credential was available at all or one tried and was refused.
+
+What you will not find in the logs is the Azure SDK's own error text. It is
+deliberately never printed: a failure that happens before any response exists
+is exactly the kind that renders the full request URL, query string included,
+and this project does not print URLs it has not redacted. Everything the log
+does carry is either a fixed string or a value this code produced itself.
 
 **No secret value ever appears in logs, status, or events, by design.**
 Every message references a `SecretSync` only by vault name, secret name,

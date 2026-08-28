@@ -7,6 +7,7 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -52,7 +53,8 @@ var (
 	oldestSuccessfulSync = prometheus.NewDesc(
 		"kvsynk8s_secretsync_oldest_successful_sync_timestamp_seconds",
 		"Unix timestamp of the oldest status.lastSyncTime among SecretSyncs that are "+
-			"currently InSync, or 0 when none are. Restricted to InSync on purpose: a "+
+			"currently InSync. Not emitted at all when no object is InSync, because 0 is "+
+			"not a timestamp. Restricted to InSync on purpose: a "+
 			"Failing object keeps its last successful sync time frozen forever, so "+
 			"including it would pin this gauge permanently and only duplicate what "+
 			"kvsynk8s_secretsync_state already reports.",
@@ -68,6 +70,11 @@ var (
 
 	registerSyncMetricsOnce sync.Once
 )
+
+// collectTimeout bounds one scrape's read of the cache. Comfortably longer
+// than an indexer read, comfortably shorter than any sane Prometheus scrape
+// timeout.
+const collectTimeout = 2 * time.Second
 
 // stateCollector reports the per-state counts and the oldest successful sync
 // at scrape time, by listing SecretSyncs from the manager's cache.
@@ -94,10 +101,25 @@ func (stateCollector) Collect(ch chan<- prometheus.Metric) {
 		return
 	}
 
+	// A bounded context, not context.Background(). The manager starts its
+	// metrics server BEFORE its caches, on purpose, so metrics and probes are
+	// up while the caches sync. In that window the cached client does not
+	// return an error for an informer that has started but not synced -- it
+	// blocks in cache.WaitForCacheSync until its context is done, which for
+	// context.Background() is never. An unbounded read here would therefore
+	// hang this Collect, and with it the whole /metrics response, including
+	// controller-runtime's own counters and the queue gauges. That is exactly
+	// when an operator needs the endpoint to answer: an informer that cannot
+	// sync means RBAC drift on secretsyncs, or the CRD is gone. The deadline
+	// turns that back into the error case below.
+	ctx, cancel := context.WithTimeout(context.Background(), collectTimeout)
+	defer cancel()
+
 	var list kvsynk8sv1alpha1.SecretSyncList
-	if err := (*readerPtr).List(context.Background(), &list); err != nil {
-		// The cache may not have synced yet. Same reasoning as above: report
-		// nothing rather than something untrue.
+	if err := (*readerPtr).List(ctx, &list); err != nil {
+		// Cache not started, informer not synced, or no REST mapping for the
+		// CRD yet. Same reasoning as above: report nothing rather than
+		// something untrue.
 		return
 	}
 
@@ -127,7 +149,16 @@ func (stateCollector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(
 			secretSyncState, prometheus.GaugeValue, float64(count), string(state))
 	}
-	ch <- prometheus.MustNewConstMetric(oldestSuccessfulSync, prometheus.GaugeValue, float64(oldest))
+	// Not emitted at all when nothing is InSync. Zero would not be a
+	// timestamp: the obvious staleness alert, `time() - <gauge>`, reads it as
+	// a sync in 1970 and would fire from the moment the chart is installed on
+	// a cluster that has no SecretSyncs yet. Absent is the honest answer, and
+	// kvsynk8s_secretsync_state already says how many objects exist and in
+	// what state. Note this is the one series here that may be absent: a
+	// per-state count of 0 is a true measurement and stays present.
+	if oldest != 0 {
+		ch <- prometheus.MustNewConstMetric(oldestSuccessfulSync, prometheus.GaugeValue, float64(oldest))
+	}
 }
 
 // registerSyncMetrics registers the sync-path metrics with the
