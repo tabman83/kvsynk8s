@@ -248,6 +248,7 @@ func (l *Listener) handleMessage(ctx context.Context, m azure.QueueMessage) {
 	if m.DequeueCount > l.PoisonThreshold {
 		log.Info("discarding poison message",
 			"messageID", m.ID, "dequeueCount", m.DequeueCount)
+		recordMessageOutcome(outcomePoison)
 		l.deleteMessage(ctx, m)
 		return
 	}
@@ -258,6 +259,7 @@ func (l *Listener) handleMessage(ctx context.Context, m azure.QueueMessage) {
 		// err itself is guaranteed to carry only fixed, static text (parser.go).
 		log.Info("discarding malformed message",
 			"messageID", m.ID, "dequeueCount", m.DequeueCount, "reason", err.Error())
+		recordMessageOutcome(outcomeMalformed)
 		l.deleteMessage(ctx, m)
 		return
 	}
@@ -265,6 +267,7 @@ func (l *Listener) handleMessage(ctx context.Context, m azure.QueueMessage) {
 		// Rule 2: an event type/object type this operator does not act on.
 		// A clean, expected discard -- not worth logging at normal verbosity.
 		log.V(1).Info("discarding non-actionable event", "messageID", m.ID)
+		recordMessageOutcome(outcomeNonActionable)
 		l.deleteMessage(ctx, m)
 		return
 	}
@@ -278,9 +281,19 @@ func (l *Listener) handleMessage(ctx context.Context, m azure.QueueMessage) {
 		return
 	}
 	if len(matches) == 0 {
-		// Rule 3: no declaration cares about this vault+secret.
+		// Rule 3: no declaration cares about this vault+secret. Stays at V(1)
+		// like the non-actionable discard above, because with the vault-scoped
+		// Event Grid subscription this project documents it is ordinary
+		// traffic: every undeclared secret in the vault produces one of these
+		// on every rotation, so logging it at default verbosity would be pure
+		// noise on a busy vault. kvsynk8s_queue_messages_total{outcome=
+		// "unmatched"} is the signal instead -- it costs nothing per message,
+		// and it is the counter moving while "dispatched" stays flat, right
+		// after a rotation you expected to propagate, that means a typo in a
+		// spec.vault. Turn on V(1) to see which secret.
 		log.V(1).Info("discarding unmatched event",
 			"messageID", m.ID, "eventID", parsed.ID, "vault", parsed.VaultName, "secret", parsed.SecretName)
+		recordMessageOutcome(outcomeUnmatched)
 		l.deleteMessage(ctx, m)
 		return
 	}
@@ -300,6 +313,7 @@ func (l *Listener) handleMessage(ctx context.Context, m azure.QueueMessage) {
 	log.Info("dispatched reconcile requests for event",
 		"messageID", m.ID, "eventID", parsed.ID, "vault", parsed.VaultName, "secret", parsed.SecretName,
 		"version", parsed.Version, "matches", len(matches))
+	recordMessageOutcome(outcomeDispatched)
 
 	// Rule 5: delete only after every matching sync has been accepted for
 	// processing (sent into Events above); sync failures are retried via

@@ -25,7 +25,14 @@ const (
 	// SecretSync never had a prior synced version to fall back to.
 	ReasonSecretNotFound = "SecretNotFound"
 	// ReasonAccessDenied: the operator's identity cannot read the secret.
+	// The token was accepted; the role assignment on the vault is missing.
 	ReasonAccessDenied = "AccessDenied"
+	// ReasonAuthenticationFailed: no Azure token could be acquired at all, so
+	// the request never reached the vault — workload identity is not wired up.
+	// Split out from ReasonTransientError, where it used to land: an unwired
+	// identity never clears on its own, and "the controller retries" is the
+	// wrong thing to tell an operator staring at one.
+	ReasonAuthenticationFailed = "AuthenticationFailed"
 	// ReasonSourceDeleted: the vault secret used to exist (this SecretSync
 	// had already synced a version) and the vault now reports it missing.
 	// FR-013: the managed Secret keeps its last synced value untouched.
@@ -253,6 +260,9 @@ func classifyReaderError(err error, owner *kvsynk8sv1alpha1.SecretSync, managed 
 		return ReasonSourceDisabled, fmt.Sprintf("secret %q in vault %q is disabled", secretName, vault)
 	case errors.Is(err, azure.ErrAccessDenied):
 		return ReasonAccessDenied, fmt.Sprintf("access denied reading secret %q from vault %q", secretName, vault)
+	case errors.Is(err, azure.ErrAuthFailure):
+		return ReasonAuthenticationFailed, fmt.Sprintf(
+			"could not authenticate to Azure to read secret %q from vault %q", secretName, vault)
 	case errors.Is(err, azure.ErrTransient):
 		return ReasonTransientError, fmt.Sprintf("transient error reading secret %q from vault %q", secretName, vault)
 	default:

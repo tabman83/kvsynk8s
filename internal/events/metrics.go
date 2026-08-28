@@ -44,6 +44,32 @@ var (
 			"secrets still converge via periodic reconciliation.",
 	})
 
+	// queueMessagesTotal closes the one gap the two gauges above honestly
+	// cannot see. They prove the operator can reach the queue; they say
+	// nothing about whether the messages arriving are the ones anyone wanted.
+	// An "unmatched" message is an event for a vault secret no SecretSync
+	// declares. With a vault-scoped Event Grid subscription -- the setup this
+	// project documents -- that is ordinary traffic, not a fault: every
+	// undeclared secret in the vault produces one on every rotation. It
+	// becomes a signal when read against "dispatched": unmatched moving while
+	// dispatched stays flat, right after a rotation that was supposed to
+	// propagate, means a typo in a spec.vault or spec.vault.secret. The
+	// realtime path is then dead for that declaration while both gauges above
+	// look perfectly healthy.
+	//
+	// One label, drawn from a closed five-value vocabulary, so this is five
+	// series forever. Nothing derived from a message body, a vault name or a
+	// secret name ever becomes a label (constitution I, and cardinality).
+	queueMessagesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: queueMessagesMetric,
+		Help: "Queue messages handled, by outcome: dispatched (matched at least one " +
+			"SecretSync and triggered a reconcile), unmatched (no SecretSync declares " +
+			"that vault secret; expected traffic when the Event Grid subscription covers " +
+			"a whole vault), nonactionable (an event type this operator ignores), " +
+			"malformed (undecodable body), poison (exceeded the dequeue threshold and " +
+			"was dropped unparsed).",
+	}, []string{"outcome"})
+
 	registerQueueMetricsOnce sync.Once
 )
 
@@ -56,6 +82,7 @@ func registerQueueMetrics() {
 		metrics.Registry.MustRegister(
 			queueLastSuccessfulReceiveTimestamp,
 			queueConsecutiveReceiveFailures,
+			queueMessagesTotal,
 		)
 	})
 }
@@ -82,4 +109,23 @@ func (l *Listener) recordReceiveFailure() {
 	defer l.healthMu.Unlock()
 	l.consecutiveReceiveFailures++
 	queueConsecutiveReceiveFailures.Set(float64(l.consecutiveReceiveFailures))
+}
+
+// The queue-message counter's name and its closed outcome vocabulary. Named
+// constants rather than literals so the listener's call sites, the Help text
+// and the tests cannot drift apart.
+const (
+	queueMessagesMetric = "kvsynk8s_queue_messages_total"
+
+	outcomeDispatched    = "dispatched"
+	outcomeUnmatched     = "unmatched"
+	outcomeNonActionable = "nonactionable"
+	outcomeMalformed     = "malformed"
+	outcomePoison        = "poison"
+)
+
+// recordMessageOutcome counts one handled queue message. outcome is always one
+// of the five fixed literals named in queueMessagesTotal's help text.
+func recordMessageOutcome(outcome string) {
+	queueMessagesTotal.WithLabelValues(outcome).Inc()
 }

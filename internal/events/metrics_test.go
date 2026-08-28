@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -125,9 +126,19 @@ func TestListener_FailureTimestampUntouched_OnlyStalenessSignals(t *testing.T) {
 }
 
 func TestQueueMetrics_RegisteredWithControllerRuntimeRegistry(t *testing.T) {
-	// NewListener registers the gauges with the controller-runtime Registry
-	// (the one the manager's /metrics endpoint serves).
+	// NewListener registers the gauges AND the message-outcome counter with the
+	// controller-runtime Registry (the one the manager's /metrics endpoint
+	// serves). A metric registered with the default prometheus registry instead
+	// would never be scraped from this operator, so the name check is the whole
+	// point of this test.
 	_ = NewListener(&flakyQueueSource{}, fakeClientWith(t), make(chan event.GenericEvent, 1))
+
+	// A CounterVec with no children produces no MetricFamily at all, so
+	// materialise every outcome first. This doubles as the guard on the closed
+	// vocabulary asserted below.
+	for _, outcome := range queueOutcomes {
+		recordMessageOutcome(outcome)
+	}
 
 	families, err := metrics.Registry.Gather()
 	if err != nil {
@@ -136,15 +147,181 @@ func TestQueueMetrics_RegisteredWithControllerRuntimeRegistry(t *testing.T) {
 	want := map[string]bool{
 		"kvsynk8s_queue_last_successful_receive_timestamp_seconds": false,
 		"kvsynk8s_queue_consecutive_receive_failures":              false,
+		queueMessagesMetric: false,
 	}
+	var outcomeSeries []string
 	for _, mf := range families {
 		if _, ok := want[mf.GetName()]; ok {
 			want[mf.GetName()] = true
+		}
+		if mf.GetName() != queueMessagesMetric {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			for _, lp := range m.GetLabel() {
+				if lp.GetName() != "outcome" {
+					t.Errorf("kvsynk8s_queue_messages_total carries an unexpected label %q; "+
+						"only the closed-vocabulary \"outcome\" label may exist (constitution I, cardinality)",
+						lp.GetName())
+				}
+				outcomeSeries = append(outcomeSeries, lp.GetValue())
+			}
 		}
 	}
 	for name, found := range want {
 		if !found {
 			t.Errorf("metric %q not registered with the controller-runtime Registry", name)
 		}
+	}
+
+	// The vocabulary is closed: exactly the five documented outcomes, no more.
+	// A sixth series here means a new handleMessage branch invented a label
+	// value without anyone deciding it belongs in the metric's contract.
+	allowed := make(map[string]bool, len(queueOutcomes))
+	for _, outcome := range queueOutcomes {
+		allowed[outcome] = false
+	}
+	for _, got := range outcomeSeries {
+		seen, ok := allowed[got]
+		if !ok {
+			t.Errorf("kvsynk8s_queue_messages_total has outcome=%q, outside the closed vocabulary %v", got, queueOutcomes)
+			continue
+		}
+		if seen {
+			t.Errorf("kvsynk8s_queue_messages_total has duplicate series for outcome=%q", got)
+		}
+		allowed[got] = true
+	}
+	for outcome, seen := range allowed {
+		if !seen {
+			t.Errorf("kvsynk8s_queue_messages_total has no series for outcome=%q", outcome)
+		}
+	}
+}
+
+// queueOutcomes is the closed label vocabulary of kvsynk8s_queue_messages_total
+// (metrics.go). Kept here rather than exported from production code so the test
+// pins the contract independently of whatever the implementation happens to
+// pass to recordMessageOutcome.
+var queueOutcomes = []string{outcomeDispatched, outcomeUnmatched, outcomeNonActionable, outcomeMalformed, outcomePoison}
+
+// queueOutcomeCounts snapshots the current value of every outcome series. The
+// counter is a package-global shared by every test in this package, so the
+// outcome assertions below all work on deltas around one pollOnce rather than
+// on absolute values.
+func queueOutcomeCounts() map[string]float64 {
+	counts := make(map[string]float64, len(queueOutcomes))
+	for _, outcome := range queueOutcomes {
+		counts[outcome] = testutil.ToFloat64(queueMessagesTotal.WithLabelValues(outcome))
+	}
+	return counts
+}
+
+// TestListener_MessageOutcome_CountedExactlyOnce drives one message of each
+// shape through the listener and asserts it bumps its own outcome series by
+// exactly one and leaves the other four alone. This is what makes the metric
+// diagnostic rather than decorative: "unmatched" in particular is the only
+// signal an operator gets for a typo in spec.vault, and it is worthless if a
+// branch double-counts or gets attributed to the wrong outcome.
+func TestListener_MessageOutcome_CountedExactlyOnce(t *testing.T) {
+	matchingBody := string(encodedBody(eventPayload(testEventID, newVersionET, testVault, secretType, testObject, testVersion)))
+
+	tests := []struct {
+		name string
+		// declared is whether a SecretSync for testVault/testObject exists in
+		// the fake cache.
+		declared bool
+		msg      azure.QueueMessage
+		outcome  string
+	}{
+		{
+			// Above the dequeue threshold: dropped before it is even parsed,
+			// even though the body would otherwise have dispatched.
+			name:     "poison",
+			declared: true,
+			msg: azure.QueueMessage{
+				ID: "outcome-poison", PopReceipt: "pop-outcome-poison",
+				Text: matchingBody, DequeueCount: DefaultPoisonThreshold + 1,
+			},
+			outcome: "poison",
+		},
+		{
+			name:     "malformed body",
+			declared: true,
+			msg: azure.QueueMessage{
+				ID: "outcome-malformed", PopReceipt: "pop-outcome-malformed",
+				Text: "not-valid-base64!!!", DequeueCount: 1,
+			},
+			outcome: "malformed",
+		},
+		{
+			// A valid envelope carrying an event type this operator ignores.
+			name:     "non-actionable event type",
+			declared: true,
+			msg: azure.QueueMessage{
+				ID: "outcome-nonactionable", PopReceipt: "pop-outcome-nonactionable",
+				Text:         string(encodedBody(eventPayload(testEventID, nearExpiryET, testVault, secretType, testObject, testVersion))),
+				DequeueCount: 1,
+			},
+			outcome: "nonactionable",
+		},
+		{
+			// Well-formed secret event that no SecretSync declares.
+			name:     "unmatched",
+			declared: false,
+			msg: azure.QueueMessage{
+				ID: "outcome-unmatched", PopReceipt: "pop-outcome-unmatched",
+				Text:         string(encodedBody(eventPayload(testEventID, newVersionET, "no-such-vault", secretType, testObject, testVersion))),
+				DequeueCount: 1,
+			},
+			outcome: "unmatched",
+		},
+		{
+			name:     outcomeDispatched,
+			declared: true,
+			msg: azure.QueueMessage{
+				ID: "outcome-dispatched", PopReceipt: "pop-outcome-dispatched",
+				Text: matchingBody, DequeueCount: 1,
+			},
+			outcome: outcomeDispatched,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var objs []client.Object
+			if tt.declared {
+				objs = append(objs, newSecretSync("ns-a", "sync-a", testVault, testObject))
+			}
+			queue := newFakeQueueSource([]azure.QueueMessage{tt.msg})
+			events := make(chan event.GenericEvent, 10)
+			l := NewListener(queue, fakeClientWith(t, objs...), events)
+
+			before := queueOutcomeCounts()
+			if _, err := l.pollOnce(context.Background()); err != nil {
+				t.Fatalf("pollOnce() error = %v, want nil", err)
+			}
+			after := queueOutcomeCounts()
+
+			for _, outcome := range queueOutcomes {
+				want := float64(0)
+				if outcome == tt.outcome {
+					want = 1
+				}
+				if got := after[outcome] - before[outcome]; got != want {
+					t.Errorf("kvsynk8s_queue_messages_total{outcome=%q} moved by %v, want %v", outcome, got, want)
+				}
+			}
+
+			// Drain so the channel capacity never influences a later subtest.
+			for {
+				select {
+				case <-events:
+					continue
+				default:
+				}
+				break
+			}
+		})
 	}
 }

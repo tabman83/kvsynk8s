@@ -57,7 +57,7 @@ func transportError() error {
 	return &url.Error{
 		Op:  "Get",
 		URL: sasQueueURL,
-		Err: &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("no such host")},
+		Err: &net.OpError{Op: opDial, Net: "tcp", Err: errors.New("no such host")},
 	}
 }
 

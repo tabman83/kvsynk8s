@@ -358,7 +358,7 @@ func TestSync_RefusesUnmanagedExistingSecret_TargetConflict(t *testing.T) {
 			Labels:    map[string]string{"app": "someone-else"},
 		},
 		Type: corev1.SecretTypeOpaque,
-		Data: map[string][]byte{"unrelated-key": []byte("unrelated-value")},
+		Data: map[string][]byte{unrelatedKey: []byte(unrelatedValue)},
 	}
 
 	reader := &fakeSecretReader{value: sentinelValue, version: "v1"}
@@ -382,8 +382,8 @@ func TestSync_RefusesUnmanagedExistingSecret_TargetConflict(t *testing.T) {
 	if secret != existing {
 		t.Fatalf("Sync() must leave an unmanaged existing Secret completely untouched (same pointer)")
 	}
-	if string(secret.Data["unrelated-key"]) != "unrelated-value" {
-		t.Fatalf("unmanaged Secret data was modified: %q", secret.Data["unrelated-key"])
+	if string(secret.Data[unrelatedKey]) != unrelatedValue {
+		t.Fatalf("unmanaged Secret data was modified: %q", secret.Data[unrelatedKey])
 	}
 	if _, ok := secret.Data[owner.Spec.Vault.Secret]; ok {
 		t.Fatalf("unmanaged Secret must not gain the vault's data key, found %q", owner.Spec.Vault.Secret)

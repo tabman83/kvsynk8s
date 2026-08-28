@@ -123,7 +123,8 @@ type SecretSyncStatus struct {
 	SyncedVersion string `json:"syncedVersion,omitempty"`
 
 	// reason is a machine-readable failure reason. Known values: SecretNotFound,
-	// AccessDenied, TargetConflict, SourceDeleted, SourceDisabled, TransientError.
+	// AccessDenied, AuthenticationFailed, TargetConflict, TargetImmutable,
+	// SourceDeleted, SourceDisabled, SecretWriteFailed, TransientError.
 	// +optional
 	Reason string `json:"reason,omitempty"`
 
@@ -136,16 +137,40 @@ type SecretSyncStatus struct {
 	// controller.
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// conditions holds the standard Kubernetes conditions for this SecretSync.
+	// Exactly one type is set today, "Ready": True while the managed Secret
+	// reflects the current vault value, False with the failure reason
+	// otherwise, Unknown before the first sync attempt completes.
+	//
+	// It exists because nothing standard can key on status.state: this field
+	// is what makes `kubectl wait --for=condition=Ready secretsync/<name>`
+	// work, and what Argo CD and Flux health checks read.
+	// +optional
+	// +listType=map
+	// +listMapKey=type
+	// +patchStrategy=merge
+	// +patchMergeKey=type
+	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
 }
+
+// ConditionReady is the only condition type this operator sets. Its Reason is
+// the same vocabulary as status.reason, plus "Synced" for the success case and
+// "Pending" before the first attempt completes — metav1.Condition.Reason is
+// required and must be non-empty, so the success case cannot simply carry the
+// empty status.reason.
+const ConditionReady = "Ready"
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:shortName=ss
 // +kubebuilder:printcolumn:name="Vault",type=string,JSONPath=".spec.vault.name"
-// +kubebuilder:printcolumn:name="Secret",type=string,JSONPath=".spec.vault.secret"
+// +kubebuilder:printcolumn:name="Secret",type=string,JSONPath=".spec.vault.secret",priority=1
 // +kubebuilder:printcolumn:name="State",type=string,JSONPath=".status.state"
+// +kubebuilder:printcolumn:name="Reason",type=string,JSONPath=".status.reason"
 // +kubebuilder:printcolumn:name="Version",type=string,JSONPath=".status.syncedVersion"
 // +kubebuilder:printcolumn:name="Last Sync",type=date,JSONPath=".status.lastSyncTime"
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=".metadata.creationTimestamp"
 
 // SecretSync is the Schema for the secretsyncs API
 type SecretSync struct {

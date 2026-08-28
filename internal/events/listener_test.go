@@ -49,10 +49,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -61,6 +63,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	kvsynk8sv1alpha1 "github.com/tabman83/kvsynk8s/api/v1alpha1"
 	"github.com/tabman83/kvsynk8s/internal/azure"
@@ -665,6 +668,106 @@ func TestListener_NonActionableEvent_DeletedWithoutEmit(t *testing.T) {
 
 	if deleted := queue.deletedIDs(); len(deleted) != 1 || deleted[0] != "msg-near-expiry" {
 		t.Errorf("deleted = %v, want [msg-near-expiry] (non-actionable events are still consumed)", deleted)
+	}
+}
+
+// verbosityLogSink records the messages a logger emits together with their
+// verbosity level, and — unlike recordingLogSink in redaction_test.go, which
+// enables everything so it can audit keys on every path — it enables only the
+// levels a real deployment would. That is what makes it able to tell "logged"
+// from "logged, but invisible at the operator's verbosity".
+type verbosityLogSink struct {
+	maxLevel int
+	msgs     *[]string
+}
+
+// newVerbosityLogger returns a logger that drops anything above maxLevel, plus
+// the slice the messages that survived land in. maxLevel 0 is the operator's
+// default verbosity (no -zap-log-level flag).
+func newVerbosityLogger(maxLevel int) (logr.Logger, *[]string) {
+	msgs := &[]string{}
+	return logr.New(&verbosityLogSink{maxLevel: maxLevel, msgs: msgs}), msgs
+}
+
+func (s *verbosityLogSink) Init(logr.RuntimeInfo)        {}
+func (s *verbosityLogSink) Enabled(level int) bool       { return level <= s.maxLevel }
+func (s *verbosityLogSink) WithName(string) logr.LogSink { return s }
+
+func (s *verbosityLogSink) Info(_ int, msg string, _ ...any) {
+	*s.msgs = append(*s.msgs, msg)
+}
+
+func (s *verbosityLogSink) Error(_ error, msg string, _ ...any) {
+	*s.msgs = append(*s.msgs, msg)
+}
+
+func (s *verbosityLogSink) WithValues(...any) logr.LogSink { return s }
+
+var _ logr.LogSink = (*verbosityLogSink)(nil)
+
+func containsMsg(msgs []string, want string) bool {
+	return slices.Contains(msgs, want)
+}
+
+// TestListener_CleanDiscards_StayAtV1 pins both clean-discard branches of
+// handleMessage at V(1), i.e. invisible at a normal deployment's log level.
+//
+// It is tempting to promote the unmatched one, since an unmatched Key Vault
+// secret event can mean a typo in a spec.vault that kills the realtime path
+// for that SecretSync while every queue health gauge stays green. But with the
+// vault-scoped Event Grid subscription this project documents, an unmatched
+// event is ORDINARY traffic: every undeclared secret in the vault produces one
+// on every rotation, so at default verbosity a busy vault would drown the log
+// in lines that mean nothing is wrong. kvsynk8s_queue_messages_total{outcome}
+// carries that signal instead, for free, and is the thing to alert on.
+//
+// Only messages are asserted here, no log keys: redaction_test.go pins a closed
+// allow-list for this package's keys and nothing new may be introduced.
+func TestListener_CleanDiscards_StayAtV1(t *testing.T) {
+	// A SecretSync exists, but for another vault, so the secret event below
+	// matches nothing.
+	cli := fakeClientWith(t, newSecretSync("ns-a", "sync-a", "other-vault", testObject))
+
+	unmatched := azure.QueueMessage{
+		ID: "msg-verbosity-unmatched", PopReceipt: "pop-vu",
+		Text:         string(encodedBody(eventPayload(testEventID, newVersionET, "no-such-vault", secretType, testObject, testVersion))),
+		DequeueCount: 1,
+	}
+	nonActionable := azure.QueueMessage{
+		ID: "msg-verbosity-nonactionable", PopReceipt: "pop-vn",
+		Text:         string(encodedBody(eventPayload(testEventID, nearExpiryET, testVault, secretType, testObject, testVersion))),
+		DequeueCount: 1,
+	}
+
+	queue := newFakeQueueSource([]azure.QueueMessage{unmatched, nonActionable})
+	l := NewListener(queue, cli, make(chan event.GenericEvent, 10))
+
+	logger, msgs := newVerbosityLogger(0) // default verbosity: V(1) is dropped
+	if _, err := l.pollOnce(logf.IntoContext(context.Background(), logger)); err != nil {
+		t.Fatalf("pollOnce() error = %v, want nil", err)
+	}
+
+	if containsMsg(*msgs, "discarding unmatched event") {
+		t.Errorf("\"discarding unmatched event\" logged at default verbosity, want V(1) only "+
+			"(it is ordinary traffic on a vault-scoped subscription); logged: %v", *msgs)
+	}
+	if containsMsg(*msgs, "discarding non-actionable event") {
+		t.Errorf("\"discarding non-actionable event\" logged at default verbosity, want V(1) only; logged: %v", *msgs)
+	}
+
+	// At V(1) both are visible, so an operator chasing a specific secret that
+	// is not propagating can still see exactly which events were discarded.
+	verbose, verboseMsgs := newVerbosityLogger(1)
+	queue = newFakeQueueSource([]azure.QueueMessage{unmatched, nonActionable})
+	l = NewListener(queue, cli, make(chan event.GenericEvent, 10))
+	if _, err := l.pollOnce(logf.IntoContext(context.Background(), verbose)); err != nil {
+		t.Fatalf("pollOnce() error = %v, want nil", err)
+	}
+	if !containsMsg(*verboseMsgs, "discarding non-actionable event") {
+		t.Errorf("no \"discarding non-actionable event\" line at V(1); logged: %v", *verboseMsgs)
+	}
+	if !containsMsg(*verboseMsgs, "discarding unmatched event") {
+		t.Errorf("no \"discarding unmatched event\" line at V(1); logged: %v", *verboseMsgs)
 	}
 }
 

@@ -26,6 +26,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -222,19 +224,62 @@ func (r *SecretSyncReconciler) recordEvent(ss *kvsynk8sv1alpha1.SecretSync, even
 	r.Recorder.Eventf(ss, nil, eventType, reason, reason, message)
 }
 
-// recordSyncOutcome emits the terminal-state Event for one reconcile's
-// result, per T027: "Synced" on InSync, "SyncFailed" (carrying status.Reason
-// in its message) on Failing. Pending is not terminal (it is only ever set
-// once, transiently, before the very first conflict check/vault read) and
-// gets no event of its own.
-func (r *SecretSyncReconciler) recordSyncOutcome(ss *kvsynk8sv1alpha1.SecretSync, status kvsynk8sv1alpha1.SecretSyncStatus, targetName string) {
+// recordSyncOutcome is the single choke point for everything an operator can
+// observe about one reconcile's result: the Kubernetes Event (T027), the
+// sync-result counter, and the log line.
+//
+// "Synced" on InSync, "SyncFailed" (carrying status.Reason in its message) on
+// Failing. Pending is not terminal — it is only ever set once, transiently,
+// before the very first conflict check or vault read — so it gets no event, no
+// counter increment, and no log line of its own.
+//
+// The logs are here rather than at the three call sites for the same reason
+// the Event is: all three terminal paths already funnel through this function,
+// so nothing can grow a fourth exit that reports nothing. They log at default
+// verbosity on purpose. Production zap runs at info level, so the V(1) trace
+// at the end of Reconcile is invisible there, which used to mean a classified
+// failure produced no operator log at all — everything lived in status and the
+// Event, neither of which is where anyone looks while tailing logs. The
+// recovery line is gated on the transition out of Failing, so a healthy fleet
+// does not re-log every 4h and a brand-new declaration is not announced as a
+// recovery; the failing line is not gated, because a failure that keeps
+// repeating is itself the signal.
+//
+// status.Message is safe to log: every one of them is built from identifiers
+// and fixed text, never from an upstream error string (constitution I /
+// FR-010), which is what classifyReaderError and this file's own status
+// literals guarantee.
+func (r *SecretSyncReconciler) recordSyncOutcome(
+	ctx context.Context,
+	ss *kvsynk8sv1alpha1.SecretSync,
+	previousState kvsynk8sv1alpha1.SecretSyncState,
+	status kvsynk8sv1alpha1.SecretSyncStatus,
+	targetName string,
+) {
+	log := logf.FromContext(ctx)
+
 	switch status.State {
 	case kvsynk8sv1alpha1.SecretSyncStateInSync:
 		r.recordEvent(ss, corev1.EventTypeNormal, "Synced", fmt.Sprintf(
 			"synced secret %q (version %q) from vault %q into %s/%s",
 			ss.Spec.Vault.Secret, status.SyncedVersion, ss.Spec.Vault.Name, ss.Namespace, targetName))
+		recordSyncResult(status.State, "")
+		// Only a real recovery, not a first sync: Pending -> InSync is a new
+		// declaration working as intended and says nothing an operator needs
+		// at default verbosity.
+		if previousState == kvsynk8sv1alpha1.SecretSyncStateFailing {
+			log.Info("SecretSync recovered",
+				"namespace", ss.Namespace, "name", ss.Name,
+				"vault", ss.Spec.Vault.Name, "secret", ss.Spec.Vault.Secret,
+				"version", status.SyncedVersion)
+		}
 	case kvsynk8sv1alpha1.SecretSyncStateFailing:
 		r.recordEvent(ss, corev1.EventTypeWarning, "SyncFailed", fmt.Sprintf("%s: %s", status.Reason, status.Message))
+		recordSyncResult(status.State, status.Reason)
+		log.Info("SecretSync is failing",
+			"namespace", ss.Namespace, "name", ss.Name,
+			"vault", ss.Spec.Vault.Name, "secret", ss.Spec.Vault.Secret,
+			"reason", status.Reason, "message", status.Message)
 	}
 }
 
@@ -284,6 +329,11 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, fmt.Errorf("kvsynk8s: get secretsync %s: %w", req.NamespacedName, err)
 	}
 
+	// Captured before anything below reassigns ss.Status wholesale, so
+	// recordSyncOutcome can tell "still failing" from "just recovered" and log
+	// the recovery exactly once instead of on every periodic pass.
+	previousState := ss.Status.State
+
 	targetName := resolveTargetName(&ss)
 	targetKey := types.NamespacedName{Namespace: ss.Namespace, Name: targetName}
 	dataKey := resolveDataKey(&ss)
@@ -297,6 +347,7 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// reconcile of a new CR, before any conflict check or vault read runs.
 	if ss.Status.State == "" {
 		ss.Status.State = kvsynk8sv1alpha1.SecretSyncStatePending
+		setReadyCondition(&ss, &ss.Status)
 		if err := r.Status().Update(ctx, &ss); err != nil {
 			return ctrl.Result{}, fmt.Errorf("kvsynk8s: set pending status for %s: %w", req.NamespacedName, err)
 		}
@@ -310,7 +361,7 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, err
 	}
 	if conflictingOwner {
-		ss.Status = kvsynk8sv1alpha1.SecretSyncStatus{
+		conflictStatus := kvsynk8sv1alpha1.SecretSyncStatus{
 			State:  kvsynk8sv1alpha1.SecretSyncStateFailing,
 			Reason: sync.ReasonTargetConflict,
 			Message: fmt.Sprintf(
@@ -320,6 +371,11 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			LastSyncTime:       ss.Status.LastSyncTime,
 			SyncedVersion:      ss.Status.SyncedVersion,
 		}
+		// Built into a local first: setReadyCondition copies the existing
+		// conditions forward off ss.Status, which assigning to it would have
+		// already thrown away.
+		setReadyCondition(&ss, &conflictStatus)
+		ss.Status = conflictStatus
 		// Terminal status, so it is persisted on a detached context like the
 		// one at the end of Reconcile — see statusPersistTimeout. This path
 		// cannot itself exhaust the reconcile deadline (it runs off cached
@@ -331,7 +387,7 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		if err := r.Status().Update(statusCtx, &ss); err != nil {
 			return ctrl.Result{}, fmt.Errorf("kvsynk8s: update status for %s: %w", req.NamespacedName, err)
 		}
-		r.recordSyncOutcome(&ss, ss.Status, targetName)
+		r.recordSyncOutcome(ctx, &ss, previousState, ss.Status, targetName)
 		return ctrl.Result{RequeueAfter: r.reconcileInterval()}, nil
 	}
 
@@ -428,7 +484,7 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			value := string(desired.Data[dataKey])
 			writeErr := writer.CreateOrUpdate(ctx, &ss, targetKey.Namespace, targetKey.Name, dataKey, value, status.SyncedVersion)
 			if writeErr != nil {
-				if !errors.Is(writeErr, sync.ErrTargetConflict) {
+				if !isTerminalWriteError(writeErr) {
 					// Any other write failure — an admission policy rejecting
 					// the Secret, a ResourceQuota, RBAC drift, a wedged API
 					// server — is returned for backoff retry, but the CR must
@@ -442,13 +498,16 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 					// statusPersistTimeout exists to prevent for a hung vault
 					// read, on the write side.
 					//
-					// TransientError because that is exactly what an unreadable
-					// classification is worth here: the reconcile is retried
-					// with backoff, and a cause that has since cleared resolves
-					// itself with no further status of its own.
+					// SecretWriteFailed, not TransientError: the reconcile is
+					// still retried with backoff (this branch returns writeErr),
+					// but the reason now says which half of the operator broke.
+					// A Key Vault timeout and a cluster policy rejecting the
+					// write used to be indistinguishable from kubectl, from the
+					// Event and from any metric, while having completely
+					// different fixes.
 					status = kvsynk8sv1alpha1.SecretSyncStatus{
 						State:  kvsynk8sv1alpha1.SecretSyncStateFailing,
-						Reason: sync.ReasonTransientError,
+						Reason: sync.ReasonSecretWriteFailed,
 						// Identifiers and fixed text only, never writeErr's own
 						// string: it comes from the Kubernetes API, and what an
 						// admission webhook echoes back into it is not something
@@ -460,6 +519,7 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 						LastSyncTime:       ss.Status.LastSyncTime,
 						SyncedVersion:      ss.Status.SyncedVersion,
 					}
+					setReadyCondition(&ss, &status)
 					ss.Status = status
 					// Detached from the reconcile deadline for the same reason
 					// as every other terminal status write here: a write that
@@ -474,23 +534,48 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 						log.Error(statusErr, "failed to persist Failing status after a secret write error",
 							"namespace", targetKey.Namespace, "name", targetKey.Name)
 					}
-					r.recordSyncOutcome(&ss, status, targetName)
+					r.recordSyncOutcome(ctx, &ss, previousState, status, targetName)
 					return ctrl.Result{}, fmt.Errorf("kvsynk8s: write secret %s: %w", targetKey, writeErr)
 				}
-				// An unmanaged Secret occupies the target name. With the
-				// filtered cache (ManagedSecretCacheOptions) this is the
-				// normal detection path for that case — the cached Get above
-				// cannot see unmanaged Secrets — and it also covers the
-				// TOCTOU race where another actor created the Secret between
-				// that Get and the write just above. Either way the CR's
-				// status reflects TargetConflict rather than going stale for
-				// this cycle.
+				// A terminal write failure: nothing in the cluster will change
+				// on its own to make this write succeed. Reported through
+				// status and an Event and then requeued at the ordinary
+				// periodic cadence below — never returned as an error. Handing
+				// a permanent condition to the rate-limited workqueue would
+				// retry it forever, and every one of those retries pays a Key
+				// Vault read for a state only a human can clear.
+				//
+				// Two shapes reach here. An unmanaged Secret occupies the
+				// target name: with the filtered cache
+				// (ManagedSecretCacheOptions) this is the normal detection
+				// path for that case — the cached Get above cannot see
+				// unmanaged Secrets — and it also covers the TOCTOU race where
+				// another actor created the Secret between that Get and the
+				// write just above. Or the managed Secret is immutable, so
+				// Kubernetes refuses to change its data at all. Either way the
+				// CR's status says which, rather than going stale for this
+				// cycle.
+				reason := sync.ReasonTargetConflict
+				message := fmt.Sprintf(
+					"secret %s/%s already exists and is not managed by kvsynk8s", ss.Namespace, targetName)
+				if errors.Is(writeErr, sync.ErrTargetImmutable) {
+					reason = sync.ReasonTargetImmutable
+					message = fmt.Sprintf(
+						"secret %s/%s is immutable and cannot be updated; keeping last synced value",
+						ss.Namespace, targetName)
+					// Kubernetes offers no way to unset immutable on an
+					// existing Secret, so the remedy is not obvious and is
+					// worth spelling out where an operator tailing logs will
+					// see it. targetKey is a namespace/name pair; no value can
+					// reach this call.
+					log.Info("target secret is immutable, so its value can no longer be rotated; "+
+						"delete the Secret to resume syncing (immutable cannot be unset in place)",
+						"namespace", targetKey.Namespace, "name", targetKey.Name)
+				}
 				status = kvsynk8sv1alpha1.SecretSyncStatus{
-					State:  kvsynk8sv1alpha1.SecretSyncStateFailing,
-					Reason: sync.ReasonTargetConflict,
-					Message: fmt.Sprintf(
-						"secret %s/%s already exists and is not managed by kvsynk8s", ss.Namespace, targetName,
-					),
+					State:              kvsynk8sv1alpha1.SecretSyncStateFailing,
+					Reason:             reason,
+					Message:            message,
 					ObservedGeneration: ss.Generation,
 					LastSyncTime:       ss.Status.LastSyncTime,
 					SyncedVersion:      ss.Status.SyncedVersion,
@@ -499,6 +584,7 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 	}
 
+	setReadyCondition(&ss, &status)
 	ss.Status = status
 	// Detached from the per-reconcile deadline on purpose (statusPersistTimeout):
 	// this is the write that makes a reconcile which ran out of budget — a hung
@@ -509,7 +595,7 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if err := r.Status().Update(statusCtx, &ss); err != nil {
 		return ctrl.Result{}, fmt.Errorf("kvsynk8s: update status for %s: %w", req.NamespacedName, err)
 	}
-	r.recordSyncOutcome(&ss, status, targetName)
+	r.recordSyncOutcome(ctx, &ss, previousState, status, targetName)
 
 	log.V(1).Info("reconciled SecretSync",
 		"vault", ss.Spec.Vault.Name, "secret", ss.Spec.Vault.Secret, "state", status.State)
@@ -529,12 +615,12 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 	}
 
-	if status.State == kvsynk8sv1alpha1.SecretSyncStateFailing && status.Reason == sync.ReasonTransientError {
+	if status.State == kvsynk8sv1alpha1.SecretSyncStateFailing && retriedWithBackoff(status.Reason) {
 		// Constitution II / FR-008: transient failures (network, throttling,
 		// auth token expiry) are retried with exponential backoff via
 		// controller-runtime's rate-limited workqueue, not at the same fixed
 		// cadence used for a healthy periodic reconcile.
-		return ctrl.Result{}, fmt.Errorf("kvsynk8s: transient error syncing %s, retrying with backoff", req.NamespacedName)
+		return ctrl.Result{}, fmt.Errorf("kvsynk8s: %s syncing %s, retrying with backoff", status.Reason, req.NamespacedName)
 	}
 
 	return ctrl.Result{RequeueAfter: r.reconcileInterval()}, nil
@@ -632,6 +718,91 @@ func (r *SecretSyncReconciler) deleteStaleManagedSecrets(
 // writer also use, so the controller can never disagree with them.
 func ownedBy(secret *corev1.Secret, ss *kvsynk8sv1alpha1.SecretSync) bool {
 	return sync.ControllerOwnedBy(secret, ss)
+}
+
+// setReadyCondition mirrors a freshly computed status into the standard Ready
+// condition, so `kubectl wait --for=condition=Ready`, Argo CD and Flux have
+// something to key on. InSync is Ready=True, Failing is Ready=False carrying
+// the same reason, anything else (Pending) is Ready=Unknown.
+//
+// Two things here are load-bearing and easy to break:
+//
+// The existing conditions are copied forward from ss first. Reconcile assigns
+// ss.Status = <fresh struct> wholesale in several places, and engine.Sync
+// builds a fresh status of its own, so without this copy the slice handed to
+// meta.SetStatusCondition would always be empty and every reconcile would
+// reset LastTransitionTime — destroying the one piece of information a
+// condition adds over the plain state field.
+//
+// And Reason is never empty. metav1.Condition.Reason is required, with a
+// non-empty pattern, so the API server would reject the whole status write on
+// the success path if it were left as status.Reason (which is "" when nothing
+// failed).
+func setReadyCondition(ss *kvsynk8sv1alpha1.SecretSync, status *kvsynk8sv1alpha1.SecretSyncStatus) {
+	condition := metav1.Condition{
+		Type:               kvsynk8sv1alpha1.ConditionReady,
+		ObservedGeneration: status.ObservedGeneration,
+	}
+
+	switch status.State {
+	case kvsynk8sv1alpha1.SecretSyncStateInSync:
+		condition.Status = metav1.ConditionTrue
+		condition.Reason = "Synced"
+		condition.Message = fmt.Sprintf("synced version %q", status.SyncedVersion)
+	case kvsynk8sv1alpha1.SecretSyncStateFailing:
+		condition.Status = metav1.ConditionFalse
+		condition.Reason = status.Reason
+		condition.Message = status.Message
+	default:
+		condition.Status = metav1.ConditionUnknown
+		condition.Reason = "Pending"
+		condition.Message = "no sync attempt has completed yet"
+	}
+	if condition.Reason == "" {
+		condition.Reason = "Unknown"
+	}
+
+	status.Conditions = ss.Status.Conditions
+	meta.SetStatusCondition(&status.Conditions, condition)
+}
+
+// isTerminalWriteError reports whether a SecretWriter failure is one no amount
+// of retrying can clear: something in the cluster has to change first. Either
+// a foreign Secret occupies the target name (FR-012), or the managed Secret
+// was marked immutable so its data can no longer be rewritten. Both are
+// reported through status and an Event and then requeued at the periodic
+// interval; everything else goes back to the workqueue for exponential
+// backoff.
+//
+// Naming the distinction the write-failure branch was already making
+// implicitly means a third terminal condition is a one-line change here rather
+// than another inline errors.Is buried in Reconcile.
+func isTerminalWriteError(err error) bool {
+	return errors.Is(err, sync.ErrTargetConflict) || errors.Is(err, sync.ErrTargetImmutable)
+}
+
+// retriedWithBackoff reports whether a Failing reason should be handed back to
+// the rate-limited workqueue rather than left to the periodic requeue.
+//
+// TransientError is the obvious one: network, throttling, an unclassified
+// upstream error. SecretWriteFailed belongs to the same class and is listed
+// for completeness, though in practice its branch returns writeErr directly
+// and never reaches this gate. AuthenticationFailed is here for a less
+// obvious reason: it usually
+// means workload identity is misconfigured, which a human has to fix, but it
+// is also what a pod sees in the seconds before its projected token exists.
+// Backoff covers both — it converges in seconds when the cause is a startup
+// race, and settles at the rate limiter's ceiling when it is not, which beats
+// waiting a full reconcile interval to retry a broken identity.
+//
+// Everything else (SecretNotFound, AccessDenied, SourceDeleted,
+// SourceDisabled, TargetConflict, TargetImmutable) needs a change in Azure or
+// in the cluster before it can succeed, so retrying it fast buys nothing and
+// costs a Key Vault read per attempt.
+func retriedWithBackoff(reason string) bool {
+	return reason == sync.ReasonTransientError ||
+		reason == sync.ReasonSecretWriteFailed ||
+		reason == sync.ReasonAuthenticationFailed
 }
 
 // resolveTargetName applies the data-model.md default for
@@ -737,6 +908,12 @@ func (r *SecretSyncReconciler) SetupWithManager(mgr ctrl.Manager, syncEvents <-c
 	if r.APIReader == nil {
 		r.APIReader = mgr.GetAPIReader()
 	}
+
+	// Publish the cached client the state collector lists through, and
+	// register the sync-path metrics. This is the only place that has both the
+	// manager's client and a once-per-process guarantee in production; see
+	// registerSyncMetrics for why the once matters in the test suite too.
+	registerSyncMetrics(mgr.GetClient())
 
 	bldr := ctrl.NewControllerManagedBy(mgr).
 		For(&kvsynk8sv1alpha1.SecretSync{}).

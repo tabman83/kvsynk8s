@@ -20,6 +20,7 @@ import (
 	azruntime "github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azsecrets"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // Sentinel errors a caller classifies a SecretReader failure with, via
@@ -38,6 +39,21 @@ var (
 	// ErrAccessDenied means the caller's identity lacks permission to read
 	// the secret. HTTP 401/403. Maps to status.reason AccessDenied.
 	ErrAccessDenied = errors.New("access denied to key vault secret")
+
+	// ErrAuthFailure means no Azure token could be acquired at all, so the
+	// request never reached Key Vault: workload identity is not wired up
+	// (federated credential subject mismatch, a missing
+	// azure.workload.identity/client-id annotation, no projected token). Maps
+	// to status.reason AuthenticationFailed.
+	//
+	// Deliberately distinct from ErrAccessDenied, which means the opposite
+	// half of the same sentence: the token WAS accepted and the identity
+	// simply lacks the role assignment on the vault. The two have completely
+	// different fixes — one is in the cluster, one is in Azure RBAC — and
+	// before this existed both landed on ErrTransient, whose documented advice
+	// is "usually nothing, the controller retries". That advice is wrong for
+	// every failure this sentinel covers.
+	ErrAuthFailure = errors.New("could not acquire an Azure token")
 
 	// ErrSecretDisabled means the secret exists but is administratively
 	// disabled in the vault. Maps to status.reason SourceDisabled.
@@ -153,7 +169,7 @@ func (r *keyVaultReader) GetLatest(ctx context.Context, vaultName, secretName st
 	// Empty version string means "latest" in the Key Vault REST API.
 	resp, err := client.GetSecret(ctx, secretName, "", nil)
 	if err != nil {
-		return "", "", classifyGetSecretError(vaultName, secretName, err)
+		return "", "", classifyGetSecretError(ctx, vaultName, secretName, err)
 	}
 
 	if secretIsDisabled(resp.Attributes) {
@@ -186,7 +202,81 @@ func secretIsDisabled(attrs *azsecrets.SecretAttributes) bool {
 // secretName (identifiers, never values) plus the fixed sentinel text —
 // never the underlying SDK error's own message, which may echo response
 // details we do not want to have to audit (constitution I).
-func classifyGetSecretError(vaultName, secretName string, err error) error {
+//
+// It also emits the one diagnostic line an operator needs and could not
+// previously get anywhere. The engine drops this error after classifying it
+// (engine.go's classifyReaderError uses it for errors.Is dispatch and returns
+// only a fixed message), so if this function does not log the HTTP status
+// code, nothing does: a SecretSync sits at Failing/TransientError with no way
+// to tell a 429 from a 500 from a DNS failure. Three rules that log call has
+// to keep:
+//
+//   - The first argument to Error is nil, never err. logr renders a non-nil
+//     error's own string, and that string is the upstream text this package
+//     refuses to echo. cmd/main.go uses the same Error(nil, ...) idiom for
+//     the same reason.
+//   - Only the status code — an int — and, for an auth failure, a fixed
+//     kind literal cross the boundary. Nothing from the response body or from
+//     the SDK error's own text does, exactly as isDisabledSecretResponse below
+//     already reads the body to classify and never forwards it.
+//   - This detail goes to the operator log and deliberately NOT into
+//     status.Message, which is bound by the identifiers-and-fixed-text rule
+//     because anyone with read access to the CR can see it.
+func classifyGetSecretError(ctx context.Context, vaultName, secretName string, err error) error {
+	statusCode, sentinel := classifySentinel(err)
+
+	keys := []any{
+		"vault", vaultName, "secret", secretName,
+		"statusCode", statusCode, "classification", classificationName(sentinel),
+	}
+	// On an auth failure there is no status code to report (the request never
+	// went out), so the log would otherwise say only "AuthenticationFailed"
+	// and leave an operator to guess between a missing annotation and a
+	// mismatched federated credential. authFailureKind answers that from the
+	// error's TYPE, carrying no upstream characters -- see its comment for why
+	// the SDK's own text is not logged instead.
+	if kind := authFailureKind(err); kind != "" {
+		keys = append(keys, "authFailure", kind)
+	}
+
+	logf.FromContext(ctx).Error(nil, "key vault read failed", keys...)
+
+	return fmt.Errorf("vault %q secret %q: %w", vaultName, secretName, sentinel)
+}
+
+// The status.reason each sentinel maps to. Declared here rather than written
+// inline so the log line cannot drift from internal/sync's own reason
+// constants, which are the ones that reach status and the README.
+const (
+	classSecretNotFound       = "SecretNotFound"
+	classAccessDenied         = "AccessDenied"
+	classAuthenticationFailed = "AuthenticationFailed"
+	classSourceDisabled       = "SourceDisabled"
+	classTransientError       = "TransientError"
+)
+
+// classificationName renders a sentinel as the status.reason a caller will end
+// up with, so the log line and `kubectl get secretsync` agree on what happened.
+func classificationName(sentinel error) string {
+	switch {
+	case errors.Is(sentinel, ErrSecretNotFound):
+		return classSecretNotFound
+	case errors.Is(sentinel, ErrAccessDenied):
+		return classAccessDenied
+	case errors.Is(sentinel, ErrAuthFailure):
+		return classAuthenticationFailed
+	case errors.Is(sentinel, ErrSecretDisabled):
+		return classSourceDisabled
+	default:
+		return classTransientError
+	}
+}
+
+// classifySentinel reports the HTTP status code that decided the failure (0
+// when the request never got an answer) and the sentinel it maps to.
+// Split out from classifyGetSecretError so the classification and the logging
+// of it cannot drift apart.
+func classifySentinel(err error) (statusCode int, sentinel error) {
 	var respErr *azcore.ResponseError
 	if errors.As(err, &respErr) {
 		// Key Vault refuses GetSecret outright on a disabled secret instead
@@ -201,25 +291,34 @@ func classifyGetSecretError(vaultName, secretName string, err error) error {
 		// this function returns (constitution I): it is only ever used to
 		// pick which fixed sentinel applies.
 		if isDisabledSecretResponse(respErr) {
-			return fmt.Errorf("vault %q secret %q: %w", vaultName, secretName, ErrSecretDisabled)
+			return respErr.StatusCode, ErrSecretDisabled
 		}
 		switch {
 		case respErr.StatusCode == http.StatusNotFound:
-			return fmt.Errorf("vault %q secret %q: %w", vaultName, secretName, ErrSecretNotFound)
+			return respErr.StatusCode, ErrSecretNotFound
 		case respErr.StatusCode == http.StatusUnauthorized || respErr.StatusCode == http.StatusForbidden:
-			return fmt.Errorf("vault %q secret %q: %w", vaultName, secretName, ErrAccessDenied)
+			return respErr.StatusCode, ErrAccessDenied
 		case respErr.StatusCode == http.StatusTooManyRequests || respErr.StatusCode >= http.StatusInternalServerError:
-			return fmt.Errorf("vault %q secret %q: %w", vaultName, secretName, ErrTransient)
+			return respErr.StatusCode, ErrTransient
 		default:
 			// Any other HTTP status from Key Vault is not one of the known,
 			// actionable categories. Fail safe: treat it as retryable rather
 			// than surfacing a new, unhandled reason to callers.
-			return fmt.Errorf("vault %q secret %q: %w", vaultName, secretName, ErrTransient)
+			return respErr.StatusCode, ErrTransient
 		}
 	}
 
-	// No HTTP response at all: network failure, timeout, DNS, TLS, etc.
-	return fmt.Errorf("vault %q secret %q: %w", vaultName, secretName, ErrTransient)
+	// No HTTP response from Key Vault. Before anything else, ask whether we
+	// ever got a token: an unwired workload identity fails here, and calling
+	// that "transient" tells the operator to wait for a thing that will never
+	// happen. Checked only after the ResponseError branch above, so a real
+	// answer from the vault always wins.
+	if isAuthFailure(err) {
+		return 0, ErrAuthFailure
+	}
+
+	// Genuinely no answer: network failure, timeout, DNS, TLS, etc.
+	return 0, ErrTransient
 }
 
 // keyVaultErrorBody is the JSON error shape Key Vault (and Key-Vault-
