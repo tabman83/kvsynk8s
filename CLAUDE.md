@@ -22,8 +22,12 @@ confirmed back on `v0.1.0`, which carried both `install.yaml` and
 
 So T038 is the only outstanding item in the whole repo.
 
-**The project has shipped.** The newest release is `v0.2.0` (2026-08-26),
-carrying both `install.yaml` and `kvsynk8s-0.2.0.tgz`. Both install methods are
+**The project has shipped.** The newest release is `v1.0.0` (2026-08-28),
+carrying both `install.yaml` and `kvsynk8s-1.0.0.tgz`. It is the first major:
+`spec.target.secretName`'s pattern and a new CEL rule on `spec.target.dataKey`
+both got stricter, and a tightened validation on a published API is a major
+bump even though no working configuration breaks (both shapes were already
+refused by the API server on the Secret write, silently). Both install methods are
 live and verified working anonymously:
 `helm install kvsynk8s oci://ghcr.io/tabman83/charts/kvsynk8s` (no `--version`
 resolves the newest stable chart and skips the dev prereleases) and the
@@ -33,10 +37,10 @@ Every merge to `master` also publishes a dev build
 (`<next patch>-dev.<run number>`) to the registry only — no tag, no GitHub
 Release — so the releases page stays clean. See "Cutting a release" below.
 
-**`master` runs ahead of the newest tag**, so this file and the README describe
-`master`, not the released version. Anything documented here may not be in
-`v0.2.0` yet. Check with `git describe --tags HEAD` before assuming a behaviour
-is in a user's hands.
+**`master` usually runs ahead of the newest tag**, so this file and the README
+describe `master`, not necessarily the released version. Right now they are the
+same commit, but that stops being true on the next merge. Check with
+`git describe --tags HEAD` before assuming a behaviour is in a user's hands.
 
 T032 is done: the E2E suite in `test/e2e/secretsync_test.go` exercises the
 actual sync loop (create, SC-001 queue propagation, drift repair, deletion,
@@ -220,7 +224,7 @@ deliberately, and say which bump you picked and why when you propose one:**
   picking anything less.
 
 Dev builds need no decision: a merge to `master` publishes
-`<next patch>-dev.<run number>` (so `0.2.1-dev.42` after `v0.2.0`), derived
+`<next patch>-dev.<run number>` (so `1.0.1-dev.42` after `v1.0.0`), derived
 from the newest stable tag at release time. They are pushed to GHCR and
 nothing else — no git tag, no GitHub Release — so they are installable by version but never clutter
 the releases page or get mistaken for a release. They never move `:latest`.

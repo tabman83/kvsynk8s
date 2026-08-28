@@ -147,7 +147,7 @@ This is the file `.github/workflows/release.yml` builds and attaches to each
 GitHub Release: the CRD, RBAC, and the operator Deployment, with the image
 already pinned to that release's tag. The `latest/download` link always serves
 the newest stable release. To pin one, replace `latest/download` with
-`download/v0.2.0`.
+`download/v1.0.0`.
 
 ### Option C — from source
 
@@ -469,7 +469,7 @@ There are two kinds of release.
 You decide the version and start the release yourself:
 
 ```bash
-gh workflow run Release -f version=0.3.0
+gh workflow run Release -f version=1.1.0
 ```
 
 No `v` in front of the number, the workflow adds it. It creates the tag itself
@@ -477,7 +477,7 @@ at the end, pointing at the commit it built. Pushing a tag by hand still works
 too:
 
 ```bash
-git tag v0.3.0 && git push origin v0.3.0
+git tag v1.1.0 && git push origin v1.1.0
 ```
 
 A stable release is the only thing that moves the `:latest` image tag.
@@ -506,7 +506,7 @@ clusters, and `helm upgrade` applies the new schema to them, so a breaking
 schema change is a major bump even if the Go code barely changed.
 
 You can also cut a release candidate. Use a version with a suffix, like
-`0.3.0-rc1`. It publishes everything, but leaves `:latest` alone and shows as a
+`1.1.0-rc1`. It publishes everything, but leaves `:latest` alone and shows as a
 prerelease.
 
 ### Dev builds (automatic, every merge)
@@ -520,11 +520,11 @@ exactly like any other version:
 
 ```bash
 helm install kvsynk8s oci://ghcr.io/tabman83/charts/kvsynk8s \
-  --version 0.2.1-dev.42 --namespace kvsynk8s --create-namespace
+  --version 1.0.1-dev.42 --namespace kvsynk8s --create-namespace
 ```
 
-The version is the next patch plus the run number, so `0.2.1-dev.42` comes
-after `v0.2.0`. It sorts below the real `0.2.1`, so it can never look newer
+The version is the next patch plus the run number, so `1.0.1-dev.42` comes
+after `v1.0.0`. It sorts below the real `1.0.1`, so it can never look newer
 than the release it is heading towards. The base is worked out at release time
 from the newest stable tag, so the number above is only an example. Dev builds
 never move `:latest`.
