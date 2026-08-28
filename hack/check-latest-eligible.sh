@@ -192,14 +192,16 @@ if [ "$published" = unreachable ]; then
   # the same decision — leaves releases/latest/download/install.yaml serving
   # the older operator too, with nothing but a warning to say so.
   #
-  # check-release-overwrite.sh is NOT a backstop for that. It refuses on an
-  # unreadable registry only when it gets that far: a tag-push release whose
-  # tag already points at the commit being built short-circuits before its
-  # registry probe, so on that trigger nothing else would catch it.
+  # check-release-overwrite.sh is only a partial backstop. Both guards read the
+  # same registry, so when it is unreadable that guard normally refuses the
+  # release outright. The one path that never reaches its probe is a dispatch
+  # whose git tag already points at the commit being built — a re-run of a
+  # completed release, settled by the tag alone. A tag push used to take that
+  # short-circuit too, which left this gap wide; it no longer does.
   #
-  # What is left open is narrow and no worse than before: a release that died
-  # before writing its tag stays invisible only while the registry is also
-  # unreadable. Every other time, the witness below sees it.
+  # What is left open is narrow: a dispatched re-run of a completed release,
+  # while the registry is unreadable AND a newer version sits published with no
+  # tag. Every other time, the witness below sees it.
   echo "check-latest-eligible: could not read the published tags of $IMAGE; deciding from the git tags alone." >&2
   if [ -n "${GITHUB_ACTIONS:-}" ]; then
     echo "::warning title=Registry not consulted::Could not read the published tags of $IMAGE, so the :latest decision for v$version is based only on the git tags. A release that failed before creating its tag would not be visible."

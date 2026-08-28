@@ -20,6 +20,18 @@
 # built from, which is what separates the legitimate same-commit re-run from
 # the overwrite.
 #
+# One twist: whether the git tag is a witness at all depends on how the run
+# started. On a workflow_dispatch release the tag is written by the LAST job of
+# the run, so finding one is the pipeline's own receipt that a release of that
+# commit completed. On a tag-push release the tag is not a witness, it is the
+# trigger: an operator pushed it seconds ago and it always points at GITHUB_SHA,
+# so "the tag exists and points at this commit" is true of every tag push,
+# including the one someone does after a dispatched release published the image
+# and the chart and then died before tagging. Believing the tag there skips the
+# registry entirely, which is the only witness that can see that state. So on a
+# tag push witness 1 can refuse, but it can never pass on its own; $RELEASE_TRIGGER
+# says which of the two this is.
+#
 # usage: check-release-overwrite.sh <version> <commit-sha>
 #
 #   <version>     the version being released, no leading v.
@@ -38,6 +50,14 @@
 #                file holding what `imagetools inspect` would have printed,
 #                used instead of calling docker. Test seam for the label
 #                reading itself, which is the half IMAGE_PROBE stubs out.
+#   RELEASE_TRIGGER
+#                how this release was started: 'dispatch' (the release job creates
+#                the git tag at the END of this run, so an existing tag means an
+#                earlier run completed) or 'tag' (the tag exists only because
+#                pushing it started this run, so it vouches for nothing).
+#                Unlike the seams above this is a real input, and it defaults to
+#                'tag' — the strict reading, so a caller that forgets to pass it
+#                gets the registry consulted, never skipped.
 #
 # Requires: docker (with buildx) and python3, unless $IMAGE_PROBE replaces them.
 
@@ -64,6 +84,19 @@ if ! printf '%s' "$commit" | grep -qE '^[0-9a-f]{7,40}$'; then
   echo "check-release-overwrite: '$commit' is not a commit sha." >&2
   exit 2
 fi
+
+# Absent, this reads as a tag push: the strict side, where the tag settles
+# nothing and the registry gets asked. An unknown value is a wiring mistake in
+# the caller, not a verdict about the release, so refuse rather than guess which
+# side of the decision it was meant to land on.
+release_trigger="${RELEASE_TRIGGER:-tag}"
+case "$release_trigger" in
+  tag|dispatch) ;;
+  *)
+    echo "check-release-overwrite: RELEASE_TRIGGER='$release_trigger' is not 'tag' or 'dispatch'." >&2
+    exit 2
+    ;;
+esac
 
 tag="v$version"
 
@@ -144,24 +177,48 @@ probe() { # probe <image-ref>
 
 # --- witness 1: the git tag -------------------------------------------------
 #
-# When the tag exists the release completed, because the tag is written last.
-# Same commit is a deliberate re-run and converges by design; any other commit
-# is a different build wearing a published version number.
+# A tag pointing at a DIFFERENT commit is a released version being rebuilt from
+# somewhere else, whoever wrote the tag and however this run started. That
+# refusal is unconditional, and it comes first so no trigger value can ever wave
+# it through.
+#
+# A tag pointing at THIS commit means "a release of this exact commit already
+# completed" only on a dispatch, where the pipeline itself wrote the tag in its
+# final job. Re-running that is the documented remedy for a half-failed release
+# ("Re-run all jobs"; every upload is overwrite:true), so it passes here without
+# the registry being consulted at all. On a tag push the same condition holds for
+# every single run, because pushing the tag is what started it, so the tag
+# decides nothing and the registry gets the last word.
+tag_present=false
 if tag_commit="$(git -C "$REPO_DIR" rev-parse -q --verify "refs/tags/$tag^{commit}" 2>/dev/null)"; then
-  if [ "$tag_commit" = "$commit" ]; then
+  tag_present=true
+  if [ "$tag_commit" != "$commit" ]; then
+    refuse \
+      "tag $tag already exists and points at $tag_commit, not at $commit." \
+      "Refusing to rebuild a released version from a different commit." \
+      "Pick a new version, or delete the tag first if you really mean to replace the release."
+  fi
+  if [ "$release_trigger" = dispatch ]; then
     echo "check-release-overwrite: tag $tag already exists and points at this commit; treating this as a re-run of the same release." >&2
     exit 0
   fi
-  refuse \
-    "tag $tag already exists and points at $tag_commit, not at $commit." \
-    "Refusing to rebuild a released version from a different commit." \
-    "Pick a new version, or delete the tag first if you really mean to replace the release."
+  echo "check-release-overwrite: tag $tag points at this commit, but pushing that tag is what started this run, so it is not evidence that a release completed. Asking the registry instead." >&2
 fi
 
 # --- witness 2: the registry ------------------------------------------------
 #
-# No tag, so either this version was never released, or its release run died
-# after publishing the image and the chart.
+# Two paths reach here. Either there is no tag at all — this version was never
+# released, or its release run died after publishing the image and the chart —
+# or this is a tag push whose tag started the run and therefore vouches for
+# nothing. Both ask the registry the same question; they differ only in what the
+# answer can be blamed on, which is what $tag_note carries into the refusals
+# below.
+if [ "$tag_present" = true ]; then
+  tag_note="The tag $tag exists only because pushing it started this run, so it is no evidence that any release of v$version completed."
+else
+  tag_note="No git tag $tag exists, so that release run failed after publishing the image and the chart."
+fi
+
 result="$(probe "$IMAGE:$tag")"
 
 case "$result" in
@@ -170,21 +227,30 @@ case "$result" in
     exit 0
     ;;
   "revision $commit")
-    echo "check-release-overwrite: $IMAGE:$tag is already published from this same commit but has no git tag, so its release run failed after publishing. Re-running it from the same commit is the documented remedy; continuing." >&2
+    if [ "$tag_present" = true ]; then
+      echo "check-release-overwrite: $IMAGE:$tag is already published and was built from this same commit, so this run republishes an identical build; continuing." >&2
+    else
+      echo "check-release-overwrite: $IMAGE:$tag is already published from this same commit but has no git tag, so its release run failed after publishing. Re-running it from the same commit is the documented remedy; continuing." >&2
+    fi
     exit 0
     ;;
   revision\ *)
     refuse \
-      "$IMAGE:$tag is already published, built from commit ${result#revision } — but no git tag $tag exists, so that release run failed after publishing the image and the chart." \
-      "This run is building $commit, so continuing would overwrite a published version with a different commit's build." \
-      "Re-run the original failed run instead of dispatching v$version again from a newer commit."
+      "$IMAGE:$tag is already published, built from commit ${result#revision }, not from $commit." \
+      "$tag_note" \
+      "Continuing would overwrite a published version with a different commit's build." \
+      "Re-run the original failed run instead of releasing v$version again from a newer commit."
     ;;
   norevision)
-    # Fail closed. An image with no readable revision and no git tag cannot be
-    # told apart from someone else's build of the same version number, and
-    # guessing in the permissive direction is exactly the hole this closes.
+    # Fail closed. An image with no readable revision cannot be told apart from
+    # someone else's build of the same version number, and guessing in the
+    # permissive direction is exactly the hole this closes. On a tag push this is
+    # the case that hurts: an image published before the revision label existed
+    # reads exactly like a foreign build, and being permissive there is precisely
+    # the hole being closed.
     refuse \
-      "$IMAGE:$tag is already published but carries no readable org.opencontainers.image.revision, and no git tag $tag exists." \
+      "$IMAGE:$tag is already published but carries no readable org.opencontainers.image.revision." \
+      "$tag_note" \
       "There is no way to tell whether this run would republish the same commit or overwrite a different one." \
       "Re-run the original failed run, or delete $IMAGE:$tag from the registry if you are sure it should be replaced."
     ;;
