@@ -188,6 +188,14 @@ jobs:
         env:
           VERSION: ${{ steps.resolve.outputs.version }}
           IMAGE: ${{ env.IMAGE }}
+          # Which trigger this is decides whether the git tag counts as
+          # evidence. On a dispatch the tag is written by the release job at the
+          # end of this run, so an existing one means a release completed. On a
+          # tag push the tag is the trigger, pushed by hand, and the guard has
+          # to ask the registry instead. Same shape as the concurrency group
+          # above: worked out inline from the event, not from a second copy of
+          # the version-resolution logic.
+          RELEASE_TRIGGER: ${{ github.event_name == 'workflow_dispatch' && 'dispatch' || 'tag' }}
         run: hack/check-release-overwrite.sh "$VERSION" "$GITHUB_SHA"
 
   test:

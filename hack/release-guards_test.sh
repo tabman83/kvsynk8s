@@ -217,9 +217,9 @@ check "registry junk is not reported as a hand-made tag" 0 "!ignoring tag" -- \
 # A registry that cannot be read falls back to the git tags — the answer this
 # script gave before the second witness existed — and says so. Deciding "false"
 # instead would be worse than the hole it guards: the release still publishes,
-# but :latest and the GitHub Release both stay on the older version, and on a
-# tag-push release check-release-overwrite.sh short-circuits before its own
-# registry probe, so nothing else would catch it.
+# but :latest and the GitHub Release both stay on the older version, and
+# check-release-overwrite.sh is only a partial backstop — a dispatched re-run
+# settled by its git tag never reaches its own registry probe.
 check "unreadable registry falls back to the git tags" 0 "true" -- \
   env REPO_DIR="$two_repo" REGISTRY_TAGS="$unreachable_registry" "$LATEST" 0.3.0
 check "unreadable registry says the tags decided it" 0 "newer than the newest stable release, v0.2.0" -- \
@@ -255,14 +255,15 @@ check "new version with nothing published" 0 "is a new version" -- \
   env REPO_DIR="$untagged_repo" IMAGE_PROBE="$absent_probe" \
   "$OVERWRITE" 0.1.0 "$head_commit"
 
-# The documented re-run: the tag exists and points at the commit being built.
+# The documented re-run: the tag exists and points at the commit being built,
+# and the pipeline is the one that wrote it, so it means a release completed.
 check "tag on the same commit is a re-run" 0 "treating this as a re-run" -- \
-  env REPO_DIR="$tagged_repo" IMAGE_PROBE="$absent_probe" \
+  env REPO_DIR="$tagged_repo" RELEASE_TRIGGER=dispatch IMAGE_PROBE="$absent_probe" \
   "$OVERWRITE" 0.1.0 "$released_commit"
 
 # The tag settles it on its own; the registry is not even consulted.
 rm -f "$workdir/probe-called"
-env REPO_DIR="$tagged_repo" IMAGE_PROBE="$absent_probe" \
+env REPO_DIR="$tagged_repo" RELEASE_TRIGGER=dispatch IMAGE_PROBE="$absent_probe" \
   "$OVERWRITE" 0.1.0 "$released_commit" >/dev/null 2>&1
 check "tag on the same commit skips the registry probe" 1 "" -- \
   test -e "$workdir/probe-called"
@@ -307,6 +308,82 @@ nonsense_probe="$(make_probe "who knows")"
 check "unknown probe answer is an error" 2 "not an answer I understand" -- \
   env REPO_DIR="$untagged_repo" IMAGE_PROBE="$nonsense_probe" \
   "$OVERWRITE" 0.1.0 "$head_commit"
+
+# --- the trigger decides whether the tag is a witness at all -----------------
+#
+# Every case above with a tag on the commit being built is a dispatch, where the
+# pipeline wrote the tag in its last job and finding one really does mean a
+# release completed. On a tag push the same tag proves nothing: pushing it is
+# what started the run, so it points at GITHUB_SHA every single time, including
+# right after a dispatched release published the image and then died before
+# tagging. These cases pin that asymmetry from both sides.
+#
+# Note for whoever adds to this group: make_probe writes ONE shared file and
+# every call overwrites it, so each case must call it immediately before use.
+
+# The structural half of the fix: on a tag push the registry IS consulted.
+tagpush_absent_probe="$(make_probe absent)"
+env REPO_DIR="$tagged_repo" RELEASE_TRIGGER=tag IMAGE_PROBE="$tagpush_absent_probe" \
+  "$OVERWRITE" 0.1.0 "$released_commit" >/dev/null 2>&1
+check "tag push does not skip the registry probe" 0 "" -- \
+  test -e "$workdir/probe-called"
+
+# THE regression: a dispatch published v0.1.0 from another commit and died
+# before tagging, then someone pushed the tag by hand at this commit. The tag
+# now points where this run is building, and it must not settle anything.
+tagpush_foreign_probe="$(make_probe "revision $foreign_commit")"
+check "tag pushed at this commit cannot overwrite another commit's build" 1 "built from commit $foreign_commit" -- \
+  env REPO_DIR="$tagged_repo" RELEASE_TRIGGER=tag IMAGE_PROBE="$tagpush_foreign_probe" \
+  "$OVERWRITE" 0.1.0 "$released_commit"
+check "tag push says why the tag settled nothing" 1 "pushing that tag is what started this run" -- \
+  env REPO_DIR="$tagged_repo" RELEASE_TRIGGER=tag IMAGE_PROBE="$tagpush_foreign_probe" \
+  "$OVERWRITE" 0.1.0 "$released_commit"
+
+# The ordinary tag-push release — nothing published yet — must still go through.
+tagpush_new_probe="$(make_probe absent)"
+check "tag push of a new version is still allowed" 0 "is a new version" -- \
+  env REPO_DIR="$tagged_repo" RELEASE_TRIGGER=tag IMAGE_PROBE="$tagpush_new_probe" \
+  "$OVERWRITE" 0.1.0 "$released_commit"
+
+# And so must the legitimate re-run of a completed tag-push release: it passes
+# because the registry says the same commit, not because the tag exists.
+tagpush_same_probe="$(make_probe "revision $released_commit")"
+check "tag push republishing the same commit is allowed" 0 "republishes an identical build" -- \
+  env REPO_DIR="$tagged_repo" RELEASE_TRIGGER=tag IMAGE_PROBE="$tagpush_same_probe" \
+  "$OVERWRITE" 0.1.0 "$released_commit"
+
+# Fail closed on both unreadable answers, tag or no tag. This is what costs a
+# re-release of an image published before the revision label existed, and paying
+# that is the point: being permissive here IS the hole.
+tagpush_norevision_probe="$(make_probe norevision)"
+check "tag push with an unreadable revision is refused" 1 "no readable org.opencontainers.image.revision" -- \
+  env REPO_DIR="$tagged_repo" RELEASE_TRIGGER=tag IMAGE_PROBE="$tagpush_norevision_probe" \
+  "$OVERWRITE" 0.1.0 "$released_commit"
+
+tagpush_unreachable_probe="$(make_probe unreachable)"
+check "tag push with an unreachable registry is refused" 1 "Refusing to publish rather than risk overwriting" -- \
+  env REPO_DIR="$tagged_repo" RELEASE_TRIGGER=tag IMAGE_PROBE="$tagpush_unreachable_probe" \
+  "$OVERWRITE" 0.1.0 "$released_commit"
+
+# The other side of the asymmetry, deliberate: on a dispatch the tag is the
+# pipeline's own receipt, so it decides even when the registry would refuse.
+dispatch_foreign_probe="$(make_probe "revision $foreign_commit")"
+check "dispatch re-run is still settled by the tag alone" 0 "treating this as a re-run" -- \
+  env REPO_DIR="$tagged_repo" RELEASE_TRIGGER=dispatch IMAGE_PROBE="$dispatch_foreign_probe" \
+  "$OVERWRITE" 0.1.0 "$released_commit"
+
+# A caller that forgets the variable gets the strict reading, so the hole cannot
+# reopen by omission.
+default_foreign_probe="$(make_probe "revision $foreign_commit")"
+check "a missing RELEASE_TRIGGER is read as a tag push" 1 "built from commit $foreign_commit" -- \
+  env REPO_DIR="$tagged_repo" IMAGE_PROBE="$default_foreign_probe" \
+  "$OVERWRITE" 0.1.0 "$released_commit"
+
+# A typo is a wiring bug, not a verdict about the release.
+typo_probe="$(make_probe absent)"
+check "an unknown RELEASE_TRIGGER is an error" 2 "is not 'tag' or 'dispatch'" -- \
+  env REPO_DIR="$tagged_repo" RELEASE_TRIGGER=maybe IMAGE_PROBE="$typo_probe" \
+  "$OVERWRITE" 0.1.0 "$released_commit"
 
 # Malformed input.
 check "bad version is refused" 2 "is not a version" -- \
@@ -391,6 +468,13 @@ printf 'ERROR: something went wrong\n' > "$workdir/garbage.json"
 check "unparseable inspect output fails closed" 1 "Refusing to publish rather than risk overwriting" -- \
   env REPO_DIR="$untagged_repo" IMAGE_INSPECT_JSON="$workdir/garbage.json" \
   "$OVERWRITE" 0.1.0 "$head_commit"
+
+# The tag-push path joined to the real manifest shape rather than to a stubbed
+# probe: the freshly pushed tag points at the commit being built, and the label
+# on the published image is what refuses the run.
+check "tag push reads the revision label off a real manifest" 1 "built from commit $foreign_commit" -- \
+  env REPO_DIR="$tagged_repo" RELEASE_TRIGGER=tag IMAGE_INSPECT_JSON="$foreign_json" \
+  "$OVERWRITE" 0.1.0 "$released_commit"
 
 # --- result -----------------------------------------------------------------
 
