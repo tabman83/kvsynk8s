@@ -138,17 +138,30 @@ helm-verify: kustomize helm-sync ## Lint the chart, check the values contract, a
 	HELM="$(HELM)" hack/check-values.sh
 	HELM="$(HELM)" KUSTOMIZE="$(KUSTOMIZE)" hack/compare-helm-kustomize.sh
 
+# The Go toolchain the linter analyses with, taken from go.mod exactly as the
+# Lint workflow does (actions/setup-go with go-version-file: go.mod). Without
+# this, a developer whose installed Go is NEWER than the go directive gets that
+# newer one, because GOTOOLCHAIN=auto only upgrades. That is not a cosmetic
+# difference: staticcheck's IR builder parses the standard library of whichever
+# toolchain is in use, and a stdlib newer than the bundled honnef.co/go/tools
+# understands makes it panic outright ("unexpected expr") rather than report
+# anything. The whole lint run then fails with no findings, so the first real
+# feedback arrives from CI. Pinning here keeps `make lint` and the Lint
+# workflow looking at the same source, which is what makes local results
+# trustworthy.
+GO_TOOLCHAIN ?= go$(shell sed -n -e 's/^toolchain go\([0-9][0-9.]*\)$$/\1/p' -e 's/^go \([0-9][0-9.]*\)$$/\1/p' go.mod | head -1)
+
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
-	"$(GOLANGCI_LINT)" run
+	GOTOOLCHAIN=$(GO_TOOLCHAIN) "$(GOLANGCI_LINT)" run
 
 .PHONY: lint-fix
 lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
-	"$(GOLANGCI_LINT)" run --fix
+	GOTOOLCHAIN=$(GO_TOOLCHAIN) "$(GOLANGCI_LINT)" run --fix
 
 .PHONY: lint-config
 lint-config: golangci-lint ## Verify golangci-lint linter configuration
-	"$(GOLANGCI_LINT)" config verify
+	GOTOOLCHAIN=$(GO_TOOLCHAIN) "$(GOLANGCI_LINT)" config verify
 
 ##@ Build
 
