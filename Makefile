@@ -132,10 +132,13 @@ helm-sync: manifests ## Copy the generated CRD and RBAC rules into the Helm char
 # point HELM at another binary to check the other line, e.g.
 #   make helm-verify HELM=/path/to/helm3
 .PHONY: helm-verify
-helm-verify: kustomize helm-sync ## Lint the chart, check the values contract, and compare against the kustomize output.
+helm-verify: kustomize helm-sync ## Lint the chart, check the values contract, render invariants and the kustomize output.
 	"$(HELM)" lint charts/kvsynk8s
 	"$(HELM)" lint charts/kvsynk8s -f charts/kvsynk8s/ci/nondefault-values.yaml
 	HELM="$(HELM)" hack/check-values.sh
+	"$(HELM)" template kvsynk8s charts/kvsynk8s --namespace kvsynk8s > /tmp/kvsynk8s-helm-verify-default.yaml
+	"$(HELM)" template kvsynk8s charts/kvsynk8s --namespace kvsynk8s -f charts/kvsynk8s/ci/nondefault-values.yaml > /tmp/kvsynk8s-helm-verify-nondefault.yaml
+	hack/check-render.sh /tmp/kvsynk8s-helm-verify-default.yaml /tmp/kvsynk8s-helm-verify-nondefault.yaml
 	HELM="$(HELM)" KUSTOMIZE="$(KUSTOMIZE)" hack/compare-helm-kustomize.sh
 
 # The Go toolchain the linter analyses with, taken from go.mod exactly as the

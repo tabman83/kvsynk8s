@@ -99,6 +99,7 @@ if dep_key in by_key_helm and dep_key in by_key_kust:
     k = by_key_kust[dep_key]["spec"]
 
     check("Deployment .spec.replicas", h.get("replicas"), k.get("replicas"))
+    check("Deployment .spec.strategy", h.get("strategy"), k.get("strategy"))
     check(
         "Deployment .spec.selector.matchLabels",
         h.get("selector", {}).get("matchLabels"),

@@ -138,10 +138,34 @@ func NewListener(queue azure.QueueSource, cli client.Client, events chan event.G
 }
 
 // NeedLeaderElection implements manager.LeaderElectionRunnable: the listener
-// always runs regardless of leader election. This operator never actually
-// enables leader election (single replica, plan.md), so this only documents
-// the intent defensively.
-func (l *Listener) NeedLeaderElection() bool { return false }
+// MUST run only where the SecretSyncReconciler also runs, because the
+// reconciler's source.Channel watch is the only thing that drains l.Events.
+// Its only consumer is a leader-election runnable, so the listener has to be
+// one too.
+//
+// If this returned false, a manager instance that is not the leader would
+// still start the listener. handleMessage blocks sending into l.Events
+// (`select { case l.Events <- ...; case <-ctx.Done(): }`); with nothing
+// draining the channel the buffer fills, the send blocks, and Start's
+// strictly sequential poll loop stalls mid-batch, holding whatever messages
+// it already pulled off the queue with no deadline of its own
+// (QueueCallTimeout only bounds the Receive/Delete calls, not the processing
+// between them). internal/azure/queue.go sets no VisibilityTimeout, so
+// Azure's 30-second default returns those held messages to the queue; each
+// redelivery raises DequeueCount, and once it passes PoisonThreshold the
+// message is deleted without ever being parsed or matched. The result is
+// silent, permanent loss of the rotation events that arrived during the
+// window: the operator falls back to the multi-hour periodic reconcile with
+// no failure signal, because kvsynk8s_queue_consecutive_receive_failures only
+// moves on a failed Receive, and Receive never failed here.
+//
+// This operator never actually enables leader election today (single
+// replica, plan.md) — see
+// specs/003-single-replica-invariant/contracts/runnable-leadership.md — so
+// returning true changes nothing about the shipped configuration. It matters
+// only if leader election is ever turned on later, which is exactly when a
+// wrong answer here would go unnoticed until it silently dropped events.
+func (l *Listener) NeedLeaderElection() bool { return true }
 
 // Start implements manager.Runnable: it polls the queue with an adaptive
 // delay (research R6) until ctx is cancelled. Receive errors are logged and

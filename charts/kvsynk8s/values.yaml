@@ -109,6 +109,10 @@ crds:
 # Deliberately not configurable:
 #   replicas  — fixed at 1. The operator runs without leader election, so a
 #               second replica would reconcile the same Secrets uncoordinated.
+#   strategy  — fixed at Recreate. The Deployment stops the running instance
+#               before starting its replacement, so an upgrade never runs two
+#               instances at once either (README's "What happens while
+#               kvsynk8s is down").
 #   namespace — Helm's job: --namespace kvsynk8s --create-namespace.
 #               The chart renders no Namespace object.
 #   leader election, probe ports, log flags, cert paths — not part of the

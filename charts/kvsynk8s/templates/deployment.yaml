@@ -11,6 +11,17 @@ spec:
   # reconcile the same SecretSync objects and write the same Secrets
   # uncoordinated. One replica is the correct number here.
   replicas: 1
+  # Also not a value. With no strategy set, Kubernetes' default RollingUpdate
+  # rounds maxSurge up to 1 and maxUnavailable down to 0 at replicas: 1, so it
+  # starts the replacement pod BEFORE terminating the old one — briefly two
+  # uncoordinated operator instances reconciling the same SecretSync objects
+  # and polling the same queue on every upgrade. Recreate makes the single-
+  # instance guarantee above hold during a rollout, not just at rest, at the
+  # cost of a short gap with no operator running (README's "What happens while
+  # kvsynk8s is down" section: existing Secrets and the pods using them are
+  # unaffected, and a Key Vault change during the gap is delayed, not lost).
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "kvsynk8s.selectorLabels" . | nindent 6 }}
