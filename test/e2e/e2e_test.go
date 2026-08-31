@@ -197,6 +197,26 @@ var _ = Describe("Manager", Ordered, func() {
 			Eventually(verifyControllerUp).Should(Succeed())
 		})
 
+		It("should deploy with the Recreate rollout strategy", func() {
+			// Proves the shipped manifest carries the single-instance invariant
+			// end to end (specs/003-single-replica-invariant). This does not
+			// attempt to observe a rollout and count running pods -- that would
+			// be a flaky test with an inconclusive pass, since catching a
+			// sub-second overlap requires polling faster than the window it is
+			// trying to observe. Recreate is a Kubernetes-guaranteed property of
+			// the object, so asserting the field is present proves the
+			// behaviour without racing it (research.md R3).
+			By("checking the operator Deployment's rollout strategy")
+			cmd := exec.Command("kubectl", "get",
+				"deployment", "kvsynk8s-operator",
+				"-o", "jsonpath={.spec.strategy.type}",
+				"-n", namespace,
+			)
+			output, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(output).To(Equal("Recreate"))
+		})
+
 		It("should ensure the metrics endpoint is serving metrics", func() {
 			By("creating a ClusterRoleBinding for the service account to allow access to metrics")
 			cmd := exec.Command("kubectl", "create", "clusterrolebinding", metricsRoleBindingName,

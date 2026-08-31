@@ -22,6 +22,17 @@ spec:
       control-plane: controller-manager
       app.kubernetes.io/name: kvsynk8s
   replicas: 1
+  # With no strategy set, Kubernetes' default RollingUpdate rounds maxSurge up
+  # to 1 and maxUnavailable down to 0 at replicas: 1, so it starts the
+  # replacement pod BEFORE terminating the old one — briefly two uncoordinated
+  # operator instances reconciling the same SecretSync objects and polling the
+  # same queue on every upgrade. Recreate closes that window: the old instance
+  # fully stops before the new one starts, at the cost of a short gap with no
+  # operator running (README's "What happens while kvsynk8s is down" section:
+  # existing Secrets and the pods using them are unaffected, and a Key Vault
+  # change during the gap is delayed, not lost).
+  strategy:
+    type: Recreate
   template:
     metadata:
       annotations:
@@ -64,8 +75,9 @@ spec:
         # No --leader-elect: the manager is always started with leader
         # election disabled (cmd/main.go; plan.md, Simplicity First), and no
         # lease RBAC is granted, so the flag only ever misled someone into
-        # scaling this Deployment. Keep replicas at 1 — two replicas would run
-        # two uncoordinated controllers and two queue listeners.
+        # scaling this Deployment. Only one instance ever runs, including
+        # during an upgrade: replicas is pinned at 1 above and the Deployment's
+        # Recreate strategy stops the old instance before starting a new one.
         args:
           - --health-probe-bind-address=:8081
         image: controller:latest

@@ -76,7 +76,9 @@ with a comment):
 
 There is no `replicas` value. The operator runs without leader election, so a
 second replica would reconcile the same SecretSync objects and write the same
-Secrets uncoordinated.
+Secrets uncoordinated. The Deployment's rollout strategy enforces this even
+during an upgrade — see ["What happens while kvsynk8s is
+down"](#what-happens-while-kvsynk8s-is-down).
 
 **Warning about `serviceAccount.name` and the namespace.** The Entra federated
 credential is bound to the exact ServiceAccount name and namespace
@@ -342,7 +344,7 @@ exists), all read in `cmd/main.go`:
 | `--metrics-bind-address` | — | `0` (disabled) | Address the metrics endpoint binds to. `:8080` for HTTP, `:8443` for HTTPS, or `0` to disable it. |
 | `--metrics-secure` | — | `true` | Serve metrics over HTTPS. `--metrics-secure=false` for HTTP instead. |
 | `--health-probe-bind-address` | — | `:8081` | Address the `/healthz`/`/readyz` endpoints bind to. |
-| `--leader-elect` | — | `false` | Present for scaffold/manifest compatibility only. This operator always runs a single replica and never actually enables leader election regardless of this flag's value. |
+| `--leader-elect` | — | `false` | Present for scaffold/manifest compatibility only. This operator always runs a single replica and never actually enables leader election regardless of this flag's value; it is accepted and ignored so a hand-written Deployment that passes it keeps working. Single-instance operation is enforced by the Deployment's `Recreate` rollout strategy (see "What happens while kvsynk8s is down" below), not left to this flag. |
 | `--metrics-cert-path` / `--metrics-cert-name` / `--metrics-cert-key` | — | empty / `tls.crt` / `tls.key` | Directory and file names for the metrics server's TLS certificate. Left empty, controller-runtime generates a self-signed certificate (fine for development, not for production). |
 | `--webhook-cert-path` / `--webhook-cert-name` / `--webhook-cert-key` | — | empty / `tls.crt` / `tls.key` | Same, for the webhook server. kvsynk8s registers no webhooks in v1, so this is unused scaffold surface. |
 | `--enable-http2` | — | `false` | HTTP/2 is disabled by default on the metrics/webhook servers (mitigates the HTTP/2 Rapid Reset class of CVEs); set this to re-enable it. |
@@ -351,6 +353,41 @@ exists), all read in `cmd/main.go`:
 from controller-runtime's standard zap flag set. Logging defaults to zap's
 production configuration (JSON, info level); pass `--zap-devel` for the
 development configuration (console encoding, debug level).
+
+## What happens while kvsynk8s is down
+
+The operator is not on any request path. It never sits between an
+application and the thing it depends on. So while the operator pod is not
+running — a crash, a node drain, an upgrade — nothing that already worked
+stops working:
+
+- Every Kubernetes Secret the operator has already written keeps its current
+  value. Nothing deletes or blanks it.
+- Every pod that mounts one of those Secrets, or reads it as an environment
+  variable, is completely unaffected. Kubernetes does not involve the
+  operator in reading a Secret; it only involved the operator in writing it.
+- The only thing that stops is propagation: if a value changes in Key Vault
+  while the operator is down, that change does not reach the cluster until
+  the operator is running again. It is delayed, not lost — an Event Grid
+  notification waits in the Storage Queue for the next running instance to
+  pick it up, and even if that notification never arrives, the periodic
+  reconcile (`--reconcile-interval`, default `4h`) still re-reads Key Vault
+  and converges the Secret once the operator is back.
+
+**Upgrades now include a short gap with no operator running, on purpose.**
+Both install paths set the Deployment's rollout strategy to `Recreate`: the
+running instance is fully stopped before its replacement starts. The
+alternative — Kubernetes' default rolling update — would start the new pod
+first, which briefly runs two uncoordinated operator instances reconciling
+the same `SecretSync` objects and polling the same queue. Given the choice,
+a short window with zero operators is safer than a short window with two,
+because of everything above: zero operators only delays a sync, while two
+uncoordinated ones can race each other on the same write. The gap is the old
+pod stopping (up to `terminationGracePeriodSeconds: 10`) plus however long
+Kubernetes takes to schedule and start the replacement — normally a few
+seconds when the image is already on the node, longer if it has to be pulled
+or the node is busy. Nothing caps that second part; in practice it is short
+enough not to show up in normal use.
 
 ## Troubleshooting
 

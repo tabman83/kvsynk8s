@@ -59,6 +59,11 @@ The comparison script asserts these fields match `install.yaml`'s Deployment:
 - Selector labels include `control-plane: controller-manager` and
   `app.kubernetes.io/name: kvsynk8s` (so the metrics Service and
   NetworkPolicy selectors keep working).
+- `spec.strategy.type: Recreate` (hardcoded, no value). Added by
+  [specs/003-single-replica-invariant/contracts/deployment-rollout.md](../../003-single-replica-invariant/contracts/deployment-rollout.md),
+  which is now the source of truth for this field: without it, Kubernetes'
+  default rolling update at `replicas: 1` starts the replacement pod before
+  the old one terminates.
 
 ## Field-level equivalence (RBAC)
 

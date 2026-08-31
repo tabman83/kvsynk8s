@@ -58,6 +58,13 @@ Standard kubebuilder layout, one Go module, one controller.
 - **`cmd/main.go`** — manager setup: flags/env (queue URL, reconcile
   interval, Azure client ID), wires the Key Vault reader, optionally the
   queue listener (only if a queue URL is configured), and the reconciler.
+  `LeaderElection: false` is hardcoded; the operator runs a single instance.
+  Both install paths (`charts/kvsynk8s/templates/deployment.yaml`,
+  `config/manager/manager.yaml`) set `spec.strategy.type: Recreate` on the
+  Deployment so that single-instance guarantee holds during an upgrade too —
+  the default rolling update at `replicas: 1` would otherwise start the new
+  pod before stopping the old one. See README's "What happens while kvsynk8s
+  is down" and specs/003-single-replica-invariant/.
 - **`api/v1alpha1/secretsync_types.go`** — the `SecretSync` CRD (spec: vault
   name/secret, optional target secret name/data key; status: state/reason/
   message/syncedVersion/lastSyncTime/observedGeneration).
@@ -123,7 +130,12 @@ Standard kubebuilder layout, one Go module, one controller.
   through a `source.Channel`. Every Receive/Delete call against the queue runs
   under its own `QueueCallTimeout` (default 30s) — the Azure SDK's own client
   imposes none, so without it a half-open connection would block the poll
-  loop, and the realtime path, forever.
+  loop, and the realtime path, forever. `NeedLeaderElection()` returns `true`:
+  the listener's only consumer is the reconciler's `source.Channel` watch,
+  itself a leader-election runnable, so a listener running without one would
+  silently discard events once its channel filled
+  (specs/003-single-replica-invariant/contracts/runnable-leadership.md).
+  Leader election itself is never enabled today — see below.
 
 **Auth.** Azure: `azidentity.DefaultAzureCredential`, i.e. Microsoft Entra
 Workload ID in-cluster (falls back through the standard credential chain

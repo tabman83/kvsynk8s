@@ -20,6 +20,13 @@
 #   4. no two resources of the same kind share a name, and no name exceeds the
 #      63-character DNS limit. Name truncation under a long release name is the
 #      easy way to get two objects silently collapsed into one.
+#   5. the operator Deployment declares `strategy.type: Recreate` and no
+#      `rollingUpdate` block, under every value combination it is rendered
+#      with (specs/003-single-replica-invariant/contracts/deployment-rollout.md).
+#      Kubernetes' default rolling update at replicas: 1 rounds maxSurge up to
+#      1 and maxUnavailable down to 0, so without this the Deployment starts
+#      the replacement pod before the old one terminates — briefly running two
+#      uncoordinated operator instances on every upgrade.
 #
 # Requires: python3 with PyYAML.
 
@@ -113,6 +120,19 @@ for path in sys.argv[1:]:
         # talk about secrets; scanning it produces only noise.
         if doc.get("kind") != "CustomResourceDefinition":
             scan_for_credentials(path, doc, doc.get("kind", "?"))
+        if doc.get("kind") == "Deployment" and str(name).endswith("-operator"):
+            strategy = doc.get("spec", {}).get("strategy", {})
+            if strategy.get("type") != "Recreate":
+                failures.append(
+                    "%s: Deployment %s has strategy.type %r, want 'Recreate' — "
+                    "the default RollingUpdate at replicas: 1 starts the new pod "
+                    "before the old one terminates" % (path, name, strategy.get("type"))
+                )
+            if "rollingUpdate" in strategy:
+                failures.append(
+                    "%s: Deployment %s carries a rollingUpdate block alongside "
+                    "Recreate — Kubernetes rejects this combination" % (path, name)
+                )
 
     seen_names = {}
     for doc in docs:
